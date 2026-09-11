@@ -22,6 +22,7 @@ import json
 from pathlib import Path
 
 import pytest
+import yaml
 
 from hermes_cli.fallback_config import get_fallback_chain
 
@@ -83,3 +84,104 @@ def test_any_shipped_config_documents_has_no_chain():
             for key in FALLBACK_KEYS:
                 assert key not in data, f"{path.relative_to(REPO_ROOT)} defines {key}"
     assert checked >= 0  # the scan itself is the assertion; zero JSON files is fine
+
+
+# ---------------------------------------------------------------------------
+# CR #456 3985211322: the zpk scan above is necessary but far from sufficient.
+# The chain that actually reaches the runtime is read from $HERMES_HOME/config.yaml
+# plus the managed overlay -- neither of which lives under zpk/ -- so the scan can
+# pass while the effective config carries a chain. These tests drive the real
+# loader instead, and each one has a negative control so a guard that silently
+# stopped detecting anything would fail here rather than pass vacuously.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def gateway_home(tmp_path, monkeypatch):
+    """Point the gateway's config loader at a throwaway HERMES_HOME."""
+    import gateway.run as gw
+
+    monkeypatch.setattr(gw, "_hermes_home", tmp_path, raising=False)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    return tmp_path
+
+
+def _write_cfg(home: Path, cfg: dict) -> None:
+    (home / "config.yaml").write_text(yaml.safe_dump(cfg), encoding="utf-8")
+
+
+def _effective_chain():
+    from gateway.run import GatewayRunner
+
+    return GatewayRunner._load_fallback_model() or []
+
+
+def test_effective_config_without_a_chain_yields_none(gateway_home):
+    """The device's actual shape: a config with no fallback keys at all."""
+    _write_cfg(gateway_home, {"model": "pro", "agent": {"reasoning_effort": "medium"}})
+    assert _effective_chain() == []
+
+
+@pytest.mark.parametrize("key", ["fallback_model", "fallback_providers"])
+def test_a_chain_in_the_effective_config_is_detected(gateway_home, key):
+    """Negative control: if a chain IS configured, the real loader must surface it.
+
+    Without this the 'no chain' assertion above could pass because the loader
+    silently returned nothing, not because the device is clean.
+    """
+    _write_cfg(gateway_home, {
+        "model": "pro",
+        key: [{"model": "m", "provider": "openrouter", "base_url": "https://openrouter.ai/api/v1"}],
+    })
+    chain = _effective_chain()
+    assert chain, f"{key} in $HERMES_HOME/config.yaml must reach the runtime chain"
+    assert chain[0].get("provider") == "openrouter"
+
+
+def test_a_chain_injected_by_the_managed_overlay_is_detected(gateway_home, monkeypatch):
+    """The managed overlay is the second source the zpk scan cannot see."""
+    _write_cfg(gateway_home, {"model": "pro"})
+    assert _effective_chain() == []
+
+    import hermes_cli.managed_scope as managed
+
+    real = managed.apply_managed_overlay
+
+    def _overlay(config):
+        merged = dict(real(config) or config or {})
+        merged["fallback_providers"] = [
+            {"model": "m", "provider": "openrouter", "base_url": "https://openrouter.ai/api/v1"}
+        ]
+        return merged
+
+    monkeypatch.setattr(managed, "apply_managed_overlay", _overlay)
+    import gateway.run as gw
+
+    if hasattr(gw, "_gateway_cfg_cache"):
+        monkeypatch.setattr(gw, "_gateway_cfg_cache", None, raising=False)
+    assert _effective_chain(), "an overlay-injected chain must be visible to the runtime"
+
+
+def test_device_reasoning_override_and_a_chain_are_a_flagged_combination(gateway_home):
+    """The invariant this file exists for, stated against the real loader.
+
+    If the effective config ever carries a chain while the device route would
+    still inject `extra_body.reasoning`, that is the unsafe combination
+    (upstream NousResearch/hermes-agent#107836). Today the device ships no
+    chain, so this asserts the safe state and fails loudly if that changes.
+    """
+    from gateway.platforms.zet_agent import _device_reasoning_fast_path
+
+    _write_cfg(gateway_home, {"model": "pro"})
+    overrides, applied = _device_reasoning_fast_path(
+        profile="main",
+        provider="custom",
+        base_url="http://127.0.0.1:19090/api/v1/ai-proxy/v1",
+        reasoning_config=None,
+        request_overrides=None,
+    )
+    assert applied is True and "reasoning" in (overrides.get("extra_body") or {})
+    assert _effective_chain() == [], (
+        "the device route injects extra_body.reasoning; a fallback chain would carry "
+        "it to another provider on failover. Re-scope the override before adding one."
+    )
