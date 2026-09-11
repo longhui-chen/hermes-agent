@@ -1,7 +1,7 @@
 {
   "snapshot_version": 2,
-  "root_commit": "e1dfb90c2e6563bcf62a42066e8b45a065fe1bd7",
-  "sha256": "303b6d4baef38e23ce596a9167c9e7630bfacdd1be2dd56d5334fe153fe2426e",
+  "root_commit": "652287fa89ab2bf1ca94e0353464ef4325e116f5",
+  "sha256": "d7ba0886ce0792250386762ca065ecb8e1c518a82ec5b853b210cd66caae12ee",
   "payload": {
     "golden": {
       "events": {
@@ -1580,7 +1580,7 @@
           "snapshot_seq": 44,
           "next_since": {
             "updated_seq": 44,
-            "row_key": "aa:8"
+            "row_key": "a:40"
           },
           "active_turn": {
             "turn_id": "turn_demo_0001",
@@ -1588,7 +1588,15 @@
             "unsettled": true,
             "started_at": 1756972800000
           },
-          "messages": [],
+          "messages": [
+            {
+              "id": 8,
+              "row_key": "m:8",
+              "updated_seq": 44,
+              "visible": false,
+              "turn_id": "turn_demo_0001"
+            }
+          ],
           "activities": [
             {
               "activity_id": 40,
@@ -3587,7 +3595,7 @@
       "message_row": {
         "fields": {
           "content": {
-            "required": true,
+            "required": false,
             "type": "string"
           },
           "id": {
@@ -3602,7 +3610,11 @@
             "integer": true
           },
           "role": {
-            "required": true,
+            "required": false,
+            "type": "string"
+          },
+          "row_key": {
+            "required": false,
             "type": "string"
           },
           "status": {
