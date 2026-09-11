@@ -185,3 +185,80 @@ def test_device_reasoning_override_and_a_chain_are_a_flagged_combination(gateway
         "the device route injects extra_body.reasoning; a fallback chain would carry "
         "it to another provider on failover. Re-scope the override before adding one."
     )
+
+
+# ---------------------------------------------------------------------------
+# CR #456 3985250181: agent create/reuse does NOT go through
+# `_load_fallback_model()`; both paths call `_refresh_fallback_model()`
+# (gateway/run.py, agent reuse and agent create), which re-reads config.yaml
+# + managed overlay from disk on every turn. So a chain added *after* the
+# gateway started is accepted without a restart.
+#
+# We cannot block that here: the refresh path lives in `gateway/run.py`, which
+# `scripts/test-harness/overlay_gate.json` lists as protected (HR8 kernel), and
+# the 2026-09-10 ruling is explicit that HR8 is not to be lifted for this. What
+# these tests do instead is pin the behaviour so it is machine-checked and
+# nobody can read the guard above as "a runtime chain is impossible".
+# ---------------------------------------------------------------------------
+
+
+class _RunnerStub:
+    """`_refresh_fallback_model` only touches `self._fallback_model`."""
+
+    _fallback_model = None
+
+
+def _refreshed_chain():
+    from gateway.run import GatewayRunner
+
+    return GatewayRunner._refresh_fallback_model(_RunnerStub()) or []
+
+
+def test_refresh_path_reports_no_chain_when_config_has_none(gateway_home):
+    _write_cfg(gateway_home, {"model": "pro"})
+    assert _refreshed_chain() == []
+
+
+def test_refresh_path_reports_no_chain_when_config_is_absent(gateway_home):
+    assert not (gateway_home / "config.yaml").exists()
+    assert _refreshed_chain() == []
+
+
+@pytest.mark.parametrize("key", ["fallback_model", "fallback_providers"])
+def test_refresh_path_accepts_a_chain_added_after_start(gateway_home, key):
+    """The residual this guard cannot close, stated as an executable fact.
+
+    `hermes fallback add` (or an overlay push) writes config.yaml while the
+    gateway is running; the next agent create/reuse picks it up. If this ever
+    stops being true, the prose in this module and in 附录 H H33 is stale and
+    must be revisited.
+    """
+    _write_cfg(gateway_home, {"model": "pro"})
+    assert _refreshed_chain() == []
+
+    _write_cfg(gateway_home, {
+        "model": "pro",
+        key: [{"model": "m", "provider": "openrouter", "base_url": "https://openrouter.ai/api/v1"}],
+    })
+    chain = _refreshed_chain()
+    assert chain, "the refresh path must pick up a chain written after start"
+    assert chain[0].get("provider") == "openrouter"
+
+
+def test_refresh_path_sees_a_managed_overlay_chain(gateway_home, monkeypatch):
+    _write_cfg(gateway_home, {"model": "pro"})
+    assert _refreshed_chain() == []
+
+    import hermes_cli.managed_scope as managed
+
+    real = managed.apply_managed_overlay
+
+    def _overlay(config):
+        merged = dict(real(config) or config or {})
+        merged["fallback_providers"] = [
+            {"model": "m", "provider": "openrouter", "base_url": "https://openrouter.ai/api/v1"}
+        ]
+        return merged
+
+    monkeypatch.setattr(managed, "apply_managed_overlay", _overlay)
+    assert _refreshed_chain(), "an overlay-pushed chain reaches the refresh path too"
