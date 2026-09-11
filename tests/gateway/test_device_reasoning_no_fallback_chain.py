@@ -69,18 +69,31 @@ def _chain_keys_in(text: str):
 
 
 def test_zpk_config_yaml_defines_no_fallback_chain():
-    """`zpk/config/*.yaml` is the packaged config surface named by HR6.
+    """`zpk/config/*.yaml` is the config surface HR6 names as authoritative.
 
-    It does not exist in this repo today (the device profile config is created
-    at install/runtime under $HERMES_HOME), and that fact is asserted rather
-    than assumed: if someone starts shipping config with the package, this test
-    starts checking it instead of silently passing over an empty glob.
+    hermes-agent does not ship one: its `zpk/` scripts only prepare
+    `$HERMES_HOME` and the service environment (no script writes a
+    `config.yaml`), and the device's profile config is created at
+    onboarding/runtime under that root, seeded from `cli-config.yaml.example`.
+
+    Absence is therefore recorded as a checked fact, never as proof of safety
+    (CR #457 3985625592): the guard asserts that the artifact which *does*
+    reach the device is covered, so this branch can never make the suite
+    vacuous. If someone starts shipping `zpk/config/`, it is scanned from then
+    on.
     """
     cfg_dir = ZPK_DIR / "config"
-    shipped = sorted(cfg_dir.glob("*.yaml")) + sorted(cfg_dir.glob("*.yml")) if cfg_dir.is_dir() else []
+    shipped = (sorted(cfg_dir.glob("*.yaml")) + sorted(cfg_dir.glob("*.yml"))) if cfg_dir.is_dir() else []
     if not shipped:
         assert not cfg_dir.is_dir() or not any(cfg_dir.iterdir()), (
-            "zpk/config/ exists with content but no YAML was matched — widen this guard"
+            "zpk/config/ exists with content but no YAML matched — widen this guard"
+        )
+        # Non-vacuity: the real artifact must still be under guard.
+        covered = [seed for seed in CONFIG_SEEDS if (REPO_ROOT / seed).is_file()]
+        assert covered, (
+            "zpk/config/ is absent AND no config seed is present — nothing is "
+            "actually being checked. Point the guard at whatever now provides "
+            f"the device config. {_FAIL_HINT}"
         )
         return
     offenders = []
