@@ -1,7 +1,7 @@
 {
   "snapshot_version": 2,
-  "root_commit": "652287fa89ab2bf1ca94e0353464ef4325e116f5",
-  "sha256": "d7ba0886ce0792250386762ca065ecb8e1c518a82ec5b853b210cd66caae12ee",
+  "root_commit": "0d52d0638db8b322806d31322e673842126b5f09",
+  "sha256": "bc9f7a0c166f85f03589d2557e9f3957710ad0411d93909ca49b700c46babf77",
   "payload": {
     "golden": {
       "events": {
@@ -3504,7 +3504,6 @@
           "live_seq": {
             "required": false,
             "type": "number",
-            "nullable": true,
             "integer": true
           },
           "phase": {
@@ -3548,13 +3547,11 @@
           "created_seq": {
             "required": false,
             "type": "number",
-            "nullable": true,
             "integer": true
           },
           "item_id": {
             "required": false,
-            "type": "string",
-            "nullable": true
+            "type": "string"
           },
           "kind": {
             "required": true,
@@ -3563,7 +3560,6 @@
           "last_fanout_seq": {
             "required": false,
             "type": "number",
-            "nullable": true,
             "integer": true
           },
           "status": {
@@ -3587,7 +3583,6 @@
           "updated_seq": {
             "required": false,
             "type": "number",
-            "nullable": true,
             "integer": true
           }
         }
@@ -3606,7 +3601,6 @@
           "last_fanout_seq": {
             "required": false,
             "type": "number",
-            "nullable": true,
             "integer": true
           },
           "role": {
@@ -3634,13 +3628,11 @@
           "updated_seq": {
             "required": false,
             "type": "number",
-            "nullable": true,
             "integer": true
           },
           "visible": {
             "required": false,
-            "type": "boolean",
-            "nullable": true
+            "type": "boolean"
           }
         }
       },
@@ -3661,8 +3653,7 @@
         "response": {
           "active_turn": {
             "required": false,
-            "type": "object",
-            "nullable": true
+            "type": "object"
           },
           "activities": {
             "required": true,
@@ -3699,8 +3690,7 @@
           },
           "next_since": {
             "required": false,
-            "type": "object",
-            "nullable": true
+            "type": "object"
           },
           "oldest_id": {
             "required": false,
@@ -3726,8 +3716,7 @@
         "response": {
           "active_turn": {
             "required": false,
-            "type": "object",
-            "nullable": true
+            "type": "object"
           },
           "agent_id": {
             "required": true,
@@ -3760,8 +3749,7 @@
           },
           "next_since": {
             "required": false,
-            "type": "object",
-            "nullable": true
+            "type": "object"
           },
           "oldest_id": {
             "required": false,
@@ -3807,8 +3795,7 @@
           },
           "app_element": {
             "required": false,
-            "type": "object",
-            "nullable": true
+            "type": "object"
           },
           "attachments": {
             "required": false,
@@ -3816,8 +3803,7 @@
           },
           "browser_turn_summary": {
             "required": false,
-            "type": "object",
-            "nullable": true
+            "type": "object"
           },
           "chat_attachments": {
             "required": false,
@@ -3825,8 +3811,7 @@
           },
           "clarify": {
             "required": false,
-            "type": "object",
-            "nullable": true
+            "type": "object"
           },
           "clarify_id": {
             "required": false,
@@ -3838,18 +3823,15 @@
           },
           "context_compaction": {
             "required": false,
-            "type": "object",
-            "nullable": true
+            "type": "object"
           },
           "delegation_summary": {
             "required": false,
-            "type": "object",
-            "nullable": true
+            "type": "object"
           },
           "error": {
             "required": false,
-            "type": "object",
-            "nullable": true
+            "type": "object"
           },
           "goal_id": {
             "required": false,
@@ -3884,8 +3866,7 @@
           },
           "plan_preview": {
             "required": false,
-            "type": "object",
-            "nullable": true
+            "type": "object"
           },
           "produced_files": {
             "required": false,
@@ -3893,8 +3874,7 @@
           },
           "quoted": {
             "required": false,
-            "type": "object",
-            "nullable": true
+            "type": "object"
           },
           "quotes": {
             "required": false,
@@ -3910,13 +3890,11 @@
           },
           "search_result": {
             "required": false,
-            "type": "object",
-            "nullable": true
+            "type": "object"
           },
           "separator": {
             "required": false,
-            "type": "object",
-            "nullable": true
+            "type": "object"
           },
           "seq": {
             "required": false,
@@ -3939,18 +3917,15 @@
           },
           "steer": {
             "required": false,
-            "type": "object",
-            "nullable": true
+            "type": "object"
           },
           "todo_list": {
             "required": false,
-            "type": "object",
-            "nullable": true
+            "type": "object"
           },
           "tool_call": {
             "required": false,
-            "type": "object",
-            "nullable": true
+            "type": "object"
           },
           "turn_id": {
             "required": false,
