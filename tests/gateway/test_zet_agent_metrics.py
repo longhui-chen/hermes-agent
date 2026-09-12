@@ -12,8 +12,8 @@ def test_interaction_metrics_use_bounded_labels_and_snapshot():
     assert metrics.snapshot() == {
         "interaction_opened": 1,
         "interaction_answered": 1,
-        "interaction_terminal{expired}": 1,
-        "interaction_terminal{runtime_lost}": 1,
-        "clarify_rejected{caller_inactive}": 1,
-        "clarify_rejected{other}": 1,
+        "interaction_terminal{source=hermes,state=expired}": 1,
+        "interaction_terminal{source=hermes,state=runtime_lost}": 1,
+        "clarify_rejected{reason=caller_inactive}": 1,
+        "clarify_rejected{reason=other}": 1,
     }

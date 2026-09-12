@@ -3515,10 +3515,11 @@ class ZetAgentAdapter(APIServerAdapter):
                 stream_queues = {}
                 self._approval_stream_queues = stream_queues
             stream_queues[scoped_session_key] = stream_q
+        # zettlab-overlay(uo): admission counter; upstream-pr: admission callback hook.
+        _metric_interaction_opened()
         if should_emit:
             try:
                 _put_progress(stream_q, payload)
-                _metric_interaction_opened()
             except Exception:
                 self._remove_approval_projection(
                     scoped_session_key, str(payload.get("approval_id") or "")
@@ -3752,6 +3753,7 @@ class ZetAgentAdapter(APIServerAdapter):
                 "approval", internal_key, payload
             ):
                 raise RuntimeError("approval reconnect mirror capacity exhausted")
+            _metric_interaction_opened()
             # Durable approvals also need their originating SSE queue retained
             # for interrupt/timeout terminal frames.  The legacy projection
             # path records this in ``_cache_approval_projection``; mirror the
@@ -3790,7 +3792,6 @@ class ZetAgentAdapter(APIServerAdapter):
                         "approval", internal_key, interaction_id
                     )
                     raise RuntimeError("approval notify push failed") from exc
-            _metric_interaction_opened()
             # Goal projection: a blocked approval means the loop is waiting
             # on the user — surface it on the App's goal banner (HR#3: goal
             # rounds never auto-approve). No-op for non-goal sessions.
@@ -3953,6 +3954,7 @@ class ZetAgentAdapter(APIServerAdapter):
             ):
                 self._discard_clarify_entry(internal_key, entry, reason="delivery_failed")
                 return _clarify_sentinel("clarify", interaction_id, "cancelled", "delivery_failed", "clarify could not be delivered")
+            _metric_interaction_opened()
             if turn_id:
                 reserved, push_error = self._publish_interaction_event(
                     stream_q,
@@ -3975,11 +3977,9 @@ class ZetAgentAdapter(APIServerAdapter):
                     )
                     self._discard_clarify_entry(internal_key, entry, reason="delivery_failed")
                     return _clarify_sentinel("clarify", interaction_id, "cancelled", "delivery_failed", "clarify could not be delivered")
-                _metric_interaction_opened()
             else:
                 try:
                     _put_progress(stream_q, payload)
-                    _metric_interaction_opened()
                 except Exception:
                     logger.debug("[zet_agent] clarify push failed", exc_info=True)
                     self._discard_clarify_entry(internal_key, entry, reason="delivery_failed")

@@ -1559,7 +1559,7 @@ class TestHealthDetailedEndpoint:
                 assert isinstance(data["pid"], int)
                 assert "updated_at" in data
                 assert data["interaction_metrics"] == {
-                    "interaction_terminal{other}": 1,
+                    "interaction_terminal{source=hermes,state=other}": 1,
                 }
 
 

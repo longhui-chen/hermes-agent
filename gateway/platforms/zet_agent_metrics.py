@@ -3,34 +3,41 @@ from __future__ import annotations
 
 import threading
 from collections import Counter
-from typing import Any
 
 _LOCK = threading.Lock()
 _COUNTERS: Counter[str] = Counter()
+_METRIC_NAMES = frozenset({"interaction_opened", "interaction_answered", "interaction_terminal", "clarify_rejected"})
 _TERMINAL_STATES = frozenset({"expired", "cancelled", "runtime_lost"})
 _REJECTION_REASONS = frozenset({"caller_inactive", "other"})
 
 
-def increment(name: str, label: str | None = None) -> None:
-    key = name if label is None else f"{name}{{{label}}}"
+def _increment(name: str, label: str | None = None) -> None:
+    if name not in _METRIC_NAMES:
+        return
+    if name == "interaction_terminal":
+        key = f"{name}{{source=hermes,state={label or 'other'}}}"
+    elif name == "clarify_rejected":
+        key = f"{name}{{reason={label or 'other'}}}"
+    else:
+        key = name
     with _LOCK:
         _COUNTERS[key] += 1
 
 
 def interaction_opened() -> None:
-    increment("interaction_opened")
+    _increment("interaction_opened")
 
 
 def interaction_answered() -> None:
-    increment("interaction_answered")
+    _increment("interaction_answered")
 
 
 def interaction_terminal(state: str) -> None:
-    increment("interaction_terminal", state if state in _TERMINAL_STATES else "other")
+    _increment("interaction_terminal", state if state in _TERMINAL_STATES else "other")
 
 
 def clarify_rejected(reason: str) -> None:
-    increment("clarify_rejected", reason if reason in _REJECTION_REASONS else "other")
+    _increment("clarify_rejected", reason if reason in _REJECTION_REASONS else "other")
 
 
 def snapshot() -> dict[str, int]:
