@@ -4377,8 +4377,9 @@ def run_one_job(
             set_secret_scope,
         )
 
+        _execution_profile_home = _get_hermes_home()
         _scope_token = set_secret_scope(
-            build_profile_secret_scope(_get_hermes_home())
+            build_profile_secret_scope(_execution_profile_home)
         )
         # Defer the cron agent's async-resource teardown until AFTER delivery.
         # run_job normally closes the agent (and reaps stale async clients) in
@@ -4391,9 +4392,12 @@ def run_one_job(
         try:
             execution_job = dict(job)
             execution_job["_connector_execution_id"] = execution_id
-            success, output, final_response, error = run_job(
-                execution_job, defer_agent_teardown=_deferred_agents
-            )
+            from cron.execution_context import execution_scope
+
+            with execution_scope(job["id"], execution_id, _execution_profile_home):
+                success, output, final_response, error = run_job(
+                    execution_job, defer_agent_teardown=_deferred_agents
+                )
         except BaseException:
             # run_job's finally still hands back the agent when it raises; tear
             # it down here so a failed run never leaks its async resources

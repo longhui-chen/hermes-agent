@@ -500,6 +500,7 @@ def init_agent(
     user_id: str = None,
     session_owner_id: str = None,
     user_id_alt: str = None,
+    # zettlab-overlay(H32-unowned): 深记忆 provider 主体参数，收敛时隔离到 provider; upstream: none
     deep_memory_principal: str = None,
     deep_memory_subject: str = None,
     user_name: str = None,
@@ -606,6 +607,7 @@ def init_agent(
     agent._user_id_alt = user_id_alt  # Optional stable alternate platform identifier
     # Deep Memory has a separate authenticated identity contract.  It must
     # never overload the platform account used by Memo or SessionDB migration.
+    # zettlab-overlay(H32-unowned): 深记忆 provider 主体绑定到 agent，收敛时隔离到 provider; upstream: none
     agent._deep_memory_principal = deep_memory_principal
     agent._deep_memory_subject = deep_memory_subject
     agent._user_name = user_name
@@ -1781,6 +1783,7 @@ def init_agent(
                         _init_kwargs["user_id"] = agent._user_id
                     if agent._user_id_alt:
                         _init_kwargs["user_id_alt"] = agent._user_id_alt
+                    # zettlab-overlay(H32-unowned): 深记忆 provider 初始化参数注入，收敛时隔离到 provider; upstream: none
                     if _mem_provider_name == "zettlab_deep_memory":
                         if agent._deep_memory_principal:
                             _init_kwargs["deep_memory_principal"] = agent._deep_memory_principal

@@ -16,6 +16,7 @@ a thin dispatcher that delegates to a platform-provided callback.
 
 import json
 from typing import List, Optional, Callable
+from tools.connector_setup_intent import CONNECTOR_SETUP_SCHEMA, connector_setup_result, normalize_connector_setup
 
 
 # Maximum number of predefined choices the agent can offer.
@@ -114,6 +115,7 @@ def clarify_tool(
     choices: Optional[List[str]] = None,
     multi_select: bool = False,
     callback: Optional[Callable] = None,
+    connector_setup: Optional[dict] = None,
 ) -> str:
     """
     Ask the user a question, optionally with multiple-choice options.
@@ -159,6 +161,18 @@ def clarify_tool(
     if callback is None:
         return tool_error("Clarify tool is not available in this execution context.")
 
+    if connector_setup is not None:
+        import inspect
+        try:
+            intent = normalize_connector_setup(connector_setup)
+            if choices or multi_select or "connector_setup" not in inspect.signature(callback).parameters:
+                return tool_error("connector_setup_unavailable: do not request credentials in ordinary chat")
+            raw_response = callback("Connector setup", None, connector_setup=intent)
+            return connector_setup_result(raw_response)
+        except Exception:
+            # Neither callback errors nor arbitrary responses may echo credentials.
+            return tool_error("connector_setup_unavailable: do not request credentials in ordinary chat")
+
     try:
         raw_response = _invoke_callback(callback, question, choices, multi_select)
     except Exception as exc:
@@ -188,6 +202,12 @@ def check_clarify_requirements() -> bool:
 CLARIFY_SCHEMA = {
     "name": "clarify",
     "description": (
+        # zettlab-overlay(connector-input): distinguish trusted input from ordinary clarify; upstream: none
+        "SECURITY: Ordinary clarify answers are sent to the model and chat history. "
+        "Never request a password, PAT, API key or other credential in question/choices, "
+        "even when calling the panel secure. For supported Connector setup use the "
+        "connector_setup parameter; only that path collects credentials outside chat. "
+        "A submitted setup receipt contains no credential; do not infer exposure from it. "
         "Ask the user a question when you need clarification, feedback, or a "
         "decision before proceeding. Supports three modes:\n\n"
         "1. **Single-select multiple choice** — provide up to 4 choices. The user picks one "
@@ -216,6 +236,7 @@ CLARIFY_SCHEMA = {
     "parameters": {
         "type": "object",
         "properties": {
+            "connector_setup": CONNECTOR_SETUP_SCHEMA,
             "question": {
                 "type": "string",
                 "description": (
@@ -262,6 +283,7 @@ registry.register(
         question=args.get("question", ""),
         choices=args.get("choices"),
         multi_select=args.get("multi_select", False),
+        connector_setup=args.get("connector_setup"),
         callback=kw.get("callback")),
     check_fn=check_clarify_requirements,
     emoji="❓",

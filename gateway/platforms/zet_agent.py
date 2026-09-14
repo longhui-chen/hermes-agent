@@ -425,6 +425,12 @@ def _observe_queued_attachment(
         return
 
 
+_zettlab_connector_input_capable: ContextVar[bool] = ContextVar(
+    "zettlab_connector_input_capable", default=False
+)
+_zettlab_camera_observation_input_capable: ContextVar[bool] = ContextVar(
+    "zettlab_camera_observation_input_capable", default=False
+)
 _zettlab_request_account_id: ContextVar[str] = ContextVar(
     "zettlab_request_account_id", default=""
 )
@@ -2445,11 +2451,19 @@ class ZetAgentAdapter(APIServerAdapter):
         token = push_zettlab_browser_session_token(
             request.headers.get("X-Zettlab-Browser-Session-Token", "")
         )
+        connector_input_token = _zettlab_connector_input_capable.set(
+            request.headers.get("X-Zettlab-Connector-Direct-Input", "") == "1"
+        )
+        camera_observation_token = _zettlab_camera_observation_input_capable.set(
+            request.headers.get("X-Zettlab-Camera-Observation-Input", "") == "1"
+        )
         try:
             return await self._handle_with_zettlab_identity(
                 request, super()._handle_chat_completions
             )
         finally:
+            _zettlab_camera_observation_input_capable.reset(camera_observation_token)
+            _zettlab_connector_input_capable.reset(connector_input_token)
             pop_zettlab_browser_session_token(token)
 
     async def _handle_responses(self, request: "web.Request") -> "web.Response":
@@ -3864,6 +3878,8 @@ class ZetAgentAdapter(APIServerAdapter):
         queue_key: Optional[str] = None,
         owner_agent: Any = None,
         bound_turn_id: str = "",
+        connector_input_capable: bool = False,
+        camera_observation_input_capable: bool = False,
     ):
         """Return a sync ``(question, choices) -> str`` callback.
 
@@ -3885,7 +3901,23 @@ class ZetAgentAdapter(APIServerAdapter):
             or ""
         ).strip()
 
-        def _ask(question: str, choices: Optional[List[str]]) -> str:
+        def _ask(question: str, choices: Optional[List[str]], *, connector_setup: Optional[dict] = None) -> str:
+            from gateway.platforms.connector_input_guard import requests_secret_input
+            if connector_setup is None and any(requests_secret_input(text) for text in [question, *(choices or [])]):
+                raise ValueError(
+                    "connector_setup_required: ordinary clarify sends answers to the model; "
+                    "it is not protected input. Retry with validated connector_setup metadata, "
+                    "never ask for credentials in question/choices or redirect to settings."
+                )
+            if connector_setup is not None:
+                if not connector_input_capable:
+                    raise ValueError("connector_setup_unavailable")
+                from tools.connector_setup_intent import normalize_connector_setup
+                connector_setup = normalize_connector_setup(connector_setup)
+                # Presentation support is not camera or background-vision consent.
+                # Older clients must not treat observations as connection setup.
+                if connector_setup.get("observation") is not None and not camera_observation_input_capable:
+                    raise ValueError("camera_observation_input_unavailable")
             timeout_seconds = _clarify_timeout_seconds()
             # Stamp the deadline using the same constant the agent
             # thread waits on a few lines below. Clients see the wall-
@@ -3930,6 +3962,8 @@ class ZetAgentAdapter(APIServerAdapter):
                     "choices_offered": list(choices or []),
                     "expires_at_ms": expires_at_ms,
                 }
+                if connector_setup is not None:
+                    payload["connector_setup"] = connector_setup
                 if turn_id:
                     payload["turn_id"] = turn_id
                 entry = _ClarifyEntry(
@@ -4682,6 +4716,8 @@ class ZetAgentAdapter(APIServerAdapter):
         # matches the turn's confirm/auto behaviour. Absent (async /v1/runs path,
         # or non-plan callers) → None → manual (safe default).
         agent_request_overrides = dict(request_overrides or {})
+        connector_input_capable = agent_request_overrides.pop("_zettlab_connector_input_capable", False) is True
+        camera_observation_input_capable = agent_request_overrides.pop("_zettlab_camera_observation_input_capable", False) is True
         from gateway.session_context import zettlab_auth_principal
 
         # This is transport authority minted by local-server for exactly one
@@ -5434,12 +5470,15 @@ class ZetAgentAdapter(APIServerAdapter):
         # it is just a closure allocation.
         if session_id:
             try:
+                agent._zettlab_connector_direct_input = connector_input_capable
                 agent.clarify_callback = self._make_clarify_cb(
                     stream_q,
                     session_id,
                     interaction_queue_key,
                     agent,
                     bound_turn_id=extension_turn_id,
+                    connector_input_capable=connector_input_capable,
+                    camera_observation_input_capable=camera_observation_input_capable,
                 )
             except Exception:
                 logger.warning("[zet_agent] failed to attach clarify_callback", exc_info=True)
@@ -5584,6 +5623,8 @@ class ZetAgentAdapter(APIServerAdapter):
         """
         from gateway.session_context import zettlab_auth_principal
         request_overrides = dict(request_overrides or {})
+        request_overrides["_zettlab_connector_input_capable"] = _zettlab_connector_input_capable.get()
+        request_overrides["_zettlab_camera_observation_input_capable"] = _zettlab_camera_observation_input_capable.get()
         # Private bootstrap metadata consumed and removed by this adapter's
         # _create_agent. It selects the ordinary video plugin toolset for a
         # silent task and never reaches AIAgent or a provider request.
@@ -8771,6 +8812,7 @@ class ZetAgentAdapter(APIServerAdapter):
 
     def _register_profile_api_routes(self, router, *, chat_handler=None) -> None:
         super()._register_profile_api_routes(router, chat_handler=chat_handler)
+        self._register_camera_vision_route(router)
         router.add_post(
             "/p/{profile}/api/sessions/import",
             self._profile_handler(self._handle_session_import),
@@ -8778,6 +8820,17 @@ class ZetAgentAdapter(APIServerAdapter):
         router.add_post(
             "/p/{profile}/api/memory/import",
             self._profile_handler(self._handle_memory_import),
+        )
+
+    def _register_camera_vision_route(self, router) -> None:
+        from gateway.platforms.zet_agent_camera_vision import handle_camera_vision
+
+        async def handle(request):
+            return await handle_camera_vision(self, request)
+
+        router.add_post(
+            "/p/{profile}/internal/v1/camera/vision",
+            self._profile_handler(handle),
         )
 
     async def _handle_session_steer(self, request: "web.Request") -> "web.Response":
@@ -10233,6 +10286,7 @@ class ZetAgentAdapter(APIServerAdapter):
             self._app = web.Application(middlewares=mws, client_max_size=MAX_REQUEST_BYTES)
             self._app["api_server_adapter"] = self
             self._register_base_http_routes(self._app.router)
+            self._register_camera_vision_route(self._app.router)
             self._app.router.add_post(
                 "/api/sessions/import", self._handle_session_import,
             )

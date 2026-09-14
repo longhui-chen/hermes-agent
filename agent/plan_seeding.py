@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# zettlab-overlay(H1-B2b): 计划到 todo 的播种整文件为 fork 新增，B2b 删文件; upstream: none
 """Plan → Todo seeding (方案「计划 × 任务清单合一」§3 的运行时核心).
 
 present_plan 成功呈现计划卡后，由这里用同一份计划骨架直接播种 TodoStore ——

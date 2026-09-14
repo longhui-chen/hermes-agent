@@ -1,3 +1,4 @@
+# zettlab-overlay(H21-unowned): 响应模式与可信技能执行策略状态机整文件为 fork 新增，收敛时迁适配层; upstream: none
 """Bind trusted high-risk skill execution to an exact App turn."""
 
 from __future__ import annotations
@@ -50,7 +51,8 @@ _ATTESTATION_FIELD = "_zet_agent_trusted_skill_attestation"
 _ATTESTATION_TTL_SECONDS = 30.0
 _ATTESTATION_MAX_ENTRIES = 64
 _CAMERA_SKILL_PATH = "skills/camsnap/SKILL.md"
-_CAMERA_DIRECT_TOOLS = frozenset({"terminal", "vision_analyze"})
+# zettlab-overlay(camera-confirmation): expose the existing trusted client handoff; upstream: none
+_CAMERA_DIRECT_TOOLS = frozenset({"terminal", "vision_analyze", "clarify"})
 _CAMERA_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 _PRINTER3D_SKILL_PATHS = frozenset({
     "skills/printer3d/SKILL.md",
@@ -72,6 +74,17 @@ _CAMERA_INVENTORY_INTENT_RE = re.compile(
     r"(?:摄像头|镜头|camera).{0,48}(?:检查|状态|连接情况|是否连接|是否可用|可用状态|check|status|connected|available|online)"
     r"|(?:检查|状态|连接情况|是否连接|是否可用|可用状态|check|status|connected|available|online).{0,48}(?:摄像头|镜头|camera)",
     re.IGNORECASE | re.DOTALL,
+)
+# A grant acknowledgement does not identify which media action to repeat.
+# Admit a fresh inventory only; device/Agent/session authorization remains
+# authoritative in CameraService. Whole-message matching excludes quotations
+# and requests that append background monitoring or recording instructions.
+_CAMERA_AUTHORIZATION_RETRY_RE = re.compile(
+    r"(?:我)?(?:"
+    r"(?:已经|已)?(?:授权|打开|开启)(?:了)?摄像头(?:权限|开关)?"
+    r"|摄像头(?:权限|开关)?(?:已经|已)?(?:授权|打开|开启)(?:了)?"
+    r")[，,。\s]*(?:请)?(?:再试|重试|重新试)(?:一下|下|一次)?"
+    r"(?:刚才的操作)?[。！!\s]*",
 )
 _HARDWARE_INVENTORY_INTENT_RE = re.compile(
     r"(?:(?:所有|全部|当前|整体|已连接(?:的)?)(?:硬件|设备|连接器).{0,32}(?:检查|查看|列出|有哪些|状态|连接情况|是否可用)"
@@ -147,7 +160,16 @@ _HARDWARE_ENROLLMENT_ACTION_RE = re.compile(
 _HARDWARE_ENROLLMENT_CONNECTION_STATE_RE = re.compile(
     r"(?:已(?:经)?|正在|正|当前|尚未|未|没有)连接(?:到|上|着|过|好|成功)?(?:的)?"
     r"|连接(?:中|的|状态|列表|信息|详情)"
+    # zettlab-overlay(connector-enrollment-guard): classify device status as diagnostics; upstream: none
+    r"|(?:设备|硬件|摄像头|打印机|电脑|电视)(?:访问)?(?:权限|授权|状态|能力|可用性|连接)"
     r"|\b(?:connected|connecting|connection)\b",
+    re.IGNORECASE,
+)
+# zettlab-overlay(connector-enrollment-guard): keep diagnostics out of setup intent; upstream: none
+_HARDWARE_ENROLLMENT_DIAGNOSTIC_RE = re.compile(
+    r"(?:检查|查看|查询|诊断|验证|列出|授权|权限|能力|可用|状态|区域)"
+    r"|(?:\bdoctor\b|\blist\b|\bstatus\b|\bcapabilit(?:y|ies)\b|"
+    r"\bpermission\b|\baccess\b|\bhealth\b|\binspect\b|\bverify\b)",
     re.IGNORECASE,
 )
 _HARDWARE_ENROLLMENT_META_OR_DIAG_RE = re.compile(
@@ -1416,6 +1438,9 @@ def _skill_direct_task_context(
         else normalized
     )
     hardware_inventory = bool(_HARDWARE_INVENTORY_INTENT_RE.search(normalized))
+    camera_authorization_retry = bool(
+        _CAMERA_AUTHORIZATION_RETRY_RE.fullmatch(normalized)
+    )
     return _SkillDirectTaskContext(
         task_sha256=hashlib.sha256(task_binding.encode("utf-8")).hexdigest(),
         turn_identity=_current_skill_direct_turn_identity(),
@@ -1424,6 +1449,7 @@ def _skill_direct_task_context(
             or bool(_CAMERA_INTENT_RE.search(normalized))
             or bool(_CAMERA_INVENTORY_INTENT_RE.search(normalized))
             or hardware_inventory
+            or camera_authorization_retry
             or bool(_CAMERA_DIRECT_SNAPSHOT_INTENT_RE.fullmatch(normalized))
             or camera_resumed
         ),
@@ -1434,6 +1460,7 @@ def _skill_direct_task_context(
             and (
                 _CAMERA_INVENTORY_INTENT_RE.search(normalized)
                 or hardware_inventory
+                or camera_authorization_retry
             )
             and not _CAMERA_INTENT_RE.search(normalized)
         ),
@@ -1709,6 +1736,11 @@ def _camera_runtime_argv(
         return None
     if not all(isinstance(value, str) for value in argv):
         return None
+    # The shared terminal parser also recognizes scheduled semantic helpers.
+    # Those use Cron execution identity and device policy authorization, not a
+    # Chat camsnap receipt. Never classify them as manual camera operations.
+    if Path(argv[1]).name != "camera_connector.py":
+        return None
     return list(argv)
 
 
@@ -1807,7 +1839,8 @@ def _trusted_camera_attachment_path(raw_path: Any) -> str | None:
 def _camera_attachment_path_from_terminal_result(
     result: Mapping[str, Any],
 ) -> str | None:
-    """Extract the exact trusted attachment emitted by one successful snap."""
+    # zettlab-overlay(ac432-history): Include scoped history image artifacts; upstream: none
+    """Extract the exact trusted camera attachment under the active output root."""
     output = result.get("output")
     if not isinstance(output, str) or len(output.encode("utf-8")) > 1024 * 1024:
         return None
@@ -1816,11 +1849,9 @@ def _camera_attachment_path_from_terminal_result(
     except (TypeError, ValueError):
         return None
     data = payload.get("data") if isinstance(payload, dict) else None
-    if (
-        not isinstance(data, dict)
-        or data.get("action") != "snap"
-        or data.get("status") != "ok"
-    ):
+    # zettlab-overlay(ac432-history): Classify camera artifacts in the adapter; upstream: none
+    from gateway.platforms.zet_agent_camera_arguments import camera_result_has_image
+    if not camera_result_has_image(data):
         return None
     return _trusted_camera_attachment_path(data.get("attachment_path"))
 
@@ -2012,6 +2043,13 @@ def _silent_skill_view_scope_block_message(
     )
 
 
+class CameraTaskScopeMissing(str):
+    """String-compatible policy rejection with additive machine-readable facts."""
+
+    code = "camera_task_scope_missing"
+    authorization_status = "not_checked"
+
+
 def trusted_skill_operation_block_message(
     agent: Any,
     *,
@@ -2096,10 +2134,15 @@ def trusted_skill_operation_block_message(
                     "zet_agent: blocked camera runtime command without a current "
                     "trusted camsnap scope"
                 )
-                return (
+                return CameraTaskScopeMissing(
                     "Trusted camera commands require a current request-bound "
                     "scope minted by the attested `camsnap` skill_view result. "
-                    "Load that trusted skill and retry the exact operation."
+                    "The command was not dispatched; device and Chat grants "
+                    "were not checked. Do not claim that camera permission is "
+                    "disabled or has not synced. Load the trusted skill for "
+                    "the current camera task. If it cannot establish scope, "
+                    "request an explicit camera operation instead of retrying "
+                    "the same blocked command."
                 )
             if (
                 function_name == "terminal"
@@ -2149,6 +2192,10 @@ def trusted_skill_operation_block_message(
         allowed = function_name in scope.allowed_tools
         operation_scope = scope
         authorized_args_sha256 = ""
+        # zettlab-overlay(camera-confirmation): validate proposals without granting recording authority; upstream: none
+        if allowed and function_name == "clarify" and scope.relative_path == _CAMERA_SKILL_PATH:
+            from gateway.platforms.zet_agent_camera_chat_intent import camera_confirmation_allowed
+            allowed = not scope.camera_inventory_only and camera_confirmation_allowed(function_args, scope.camera_ids)
         if allowed and function_name == "terminal":
             normalized_args = _normalized_registry_tool_args(
                 function_name,
@@ -2786,6 +2833,15 @@ def _hardware_enrollment_requested_types(
         or _HARDWARE_ENROLLMENT_META_OR_DIAG_RE.search(normalized)
     ):
         return ()
+    # zettlab-overlay(connector-enrollment-guard): preserve explicit connect intent; upstream: none
+    # Diagnostic/status requests may mention a noun phrase such as “设备连接”
+    # or “摄像头权限”. Those are not a request to enroll a connector. Keep an
+    # explicit connection verb actionable, but reject diagnostic-only turns.
+    if (
+        _HARDWARE_ENROLLMENT_DIAGNOSTIC_RE.search(normalized)
+        and not _HARDWARE_ENROLLMENT_ACTION_RE.search(action_text)
+    ):
+        return ()
 
     positioned_types: list[tuple[int, str]] = []
     for hardware_type, pattern in _HARDWARE_ENROLLMENT_TYPE_RES:
@@ -2874,6 +2930,10 @@ def ensure_hardware_enrollment_intent(
     trusted canonical card.
     """
     text = str(response_text or "")
+    if getattr(agent, "_zettlab_connector_direct_input", False):
+        # Composer-capable clients use the trusted clarify handoff. Do not
+        # append a second legacy enrollment card after that interaction.
+        return _strip_model_hardware_enrollment_blocks(text).strip()
     if (
         (getattr(agent, "platform", "") or "") != "zet_agent"
         or not completed

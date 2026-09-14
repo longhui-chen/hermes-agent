@@ -666,6 +666,7 @@ class AIAgent:
                     _init_model_config["yolo_mode"] = True
             except Exception:
                 pass
+            # zettlab-overlay(H26-unowned): zet_agent session owner 迁移，收敛时 hook 化或上游 PR; upstream: none
             session_owner_id = str(getattr(self, "_session_owner_id", "") or "").strip()
             account_id = str(self._user_id or "").strip()
             if self.platform == "zet_agent" and session_owner_id and account_id:
@@ -1119,6 +1120,7 @@ class AIAgent:
             except Exception:
                 logger.debug("thinking_callback error in _emit_wait_notice", exc_info=True)
 
+    # zettlab-overlay(H22-unowned): opt-in 结构化状态回调，上游 PR 首选; upstream: none
     def _emit_structured_status(self, event_type: str, payload: Dict[str, Any]) -> None:
         """Emit a structured gateway status event without changing CLI output.
 
@@ -1937,6 +1939,7 @@ class AIAgent:
                 if timestamp is not None:
                     msg["timestamp"] = timestamp
 
+    # zettlab-overlay(H25-B1): ZET-641 中断回滚当前 turn，B1 保留且上游 PR 候选; upstream: none
     def _discard_current_turn_on_interrupt(self, messages: list) -> None:
         """ZET-641: roll back the current turn when an interrupt fires
         before the agent produced any visible output (no streaming text,
@@ -2000,6 +2003,7 @@ class AIAgent:
         with persist_lock:
             _persist_and_drain()
 
+    # zettlab-overlay(H26-unowned): 清理 length continuation 脚手架，收敛时 hook 化或上游 PR; upstream: none
     def _drop_length_continuation_scaffolding(self, messages: List[Dict]) -> None:
         """Remove internal length-continuation prompts from durable transcripts."""
         if not messages:
@@ -2715,6 +2719,7 @@ class AIAgent:
         from agent.agent_runtime_helpers import extract_api_error_context
         return extract_api_error_context(error)
 
+    # zettlab-overlay(H25-B1): provider 结构化错误负载，B1 保留且上游 PR 候选; upstream: none
     def _provider_error_payload(self, classified, error: Exception) -> Dict[str, Any]:
         """Build the safe, structured provider-error payload for chat surfaces."""
         payload: Dict[str, Any] = {
@@ -3410,9 +3415,24 @@ class AIAgent:
         if callable(hook):
             outcome = hook(cleaned)
             return bool(outcome.get("accepted")) if isinstance(outcome, dict) else bool(outcome)
-        # zettlab-overlay(U2d): append legacy text as an identity-free tuple; upstream: none
-        with self._pending_steer_lock:
-            if self._pending_steer is None or self._interrupt_requested:
+        # zettlab-overlay(U2d): stub fallback for agents built via object.__new__ (no
+        # __init__, so no lock); upstream: H26 `_steer_closed` refusal after the turn
+        # finalizer's closing drain, kept verbatim on the list representation
+        _lock = getattr(self, "_pending_steer_lock", None)
+        if _lock is None:
+            if getattr(self, "_steer_closed", False):
+                return False
+            if getattr(self, "_interrupt_requested", False):
+                return False
+            existing = getattr(self, "_pending_steer", None)
+            if existing is None:
+                return False
+            existing.append((None, cleaned))
+            return True
+        # zettlab-overlay(U2d): append legacy text as an identity-free tuple; upstream:
+        # H26 folds `_steer_closed` into the same refusal as the closed-slot sentinel
+        with _lock:
+            if self._pending_steer is None or getattr(self, "_steer_closed", False) or self._interrupt_requested:
                 return False
             self._pending_steer.append((None, cleaned))
         return True
@@ -6052,6 +6072,7 @@ class AIAgent:
                 getattr(self, "_current_streamed_assistant_text", "") + text
             )
 
+    # zettlab-overlay(H24-unowned): provisional stream 缓冲原语，上游 PR 或删; upstream: none
     @staticmethod
     def _begin_provisional_stream() -> tuple[
         Token[Optional[List[Callable[[], None]]]], List[Callable[[], None]]
@@ -6345,6 +6366,7 @@ class AIAgent:
                 where, _n,
             )
 
+    # zettlab-overlay(H23-B2b): 计划轮压制正文，B2b 删除; upstream: none
     def _should_suppress_plan_stream_text(self) -> bool:
         """Keep provisional plain text out of Plan Review SSE responses."""
         return (
@@ -7200,6 +7222,7 @@ class AIAgent:
         """Forwarder — see ``agent.chat_completion_helpers.build_assistant_message``."""
         from agent.chat_completion_helpers import build_assistant_message
         message = build_assistant_message(self, assistant_message, finish_reason)
+        # zettlab-overlay(H23-B2b): 计划轮压制 reasoning 与并行正文，B2b 删除; upstream: none
         if (
             self._should_suppress_plan_stream_text()
             and (getattr(assistant_message, "tool_calls", None) or [])

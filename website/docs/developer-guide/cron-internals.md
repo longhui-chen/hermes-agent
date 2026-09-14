@@ -74,6 +74,19 @@ Jobs are stored in `~/.hermes/cron/jobs.json` with atomic write semantics (write
 
 ### Backward Compatibility
 
+`cron.jobs.create_job(..., enabled=False)` publishes a job in the existing
+`paused` state in its first atomic store write. This is for callers that must
+finish binding an external policy before triggering execution; creating an active
+job and then pausing it is not equivalent. Omitted `enabled` retains the old
+scheduled behavior. Only booleans are accepted. Paused one-shots do not consume
+their repeat count when their planned time passes. After binding, use the existing
+explicit `trigger_job` operation for a newly confirmed relative observation;
+do not use it to silently move an expired absolute-time request. The HTTP create
+endpoint accepts the optional boolean with the same semantics; the model tool
+does not expose it. Clients must verify `enabled:false` and `state:paused` in the
+creation response before binding and triggering, because older servers may ignore
+the optional field. A Cron state is never a resource/vision authorization grant.
+
 Older jobs may have a single `skill` field instead of the `skills` array. The scheduler normalizes this at load time — single `skill` is promoted to `skills: [skill]`.
 
 ## Scheduler Runtime
@@ -172,6 +185,62 @@ jobs stop cleanly when the count is exhausted (no orphaned one-shot). The full
 agent↔Nous wire contract lives in `docs/chronos-managed-cron-contract.md`.
 
 ### Fresh Session Isolation
+
+`run_one_job` also binds a private immutable job/execution/profile identity in
+`cron.execution_context` after the durable running transition. It is scoped to
+`run_job`, restored even on exceptions, and never sourced from shell environment
+variables or Chat routing metadata. Normal `copy_context()` workers inherit the
+identity, but it is not a grant: hardware consumers must independently check the
+active execution ledger and their resource policy at the service boundary.
+Unsupported legacy IDs leave this private identity unavailable without stopping
+ordinary Cron jobs. Delivery runs outside this execution scope.
+
+The camera direct runner accepts the pinned Presets
+`skills/camera-semantic-evaluation/scripts/camera_semantic_monitor.py` with
+only `candidate`, `commit`, and `observe` arguments. It reuses the camera package digest,
+manifest capability, fixed foreground Python dispatch, timeout, and redaction
+boundary. The current Cron identity must match the current profile home;
+profile action token, job ID, and execution ID travel via private FDs, not a
+generic shell. Missing profile values fail closed, with no ambient environment
+fallback. The local-server URL is derived only from a loopback profile callback.
+This runner does not authorize recording or replace the device's per-policy
+checks. End-to-end Skill admission, actual camera evidence, vision, and delivery
+must be verified separately from runner tests.
+
+`observe --policy-id UUID --timeout-seconds N` runs an already-confirmed finite
+policy through the same foreground process. Its explicit execution budget must
+fit inside the requested tool timeout and configured foreground maximum, with
+five seconds of process/HTTP cleanup headroom. Insufficient budgets are rejected,
+never clamped. The service also reserves first-frame and analysis time before
+starting the full policy duration. Ordinary camera and printer commands retain
+their 80-second cap. Cron inactivity cancellation and the existing trusted-runner
+interrupt cleanup remain authoritative; no detached observation worker is added.
+The default skill uses 590 seconds within a 600-second tool call. This is an
+execution limit, not permission to shorten a longer policy. A longer platform
+limit must be explicitly configured through existing runtime controls before use.
+An incomplete analysis or zero events is not proof of absence.
+
+The same command optionally accepts `--mode finite|periodic`; absence preserves
+the finite wire request. `--mode periodic --timeout-seconds 65` (tool timeout 75)
+executes one already-bound periodic policy round, using the device's original
+one-minute capture context. App/Web opt new jobs in only after the device declares
+`monitoring_periodic_observation`. Mode is not authorization: the original profile,
+running Cron identity, policy, Memo, camera grant and explicit visual-purpose
+checks still apply. The runner rejects unknown/duplicate modes and added job,
+duration or output arguments. It never changes a finite policy into a periodic
+one, retries a failed round, or launches a background worker. Supplemental frames
+are context, not extra matching claims; one round cannot prove absence between
+Cron triggers.
+
+To verify the actual Presets helper against this runner, set
+`HERMES_TEST_CAMERA_PRESETS_SOURCE` to its source file and run
+`scripts/run_tests.sh tests/tools/test_terminal_camera_semantic_runner.py -q`.
+The opt-in tests run candidate and positive/negative commit through a real
+isolated Python child, private FDs, a loopback fixture HTTP service, and private
+attachment file IO. They use fixture media and service responses, not actual
+camera capture, identity matching, model inference, or device authorization.
+Without an explicit source these cross-repository cases are skipped; other
+runner tests still run. A nonexistent supplied source fails rather than skips.
 
 Each cron job runs in a completely fresh agent session:
 

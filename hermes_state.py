@@ -1686,10 +1686,17 @@ def _connect_tracked_db(path, tracking_path=None, **kwargs):
     # Open through THIS module's sqlite3.connect so callers (and tests) that
     # patch hermes_state.sqlite3.connect keep control of connection creation;
     # the helper still owns tracking.
+    read_only_uri = bool(
+        kwargs.get("uri")
+        and isinstance(path, str)
+        and path.startswith("file:")
+        and "mode=ro" in path
+    )
     return connect_tracked(
         path,
         tracking_path=tracking_path,
         connect_fn=sqlite3.connect,
+        private_mode=None if read_only_uri else 0o600,
         **kwargs,
     )
 
@@ -8948,6 +8955,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             self._remove_session_files(sessions_dir, sid)
         return count
 
+    # zettlab-overlay(H32-unowned): zettlab: 会话根按 agent 递归删除，收敛时隔离到 provider; upstream: none
     def delete_sessions_for_agent(self, agent_id: str, sessions_dir: Optional[Path] = None) -> int:
         """Delete every session belonging to *agent_id* (roots + descendants) atomically.
 

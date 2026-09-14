@@ -35,6 +35,7 @@ from agent.display import (
     _detect_tool_failure,
 )
 from agent.zet_agent_response_mode import (
+    CameraTaskScopeMissing,
     apply_trusted_skill_execution,
     dispatch_trusted_skill_operation,
     trusted_skill_operation_block_message,
@@ -48,6 +49,8 @@ from agent.tool_dispatch_helpers import (
     make_tool_result_message,
 )
 from agent.tool_result_classification import tool_may_have_side_effect
+# zettlab-overlay(camera-scope-halt): import guardrail decision for scoped turn halt; upstream: none
+from agent.tool_guardrails import ToolGuardrailDecision
 from tools.terminal_tool import (
     get_active_env,
 )
@@ -270,6 +273,7 @@ def _cancelled_tool_result(reason: str = "user interrupt") -> str:
     )
 
 
+# zettlab-overlay(H4-B2b): 计划模式工具拦截与硬件助手作用域文案，B2b 删除; upstream: none
 def _zet_agent_plan_mode_block_message(agent, function_name: str, function_args: dict) -> Optional[str]:
     """Block legacy markdown plan-mode paths in Zettlab App sessions."""
     if (getattr(agent, "platform", "") or "") != "zet_agent":
@@ -525,6 +529,7 @@ def _run_agent_tool_execution_middleware(
         block_message = scope_block
         block_error_type = "tool_scope_block"
         if block_message is None:
+            # zettlab-overlay(H4-B2b): 工具执行前套用计划模式拦截，B2b 删除; upstream: none
             block_message = _zet_agent_plan_mode_block_message(
                 agent, function_name, final_args
             )
@@ -570,7 +575,21 @@ def _run_agent_tool_execution_middleware(
             _advance_start_order()
             state["blocked"] = True
             if block_message is not None:
-                result = json.dumps({"error": block_message}, ensure_ascii=False)
+                error_payload = {"error": block_message}
+                if isinstance(block_message, CameraTaskScopeMissing):
+                    error_payload.update(
+                        code=block_message.code,
+                        authorization_status=block_message.authorization_status,
+                    )
+                    # zettlab-overlay(camera-scope-halt): stop the turn after a trusted camera scope miss; upstream: none
+                    agent._set_tool_guardrail_halt(ToolGuardrailDecision(
+                        action="halt",
+                        code=block_message.code,
+                        message=str(block_message),
+                        tool_name=function_name,
+                        count=1,
+                    ))
+                result = json.dumps(error_payload, ensure_ascii=False)
                 error_type = block_error_type
                 error_message = block_message
             else:
@@ -600,6 +619,7 @@ def _run_agent_tool_execution_middleware(
             agent._iters_since_skill = 0
 
         _advance_start_order(_begin)
+        # zettlab-overlay(H4b-unowned): 工具分发期连接器路由能力仅在本次调用内可见，与计划模式无关，不随 B2b 删除; upstream: none
         # The dispatch is the narrowest common boundary for sequential and
         # concurrent tool execution.  Keep the fallback private to this call:
         # the trusted connector runner may read it, but middleware, the model,
@@ -1780,6 +1800,8 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     choices=next_args.get("choices"),
                     multi_select=next_args.get("multi_select", False),
                     callback=agent.clarify_callback,
+                    # zettlab-overlay(connector-dispatch): preserve protected clarify metadata; upstream: none
+                    connector_setup=next_args.get("connector_setup"),
                 )
             function_result, function_args, middleware_trace, _execution_blocked = _managed_values(_run_agent_tool_execution_middleware(
                 agent,
@@ -1815,6 +1837,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             tool_duration = time.time() - tool_start_time
             if agent._should_emit_quiet_tool_messages():
                 agent._vprint(f"  {_get_cute_tool_message_impl('read_terminal', function_args, tool_duration, result=function_result)}")
+        # zettlab-overlay(H4-B2b): 顺序路径 present_plan 分发与播种元数据，B2b 删除; upstream: none
         elif function_name == "present_plan":
             from tools.plan_tool import present_plan_with_meta as _present_plan_with_meta
 
