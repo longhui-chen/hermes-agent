@@ -2942,12 +2942,6 @@ def _guard_job_credential_exfil(job: dict) -> None:
 
 def _connector_execution_blocked_document(error_code: str) -> str:
     """Return an honest terminal report before any Connector tool can run."""
-    if str(error_code).strip() == "task_connector_mixed_skills_unsupported":
-        return (
-            "**定时任务连接配置不支持**\n\n"
-            "该任务同时使用多个连接器，无法安全使用单一执行路由；"
-            "未读取数据、未生成报告。请在当前会话将其拆分为每个连接器独立的定时任务。"
-        )
     if str(error_code).strip() == "task_connector_temporarily_unavailable":
         return (
             "**定时任务连接暂时不可用**\n\n"
@@ -2962,7 +2956,18 @@ def _connector_execution_blocked_document(error_code: str) -> str:
 
 
 def _prepare_connector_execution(job: dict) -> tuple[str, Optional[str]]:
-    """Prepare the AC-local route for one non-Chat Connector Cron provider."""
+    """Prepare the AC-local route for one non-Chat Connector Cron run.
+
+    Skills naming exactly one Connector provider keep the provider-bound
+    route: any failure blocks the run before a Connector tool can execute
+    (unchanged). Skills naming none or several providers request an
+    Agent-level route (empty ``provider_id``; the broker resolves the
+    provider per request). That request is best-effort: when it fails, for
+    example an older broker rejecting the empty provider or a transport
+    error, the run proceeds without a route exactly as before, so ordinary
+    non-Connector jobs are never blocked by this step.
+    """
+    provider_id = ""
     try:
         from cron.connector_execution import (
             enabled,
@@ -2970,10 +2975,10 @@ def _prepare_connector_execution(job: dict) -> tuple[str, Optional[str]]:
             connector_provider_for_skills,
         )
 
-        provider_id = connector_provider_for_skills(job.get("skills") or job.get("skill"))
-        if not provider_id:
-            return "", None
+        provider_id = connector_provider_for_skills(job.get("skills") or job.get("skill")) or ""
         if not enabled():
+            if not provider_id:
+                return "", None
             return "", "task_connector_temporarily_unavailable"
         capability = prepare_route_capability(
             str(job.get("id") or ""),
@@ -2982,7 +2987,14 @@ def _prepare_connector_execution(job: dict) -> tuple[str, Optional[str]]:
         )
         return capability, None
     except Exception as exc:
-        return "", str(getattr(exc, "code", "task_connector_not_authorized"))
+        code = str(getattr(exc, "code", "task_connector_not_authorized"))
+        if not provider_id:
+            logger.warning(
+                "Job '%s': agent-level connector route unavailable (%s); running without a route",
+                job.get("id"), code,
+            )
+            return "", None
+        return "", code
 
 
 def _attach_private_connector_execution(job: dict) -> dict:
