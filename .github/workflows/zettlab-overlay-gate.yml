@@ -55,6 +55,9 @@ jobs:
         run: |
           git fetch --no-tags --quiet origin "+refs/pull/${PR_NUMBER}/head:refs/remotes/pr/head"
           test "$(git rev-parse refs/remotes/pr/head)" = "$HEAD_SHA" || { echo "PR head ref/sha mismatch"; exit 2; }
+          # main 回灌集成分支时，上游整段增量相对集成分支成了无标记新增。
+          # 取一份可信的 origin/main 供 --upstream-ref 逐字比对（remote ref，非 PR 输入）。
+          git fetch --no-tags --quiet origin "+refs/heads/main:refs/remotes/origin/main"
       - name: Overlay gate (HR8)
         env:
           PR_BODY: ${{ github.event.pull_request.body }}
@@ -69,4 +72,5 @@ jobs:
             --repo "$GITHUB_WORKSPACE" \
             --base "origin/${BASE_REF}" --head refs/remotes/pr/head \
             --pr-body-file "$RUNNER_TEMP/pr_body.txt" --head-ref "$HEAD_REF" \
-            --pr-labels "$PR_LABELS" --head-repo "$HEAD_REPO" --base-repo "$BASE_REPO"
+            --pr-labels "$PR_LABELS" --head-repo "$HEAD_REPO" --base-repo "$BASE_REPO" \
+            --upstream-ref refs/remotes/origin/main

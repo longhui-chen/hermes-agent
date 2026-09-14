@@ -98,6 +98,7 @@ class GateResult:
     skip_reason: str = ""
     protected_files: List[str] = field(default_factory=list)
     added_total: int = 0
+    upstream_merge_hunks: int = 0
     violations: List[Violation] = field(default_factory=list)
 
     @property
@@ -293,6 +294,40 @@ def should_skip(head_ref: str, config: dict, labels: Sequence[str] = (), head_re
     return True
 
 
+def upstream_file_lines(repo: Path, ref: str, path: str) -> Optional[set]:
+    """Verbatim non-blank line set of ``path`` at ``ref``; ``None`` when ref/blob is absent."""
+    if not ref:
+        return None
+    try:
+        raw = _git_bytes(repo, "show", f"{ref}:{path}")
+    except Exception:
+        return None
+    return {line.strip() for line in raw.decode("utf-8", "replace").splitlines() if line.strip()}
+
+
+def hunk_is_upstream_merge(hunk: "Hunk", upstream_lines: Optional[set]) -> bool:
+    """True when every added non-blank line already exists verbatim upstream.
+
+    A main-into-integration back-merge replays hundreds of upstream lines that were
+    each gated on their own PR (there the base was main's prior state, so every hunk
+    was small and carried its marker). Diffed against the integration branch they
+    arrive as one large unmarked block. Re-marking them would file upstream code as
+    fork overlay and corrupt the ownership ledger (附录 H), so a hunk whose added
+    lines all exist upstream verbatim counts as already gated: no marker required and
+    not counted against the overlay budget.
+
+    Deliberately strict: *every* added line must match, so a hunk that mixes upstream
+    code with even one fork-authored line still needs its own marker. The ref is a
+    trusted remote ref supplied by the workflow (``origin/main``), never PR input.
+    """
+    if not upstream_lines:
+        return False
+    added = [line.strip() for line in hunk.added if line.strip()]
+    if not added:
+        return False
+    return all(line in upstream_lines for line in added)
+
+
 def run_gate(
     repo: Path,
     base: str,
@@ -303,6 +338,8 @@ def run_gate(
     labels: Sequence[str] = (),
     head_repo: str = "",
     base_repo: str = "",
+    *,
+    upstream_ref: str = "",
 ) -> GateResult:
     result = GateResult()
     if should_skip(head_ref, config, labels, head_repo, base_repo):
@@ -351,9 +388,16 @@ def run_gate(
 
     file_cache: dict = {}
     comment_cache: dict = {}
+    upstream_cache: dict = {}
     for hunk in hunks:
         if hunk.added_nonblank == 0:
             continue  # deletion-only: converging to upstream needs no marker
+        if upstream_ref:
+            if hunk.path not in upstream_cache:
+                upstream_cache[hunk.path] = upstream_file_lines(repo, upstream_ref, hunk.path)
+            if hunk_is_upstream_merge(hunk, upstream_cache[hunk.path]):
+                result.upstream_merge_hunks += 1
+                continue  # every added line already exists verbatim upstream: already gated
         result.added_total += hunk.added_nonblank
         lines = file_cache.setdefault(hunk.path, new_file_lines(repo, head, hunk.path))
         if hunk.path not in comment_cache:
@@ -421,13 +465,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--pr-labels", default="", help="comma-separated PR label names")
     parser.add_argument("--head-repo", default="", help="owner/name of the PR head repository")
     parser.add_argument("--base-repo", default="", help="owner/name of the base repository")
+    parser.add_argument(
+        "--upstream-ref",
+        default="",
+        help="trusted upstream ref (e.g. origin/main); hunks whose added lines all exist there "
+             "verbatim are treated as already gated (main-into-integration back-merges)",
+    )
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     args = parser.parse_args(argv)
 
     config = load_config(args.config)
     pr_body = args.pr_body_file.read_text(encoding="utf-8") if args.pr_body_file and args.pr_body_file.exists() else ""
     labels = [item.strip() for item in args.pr_labels.split(",") if item.strip()]
-    result = run_gate(args.repo.resolve(), args.base, args.head, pr_body, args.head_ref, config, labels, args.head_repo, args.base_repo)
+    result = run_gate(
+        args.repo.resolve(), args.base, args.head, pr_body, args.head_ref, config,
+        labels, args.head_repo, args.base_repo, upstream_ref=args.upstream_ref,
+    )
 
     if result.skipped:
         print(f"overlay gate: SKIP ({result.skip_reason})")
