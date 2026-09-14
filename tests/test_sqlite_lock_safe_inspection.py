@@ -18,6 +18,7 @@ out across Hermes' inspection calls.
 
 from __future__ import annotations
 
+import os
 import sqlite3
 import subprocess
 import sys
@@ -69,6 +70,24 @@ def _make_db(path, journal_mode: str) -> None:
     conn.execute("CREATE TABLE t(v TEXT)")
     conn.executemany("INSERT INTO t(v) VALUES (?)", [(f"row{i}",) for i in range(200)])
     conn.close()
+
+
+def test_connect_tracked_private_mode_ignores_process_umask(tmp_path, clean_registry):
+    from hermes_cli.sqlite_safe_read import connect_tracked
+
+    db = tmp_path / "state.db"
+    old_umask = os.umask(0)
+    try:
+        conn = connect_tracked(db, isolation_level=None, private_mode=0o600)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("CREATE TABLE t(v TEXT)")
+        conn.execute("INSERT INTO t(v) VALUES ('value')")
+        assert db.stat().st_mode & 0o777 == 0o600
+        assert db.with_name("state.db-wal").stat().st_mode & 0o777 == 0o600
+        assert db.with_name("state.db-shm").stat().st_mode & 0o777 == 0o600
+        conn.close()
+    finally:
+        os.umask(old_umask)
 
 
 @pytest.fixture

@@ -2245,11 +2245,14 @@ def create_job(
     source: Optional[str] = None,
     app_slug: Optional[str] = None,
     import_operation: Optional[str] = None,
+    enabled: bool = True,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
 
     Args:
+        enabled: False creates the job atomically paused, before any scheduler
+                 can claim it. Omitted preserves immediate scheduling.
         prompt: The prompt to run (must be self-contained, or a task instruction when skill is set).
                 Ignored when ``no_agent=True`` except as an optional name hint.
         schedule: Schedule string (see parse_schedule)
@@ -2301,6 +2304,8 @@ def create_job(
     Returns:
         The created job dict
     """
+    if not isinstance(enabled, bool):
+        raise ValueError("enabled must be a boolean")
     # Validate the per-job timezone up-front so parse_schedule can honour it
     # for naive ISO timestamps (e.g. "2026-05-25T10:30" → 10:30 wall in tz).
     normalized_tz = _validate_tz_name(timezone)
@@ -2431,9 +2436,9 @@ def create_job(
             "times": repeat,  # None = forever
             "completed": 0
         },
-        "enabled": True,
-        "state": "scheduled",
-        "paused_at": None,
+        "enabled": enabled,
+        "state": "scheduled" if enabled else "paused",
+        "paused_at": None if enabled else now,
         "paused_reason": None,
         "created_at": now,
         "next_run_at": initial_next_run_at,

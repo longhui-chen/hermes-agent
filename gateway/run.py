@@ -1471,6 +1471,7 @@ _JSON_MEDIA_TOOL_PATH_FIELDS = {
 }
 
 
+# zettlab-overlay(H29-B3): 工具输出媒体标记抽取，B3 产物声明后复审; upstream: none
 # Extension-anchored MEDIA: matcher for tool results. Mirrors the dispatch-site
 # pattern so a bare ``MEDIA:`` token in prose (no deliverable extension) is never
 # auto-appended. Kept local to the auto-append path; the producer-tool allowlist
@@ -1825,6 +1826,7 @@ def _bridge_max_turns_from_config(home: "Path") -> None:
     _apply_config_timezone_authority(cfg)
 
 
+# zettlab-overlay(H30-unowned): 配置时区权威与静默校验，随 H30 独立收敛; upstream: none
 def _is_valid_iana_timezone(name: str) -> bool:
     """True if ``name`` is a real IANA zone — quiet (no logging side effect).
 
@@ -6902,6 +6904,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         task.add_done_callback(consume_detached_task_result)
         return False
 
+    # zettlab-overlay(H30-unowned): adapter cleanup 严格等待，随 H30 独立收敛; upstream: none
     async def _await_adapter_cleanup_strict(
         self, cleanup: Awaitable[Any], timeout: float
     ) -> None:
@@ -11602,6 +11605,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         
         Returns True if at least one adapter connected successfully.
         """
+        # zettlab-overlay(H30-unowned): zet_agent 进程边界预检，随 H30 独立收敛; upstream: none
         zet_agent_config = self.config.platforms.get(Platform.ZET_AGENT)
         self._zet_agent_process_boundary_failed = False
         if zet_agent_config is not None and zet_agent_config.enabled:
@@ -22821,6 +22825,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             *args,
         )
 
+    # zettlab-overlay(H29-B3): executor worker 取消完成栅栏，B3 相邻待复审; upstream: none
     async def _run_in_executor_with_context_completion_barrier(self, func, *args):
         """请求取消时等待不可取消的 executor worker 真正结束。"""
         worker = asyncio.create_task(
@@ -23381,6 +23386,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         chat_type = str(evt.get("chat_type") or derived_chat_type or "").strip().lower()
         chat_id = str(evt.get("chat_id") or derived_chat_id or "").strip()
         if not platform_name or not chat_type or not chat_id:
+            # zettlab-overlay(H28-unowned): 适配器认领自有 session 的 process event，上游 PR 首选; upstream: none
             # zettlab fork: adapter-owned opaque session keys (zet_agent binds
             # the local-server session id verbatim, no "platform:chat_type:…"
             # shape) never parse into routing fields — before declaring the
@@ -23537,6 +23543,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             parent_session_id = str(evt.get("parent_session_id") or "").strip()
             if parent_session_id:
                 metadata["gateway_session_id"] = parent_session_id
+            # zettlab-overlay(H28-unowned): 结构化完成事件外露给适配层，上游 PR 首选; upstream: none
             # zettlab fork: expose the structured completion event so adapters
             # that deliver externally (zet_agent → local-server) can forward
             # machine-readable results instead of re-parsing synth_text.

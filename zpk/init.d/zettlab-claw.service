@@ -39,7 +39,7 @@ OOMPolicy=continue
 NoNewPrivileges=true
 PrivateTmp=true
 RuntimeDirectory=zettlab-claw
-RuntimeDirectoryMode=0755
+RuntimeDirectoryMode=0700
 # CAP_SYS_PTRACE lets the root service audit hidden procfs entries.
 ProtectProc=invisible
 CapabilityBoundingSet=~CAP_SYS_ADMIN

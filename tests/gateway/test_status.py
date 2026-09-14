@@ -59,6 +59,20 @@ class TestGatewayPidState:
         assert status.is_gateway_runtime_lock_active() is False
 
 
+    def test_runtime_lock_is_owner_only_under_permissive_umask(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        old_umask = os.umask(0)
+        try:
+            assert status.acquire_gateway_runtime_lock() is True
+        finally:
+            os.umask(old_umask)
+            status.release_gateway_runtime_lock()
+
+        assert (tmp_path / "gateway.lock").stat().st_mode & 0o777 == 0o600
+
+
     def test_get_running_pid_cached_invalidates_when_pid_file_changes(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         status._clear_running_pid_cache()
@@ -877,6 +891,29 @@ class TestRespawnStormBreaker:
                 max_starts=5, window_s=120.0
             )
             assert result is None
+
+    def test_start_log_is_owner_only_under_permissive_umask(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        old_umask = os.umask(0)
+        try:
+            assert status.record_start_and_check_storm() is None
+        finally:
+            os.umask(old_umask)
+
+        assert (tmp_path / "gateway-starts.log").stat().st_mode & 0o777 == 0o600
+
+
+def test_write_pid_file_is_owner_only_under_permissive_umask(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    old_umask = os.umask(0)
+    try:
+        status.write_pid_file()
+    finally:
+        os.umask(old_umask)
+
+    assert (tmp_path / "gateway.pid").stat().st_mode & 0o777 == 0o600
 
 
 class TestLaunchdPlistRespawnGovernance:

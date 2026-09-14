@@ -673,6 +673,28 @@ def test_camera_media_intent_is_not_inventory_only():
     assert not task.camera_inventory_only
 
 
+@pytest.mark.parametrize("message", [
+    "我已经授权了摄像头，再试下",
+    "摄像头已经打开，重试",
+    "摄像头开关打开了，重试刚才的操作",
+])
+def test_camera_authorization_retry_is_inventory_only(message):
+    task = response_mode._skill_direct_task_context(_FakeAgent(), message)
+    assert task.camera_applicable
+    assert task.camera_inventory_only
+
+
+@pytest.mark.parametrize("message", [
+    "再试下",
+    "总结“我已经授权了摄像头，再试下”这句话",
+    "我已经授权了摄像头，再试下并开始持续监控",
+    "我没有授权摄像头，再试下",
+])
+def test_camera_retry_does_not_infer_authority_from_unrelated_text(message):
+    task = response_mode._skill_direct_task_context(_FakeAgent(), message)
+    assert not task.camera_applicable
+
+
 def test_camera_inventory_command_policy_allows_list_but_blocks_capture(
     monkeypatch,
 ):
@@ -826,7 +848,8 @@ def test_camera_list_result_extracts_response_bounded_valid_id_snapshot():
     assert response_mode._camera_ids_from_terminal_result(oversized_output) is None
 
 
-def test_camera_snapshot_attachment_stays_under_active_output_root(tmp_path):
+@pytest.mark.parametrize("action,status", [("snap", "ok"), ("history", "sampled"), ("history", "insufficient_evidence")])
+def test_camera_snapshot_attachment_stays_under_active_output_root(tmp_path, action, status):
     from agent import secret_scope as secret_scope_module
 
     output_root = tmp_path / "output"
@@ -845,8 +868,8 @@ def test_camera_snapshot_attachment_stays_under_active_output_root(tmp_path):
             "output": json.dumps(
                 {
                     "data": {
-                        "action": "snap",
-                        "status": "ok",
+                        "action": action,
+                        "status": status,
                         "attachment_path": str(frame),
                     }
                 }
@@ -857,6 +880,16 @@ def test_camera_snapshot_attachment_stays_under_active_output_root(tmp_path):
         ) == str(frame.resolve())
         assert response_mode._trusted_camera_attachment_path(str(outside)) is None
         assert response_mode._trusted_camera_attachment_path(str(symlink)) is None
+        for path in (outside, symlink):
+            rejected = {"output": json.dumps({"data": {
+                "action": action, "status": status, "attachment_path": str(path),
+            }})}
+            assert response_mode._camera_attachment_path_from_terminal_result(rejected) is None
+        for invalid_action, invalid_status in (("history", "failed"), ("history", "ok"), ("clip", "ok")):
+            rejected = {"output": json.dumps({"data": {
+                "action": invalid_action, "status": invalid_status, "attachment_path": str(frame),
+            }})}
+            assert response_mode._camera_attachment_path_from_terminal_result(rejected) is None
     finally:
         secret_scope_module.reset_secret_scope(scope_token)
 
@@ -941,6 +974,9 @@ def test_camera_vision_scope_is_bound_to_exact_current_attachment(monkeypatch):
         ("查看下硬件连接中的电脑", ()),
         ("查看硬件连接中的电脑有哪些文件", ()),
         ("查看已连接的电脑", ()),
+        ("调用 camera doctor，检查当前 Agent 的摄像头授权、设备连接和可用能力", ()),
+        ("调用 camera list，列出当前摄像头、授权状态和可用能力", ()),
+        ("检查并连接摄像头", ("camera",)),
         ("Show connected computers", ()),
         ("Show the computer connection status", ()),
         ("帮我重新连接电脑", ("pc_node",)),
@@ -1112,6 +1148,42 @@ def test_hardware_status_turn_strips_model_authored_enrollment_card():
     assert response == "摄像头在线，打印机当前会话未授权。"
 
 
+def test_hardware_diagnostic_turn_strips_model_authored_connector_enrollment_card():
+    agent = _FakeAgent()
+    agent.platform = "zet_agent"
+    response = response_mode.ensure_hardware_enrollment_intent(
+        agent,
+        user_message="调用 camera doctor，检查当前 Agent 的摄像头授权、设备连接和可用能力",
+        response_text=(
+            "摄像头已授权，设备连接正常。\n\n"
+            "```zettlab-connector-enrollment-intent\n"
+            '{"schema_version":"2","kind":"connector_enrollment",'
+            '"items":[{"resource_kind":"camera"}],"setup_requested":true}\n```'
+        ),
+        completed=True,
+        failed=False,
+        interrupted=False,
+        structured_output=False,
+    )
+
+    assert response == "摄像头已授权，设备连接正常。"
+
+
+def test_direct_input_client_never_receives_legacy_enrollment_card():
+    agent = _FakeAgent()
+    agent.platform = "zet_agent"
+    agent._zettlab_connector_direct_input = True
+    for original in (
+        "继续连接。",
+        '继续连接。\n```zettlab-hardware-enrollment-intent\n{"schema_version":"1","kind":"hardware","requested_types":["camera"]}\n```',
+    ):
+        response = response_mode.ensure_hardware_enrollment_intent(
+            agent, user_message="帮我连接摄像头", response_text=original,
+            completed=True, failed=False, interrupted=False, structured_output=False,
+        )
+        assert response == "继续连接。"
+
+
 def test_hardware_enrollment_fallback_ignores_non_app_and_failed_turns():
     agent = _FakeAgent()
     agent.platform = "telegram"
@@ -1139,14 +1211,16 @@ def test_hardware_enrollment_fallback_ignores_non_app_and_failed_turns():
 
 
 @pytest.mark.parametrize(
-    ("message", "explicit_skill_slug"),
+    ("message", "explicit_skill_slug", "inventory_only"),
     [
-        ("拍一张快照", ""),
-        ("返回当前最新的一张图片", "camsnap"),
+        ("拍一张快照", "", False),
+        ("返回当前最新的一张图片", "camsnap", False),
+        ("我已经授权了摄像头，再试下", "", True),
     ],
 )
+@pytest.mark.parametrize("capture_action,capture_status", [("snap", "ok"), ("history", "sampled"), ("history", "insufficient_evidence")])
 def test_camera_runtime_receipt_requires_attested_camsnap_scope_flow(
-    tmp_path, monkeypatch, message, explicit_skill_slug
+    tmp_path, monkeypatch, message, explicit_skill_slug, inventory_only, capture_action, capture_status
 ):
     from agent import secret_scope as secret_scope_module
     from gateway.session_context import clear_session_vars, set_session_vars
@@ -1171,6 +1245,8 @@ def test_camera_runtime_receipt_requires_attested_camsnap_scope_flow(
         command = str(args.get("command") or "")
         if command.endswith(" list"):
             return ["python3", "camera_connector.py", "list"]
+        if " history --camera-id " in command:
+            return command.split()
         if " snap --camera-id " in command:
             return [
                 "python3",
@@ -1222,6 +1298,7 @@ def test_camera_runtime_receipt_requires_attested_camsnap_scope_flow(
         assert trusted_skill_allowed_tool_names(agent) == {
             "terminal",
             "vision_analyze",
+            "clarify",
         }
         policy_error = trusted_skill_operation_block_message(
             agent,
@@ -1287,6 +1364,14 @@ def test_camera_runtime_receipt_requires_attested_camsnap_scope_flow(
             dispatch=_dispatch_list,
         )
 
+        if inventory_only:
+            assert trusted_skill_operation_block_message(
+                agent, function_name="terminal", function_args={
+                    "command": "python3 camera_connector.py snap --camera-id cam_front",
+                },
+            ) is not None
+            return
+
         invented_error = trusted_skill_operation_block_message(
             agent,
             function_name="terminal",
@@ -1300,7 +1385,8 @@ def test_camera_runtime_receipt_requires_attested_camsnap_scope_flow(
 
         snap_args = {
             "command": (
-                "python3 camera_connector.py snap --camera-id cam_front"
+                f"python3 camera_connector.py {capture_action} --camera-id cam_front"
+                + (" --start 2026-01-01T00:00:00Z --end 2026-01-01T00:00:30Z" if capture_action == "history" else "")
             ),
             "workdir": "agent_output",
         }
@@ -1317,8 +1403,8 @@ def test_camera_runtime_receipt_requires_attested_camsnap_scope_flow(
                     "output": json.dumps(
                         {
                             "data": {
-                                "action": "snap",
-                                "status": "ok",
+                                "action": capture_action,
+                                "status": capture_status,
                                 "camera_id": "cam_front",
                                 "attachment_path": "/trusted/output/current.jpg",
                             }

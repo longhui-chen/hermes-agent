@@ -1,7 +1,7 @@
 {
   "snapshot_version": 2,
-  "root_commit": "0d52d0638db8b322806d31322e673842126b5f09",
-  "sha256": "bc9f7a0c166f85f03589d2557e9f3957710ad0411d93909ca49b700c46babf77",
+  "root_commit": "2b37c20854ae8b42be965e079534648a4d636c8b",
+  "sha256": "d103aa1d4adb22e817aa728424367df92018186133eda55d545af5242c173275",
   "payload": {
     "golden": {
       "events": {
@@ -322,7 +322,8 @@
             ],
             "expires_at_ms": 1756973100000,
             "state": "cancelled",
-            "state_reason": "delivery_failed"
+            "state_reason": "delivery_failed",
+            "connector_setup": null
           }
         },
         "clarify.cancelled.session_reset": {
@@ -341,7 +342,8 @@
             ],
             "expires_at_ms": 1756973100000,
             "state": "cancelled",
-            "state_reason": "session_reset"
+            "state_reason": "session_reset",
+            "connector_setup": null
           }
         },
         "clarify.cancelled.turn_interrupted": {
@@ -360,7 +362,27 @@
             ],
             "expires_at_ms": 1756973100000,
             "state": "cancelled",
-            "state_reason": "turn_interrupted"
+            "state_reason": "turn_interrupted",
+            "connector_setup": null
+          }
+        },
+        "clarify.connector-setup": {
+          "type": "clarify",
+          "turn_id": "turn_demo_0001",
+          "seq": 18,
+          "fanout_seq": 18,
+          "ts": 1756972800000,
+          "backend": "hermes",
+          "data": {
+            "clarify_id": "clr_demo_0001",
+            "question": "Connector setup",
+            "choices_offered": [],
+            "expires_at_ms": 1756973100000,
+            "state": "",
+            "state_reason": "",
+            "connector_setup": {
+              "resource_kind": "camera"
+            }
           }
         },
         "clarify.expired.timeout": {
@@ -379,7 +401,8 @@
             ],
             "expires_at_ms": 1756973100000,
             "state": "expired",
-            "state_reason": "timeout"
+            "state_reason": "timeout",
+            "connector_setup": null
           }
         },
         "clarify": {
@@ -398,7 +421,8 @@
             ],
             "expires_at_ms": 1756973100000,
             "state": "",
-            "state_reason": ""
+            "state_reason": "",
+            "connector_setup": null
           }
         },
         "clarify.runtime_lost.gateway_restart": {
@@ -417,7 +441,8 @@
             ],
             "expires_at_ms": 1756973100000,
             "state": "runtime_lost",
-            "state_reason": "gateway_restart"
+            "state_reason": "gateway_restart",
+            "connector_setup": null
           }
         },
         "clarify.runtime_lost.request_unknown": {
@@ -436,7 +461,8 @@
             ],
             "expires_at_ms": 1756973100000,
             "state": "runtime_lost",
-            "state_reason": "request_unknown"
+            "state_reason": "request_unknown",
+            "connector_setup": null
           }
         },
         "context.compaction": {
@@ -1441,13 +1467,13 @@
           "interaction_id": "ia_demo_0002",
           "interaction_generation": 2,
           "interaction_delivery_version": 1,
-          "question": "周末指哪两天？",
-          "choices_offered": [
-            "上周末",
-            "本周末"
-          ],
+          "question": "Connector setup",
+          "choices_offered": [],
           "expires_at_ms": 1756973100000,
-          "turn_id": "turn_demo_0001"
+          "turn_id": "turn_demo_0001",
+          "connector_setup": {
+            "resource_kind": "camera"
+          }
         },
         "hermes.delegation.progress": {
           "type": "hermes.delegation.progress",
@@ -2172,6 +2198,106 @@
               "required": false,
               "type": "string"
             },
+            "connector_setup": {
+              "required": false,
+              "type": "object",
+              "items": {
+                "struct": "ConnectorSetupIntent",
+                "fields": {
+                  "auth_kind": {
+                    "required": false,
+                    "type": "string"
+                  },
+                  "live": {
+                    "required": false,
+                    "type": "object",
+                    "items": {
+                      "struct": "CameraLiveIntent",
+                      "fields": {
+                        "camera_id": {
+                          "required": true,
+                          "type": "string"
+                        }
+                      }
+                    }
+                  },
+                  "observation": {
+                    "required": false,
+                    "type": "object",
+                    "items": {
+                      "struct": "CameraObservationIntent",
+                      "fields": {
+                        "camera_id": {
+                          "required": true,
+                          "type": "string"
+                        },
+                        "duration_seconds": {
+                          "required": true,
+                          "type": "number"
+                        },
+                        "min_duration_seconds": {
+                          "required": false,
+                          "type": "number"
+                        },
+                        "predicate": {
+                          "required": true,
+                          "type": "string"
+                        },
+                        "subject_kind": {
+                          "required": true,
+                          "type": "string"
+                        },
+                        "subject_ref": {
+                          "required": false,
+                          "type": "string"
+                        },
+                        "zone_id": {
+                          "required": false,
+                          "type": "string"
+                        }
+                      }
+                    }
+                  },
+                  "provider_id": {
+                    "required": false,
+                    "type": "string"
+                  },
+                  "recording": {
+                    "required": false,
+                    "type": "object",
+                    "items": {
+                      "struct": "CameraRecordingIntent",
+                      "fields": {
+                        "camera_id": {
+                          "required": true,
+                          "type": "string"
+                        },
+                        "retention_days": {
+                          "required": false,
+                          "type": "number"
+                        }
+                      }
+                    }
+                  },
+                  "resource_kind": {
+                    "required": true,
+                    "type": "string"
+                  },
+                  "template_id": {
+                    "required": false,
+                    "type": "string"
+                  },
+                  "url": {
+                    "required": false,
+                    "type": "string"
+                  },
+                  "variables": {
+                    "required": false,
+                    "type": "object"
+                  }
+                }
+              }
+            },
             "expires_at_ms": {
               "required": true,
               "type": "number"
@@ -2545,6 +2671,106 @@
                   "clarify_id": {
                     "required": false,
                     "type": "string"
+                  },
+                  "connector_setup": {
+                    "required": false,
+                    "type": "object",
+                    "items": {
+                      "struct": "ConnectorSetupIntent",
+                      "fields": {
+                        "auth_kind": {
+                          "required": false,
+                          "type": "string"
+                        },
+                        "live": {
+                          "required": false,
+                          "type": "object",
+                          "items": {
+                            "struct": "CameraLiveIntent",
+                            "fields": {
+                              "camera_id": {
+                                "required": true,
+                                "type": "string"
+                              }
+                            }
+                          }
+                        },
+                        "observation": {
+                          "required": false,
+                          "type": "object",
+                          "items": {
+                            "struct": "CameraObservationIntent",
+                            "fields": {
+                              "camera_id": {
+                                "required": true,
+                                "type": "string"
+                              },
+                              "duration_seconds": {
+                                "required": true,
+                                "type": "number"
+                              },
+                              "min_duration_seconds": {
+                                "required": false,
+                                "type": "number"
+                              },
+                              "predicate": {
+                                "required": true,
+                                "type": "string"
+                              },
+                              "subject_kind": {
+                                "required": true,
+                                "type": "string"
+                              },
+                              "subject_ref": {
+                                "required": false,
+                                "type": "string"
+                              },
+                              "zone_id": {
+                                "required": false,
+                                "type": "string"
+                              }
+                            }
+                          }
+                        },
+                        "provider_id": {
+                          "required": false,
+                          "type": "string"
+                        },
+                        "recording": {
+                          "required": false,
+                          "type": "object",
+                          "items": {
+                            "struct": "CameraRecordingIntent",
+                            "fields": {
+                              "camera_id": {
+                                "required": true,
+                                "type": "string"
+                              },
+                              "retention_days": {
+                                "required": false,
+                                "type": "number"
+                              }
+                            }
+                          }
+                        },
+                        "resource_kind": {
+                          "required": true,
+                          "type": "string"
+                        },
+                        "template_id": {
+                          "required": false,
+                          "type": "string"
+                        },
+                        "url": {
+                          "required": false,
+                          "type": "string"
+                        },
+                        "variables": {
+                          "required": false,
+                          "type": "object"
+                        }
+                      }
+                    }
                   },
                   "expires_at_ms": {
                     "required": true,
@@ -4004,10 +4230,11 @@
               "extra": []
             },
             "message.appended": {
+              "extra": [],
               "type_mismatch": [
                 "msg_id"
               ],
-              "reason": "Web declares msg_id as string while local-server sends the int64 chat_messages row id (App already declares number). Web keys its dedupe map by String(msg_id); align the type in chat-ui-b1-lifecycle-error together with the dedupe call sites."
+              "reason": "Web declares msg_id as string while local-server sends the int64 chat_messages row id (App already declares number). Web keys its dedupe map by String(msg_id); align the type in chat-ui-b1-lifecycle-error together with the dedupe call sites. reason / truncated 已随 chat-ui-b1-lifecycle-error 落地：两个字段现在由 local-server 实际发射，web 侧不再是 phantom，登记项于 U8-pre 回灌 main 时删除（#459 登记的那两条）。"
             },
             "tool.result": {
               "extra": [

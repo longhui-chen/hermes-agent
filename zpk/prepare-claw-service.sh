@@ -159,6 +159,37 @@ secure_state_directories() {
     done
 }
 
+secure_runtime_state_files() {
+    local name path uid
+    for name in \
+        state.db state.db-shm state.db-wal \
+    kanban.db kanban.db-shm kanban.db-wal \
+    kanban.db.init.lock kanban.db.dispatch.lock \
+        .update_check gateway-starts.log gateway-starts.tmp gateway.lock gateway.pid
+    do
+        path="$HERMES_HOME/$name"
+        if [ -L "$path" ] || { [ -e "$path" ] && [ ! -f "$path" ]; }; then
+            echo "refusing non-regular runtime state file: $path" >&2
+            exit 1
+        fi
+        [ -e "$path" ] || continue
+        uid="$(stat -c '%u' "$path" 2>/dev/null || stat -f '%u' "$path" 2>/dev/null || true)"
+        if [ "$(id -u)" -eq 0 ] && [ "$uid" != "0" ]; then
+            echo "refusing runtime state file not owned by service user: $path" >&2
+            exit 1
+        fi
+        chmod 0600 "$path"
+    done
+
+    # The gateway lock accepts an existing empty file. Create it securely
+    # before Hermes opens it with Python's default process umask.
+    path="$HERMES_HOME/gateway.lock"
+    if [ ! -e "$path" ]; then
+        (umask 077; : > "$path")
+    fi
+    chmod 0600 "$path"
+}
+
 secure_profile_secret_files() {
     local profiles_root="$HERMES_HOME/profiles" path uid process_uid
     process_uid="$(id -u)"
@@ -670,6 +701,7 @@ esac
 
 secure_state_directories
 acquire_prepare_lock
+secure_runtime_state_files
 secure_profile_secret_files
 scrub_legacy_langfuse_credentials
 ZETTLAB_PRESETS_DIR="$(detect_zettlab_presets_dir || true)"

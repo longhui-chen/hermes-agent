@@ -70,6 +70,7 @@ class TodoStore:
 
     def __init__(self):
         self._items: List[Dict[str, str]] = []
+        # zettlab-overlay(H5-B2b): 计划播种状态字段，B2b 删除; upstream: none
         # Plan-seeding state（结构保护合并的依据）：仅当清单由计划播种（或从
         # 历史回放出带 plan_id 的条目）时非空。
         self._plan_id: Optional[str] = None
@@ -80,6 +81,7 @@ class TodoStore:
         """plan_id of the seeded plan this list is linked to, if any."""
         return self._plan_id
 
+    # zettlab-overlay(H5-B2b): 用计划骨架播种 todo，B2b 删除; upstream: none
     def seed_from_plan(
         self,
         plan_id: str,
@@ -152,6 +154,7 @@ class TodoStore:
             merge: if False, replace the entire list. If True, update
                    existing items by id and append new ones.
         """
+        # zettlab-overlay(H5-B2b): 写入路径的播种骨架保护与解除，B2b 删除; upstream: none
         # 终态计划解除保护（codex P1）：播种条目全部 completed/cancelled 后计划
         # 已经收场，后续写入都是模型在为**新任务**记录——merge=false 继续保护会
         # 把旧骨架强行保留，merge=true 则会把新待办盖上旧 plan_id 混进已结束的
@@ -224,6 +227,7 @@ class TodoStore:
         """Return a copy of the current list."""
         return [item.copy() for item in self._items]
 
+    # zettlab-overlay(H5-B2b): 计划保护的解除、重上膛与受保护替换，B2b 删除; upstream: none
     def disarm_plan_protection(self) -> bool:
         """Drop plan armament explicitly (unconfirmed / mismatched-ack expiry).
 
@@ -349,6 +353,7 @@ class TodoStore:
             self._plan_id = None
             self._plan_seeded_ids = set()
 
+    # zettlab-overlay(H5-unowned): todo 正文按上限压缩，上游 PR 候选; upstream: none
     def compact_contents(self, max_chars_per_item: int) -> bool:
         """Truncate every item's content in place（收尾快照预算用）.
 
@@ -366,6 +371,7 @@ class TodoStore:
                 changed = True
         return changed
 
+    # zettlab-overlay(H5-B2b): 整表取消播种待办，B2b 删除; upstream: none
     def cancel_plan_items(self) -> bool:
         """Cancel every unfinished item of the seeded plan（取消回执处理）.
 
@@ -382,6 +388,7 @@ class TodoStore:
                 changed = True
         return changed
 
+    # zettlab-overlay(H5-B2b): turn 末残留 in_progress 降回 pending，B2b 删除; upstream: none
     def demote_stale_in_progress(self) -> bool:
         """Turn-end host-side correction (Codex #21327 lesson).
 
@@ -510,6 +517,7 @@ class TodoStore:
 
         validated: Dict[str, str] = {"id": item_id, "content": content, "status": status}
 
+        # zettlab-overlay(H5-B2b): 校验并保留计划归属字段，B2b 删除; upstream: none
         group_index = item.get("group_index")
         if isinstance(group_index, bool):
             group_index = None
@@ -662,6 +670,7 @@ TODO_SCHEMA = {
                             "enum": ["pending", "in_progress", "completed", "cancelled"],
                             "description": "Current status"
                         },
+                        # zettlab-overlay(H5-B2b): schema 暴露计划归属字段，B2b 删除; upstream: none
                         "group_index": {
                             "type": "integer",
                             "description": (

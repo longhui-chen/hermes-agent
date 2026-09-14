@@ -1094,6 +1094,10 @@ _CAMERA_RUNTIME_RELATIVE_PATH = Path(
 )
 _CAMERA_RUNTIME_MANIFEST_RELATIVE_PATH = Path("skills/camsnap/manifest.yaml")
 _CAMERA_RUNTIME_CAPABILITY = "zettlab.camera.actions.v1"
+_CAMERA_SEMANTIC_SCRIPT = "camera_semantic_monitor.py"
+_CAMERA_SEMANTIC_PATH = Path(
+    "skills/camera-semantic-evaluation/scripts/camera_semantic_monitor.py"
+)
 _PRINTER3D_RUNTIME_SCRIPTS = frozenset({
     "printer3d_connector.py",
     "printer3d_control.py",
@@ -2333,7 +2337,9 @@ def _run_connector_runtime_command_if_allowed(
         #      可能回写到错误的会话或 profile。
         # 黑名单是开集(下一个键还得再补一次),白名单是闭集:脚本需要什么,由 injected_env
         # 显式给,⛔ 不从进程环境里捡。
+        # zettlab-overlay(connector-session): Redact the local profile credential in runner output; upstream: none
         secret_values = [
+            connector_env.get("ZETTLAB_AGENT_ACTION_TOKEN", ""),
             connector_env.get("HERMES_SESSION_KEY", ""),
             connector_env.get("ZETTLAB_CONNECTORS_URL", ""),
         ]
@@ -2642,8 +2648,12 @@ class _SmartHomeRuntimeCommand:
 
 
 def _resolve_camera_runtime_script(raw_path: str) -> Optional[Path]:
+    relative_path = {
+        _CAMERA_RUNTIME_SCRIPT: _CAMERA_RUNTIME_RELATIVE_PATH,
+        _CAMERA_SEMANTIC_SCRIPT: _CAMERA_SEMANTIC_PATH,
+    }.get(Path(raw_path).name)
     anchor = _capture_connector_runtime_root()
-    if anchor is None:
+    if anchor is None or relative_path is None:
         return None
     relative_text: Optional[str] = None
     for prefix in ("$ZETTLAB_PRESETS_DIR/", "${ZETTLAB_PRESETS_DIR}/"):
@@ -2658,9 +2668,9 @@ def _resolve_camera_runtime_script(raw_path: str) -> Optional[Path]:
                 break
             except ValueError:
                 continue
-    if relative_text is None or Path(relative_text) != _CAMERA_RUNTIME_RELATIVE_PATH:
+    if relative_text is None or Path(relative_text) != relative_path:
         return None
-    candidate = anchor.resolved_root / _CAMERA_RUNTIME_RELATIVE_PATH
+    candidate = anchor.resolved_root / relative_path
     try:
         resolved = candidate.resolve(strict=True)
         resolved.relative_to(anchor.resolved_root)
@@ -2676,29 +2686,15 @@ def _resolve_camera_runtime_script(raw_path: str) -> Optional[Path]:
 
 
 def _camera_runtime_arguments_allowed(arguments: list[str]) -> bool:
-    if arguments == ["list"]:
-        return True
-    if (
-        len(arguments) == 3
-        and arguments[0] in {"snap", "doctor"}
-        and arguments[1] == "--camera-id"
-        and _CAMERA_ID_RE.fullmatch(arguments[2]) is not None
-    ):
-        return True
-    if (
-        len(arguments) in {3, 5}
-        and arguments[0] == "clip"
-        and arguments[1] == "--camera-id"
-        and _CAMERA_ID_RE.fullmatch(arguments[2]) is not None
-    ):
-        if len(arguments) == 3:
-            return True
-        return (
-            arguments[3] == "--duration"
-            and arguments[4].isdigit()
-            and 1 <= int(arguments[4]) <= 60
-        )
-    return False
+    # zettlab-overlay(ac432-history): Delegate camera argv validation to the adapter; upstream: none
+    from gateway.platforms.zet_agent_camera_arguments import camera_arguments_allowed
+    return camera_arguments_allowed(arguments)
+
+
+def _camera_semantic_arguments_allowed(arguments: list[str]) -> bool:
+    # zettlab-overlay(ac432-observe): Delegate semantic argv checks to the adapter; upstream: none
+    from gateway.platforms.zet_agent_camera_semantic_arguments import semantic_arguments_allowed
+    return semantic_arguments_allowed(arguments)
 
 
 def _parse_camera_runtime_command(command: str) -> Optional[_CameraRuntimeCommand]:
@@ -2717,12 +2713,16 @@ def _parse_camera_runtime_command(command: str) -> Optional[_CameraRuntimeComman
     if (
         len(tokens) < 3
         or not _is_python_executable_token(tokens[0])
-        or Path(tokens[1]).name != _CAMERA_RUNTIME_SCRIPT
+        or Path(tokens[1]).name not in {_CAMERA_RUNTIME_SCRIPT, _CAMERA_SEMANTIC_SCRIPT}
         or any(
             token and set(token) <= _CONNECTOR_RUNTIME_SHELL_PUNCTUATION
             for token in tokens
         )
-        or not _camera_runtime_arguments_allowed(tokens[2:])
+        or not (
+            _camera_semantic_arguments_allowed(tokens[2:])
+            if Path(tokens[1]).name == _CAMERA_SEMANTIC_SCRIPT
+            else _camera_runtime_arguments_allowed(tokens[2:])
+        )
     ):
         return None
     script = _resolve_camera_runtime_script(tokens[1])
@@ -2740,11 +2740,17 @@ def _parse_camera_runtime_command(command: str) -> Optional[_CameraRuntimeComman
     )
 
 
-def _camera_runtime_manifest_allows(anchor: _ConnectorRuntimeRootAnchor) -> bool:
-    manifest = anchor.resolved_root / _CAMERA_RUNTIME_MANIFEST_RELATIVE_PATH
+def _camera_runtime_manifest_allows(
+    anchor: _ConnectorRuntimeRootAnchor, *, semantic: bool = False
+) -> bool:
+    manifest_path = (
+        _CAMERA_SEMANTIC_PATH.parent.parent / "manifest.yaml"
+        if semantic else _CAMERA_RUNTIME_MANIFEST_RELATIVE_PATH
+    )
+    manifest = anchor.resolved_root / manifest_path
     try:
         manifest_digest = anchor.file_digests.get(
-            _CAMERA_RUNTIME_MANIFEST_RELATIVE_PATH.as_posix()
+            manifest_path.as_posix()
         )
         if manifest_digest is None or not _connector_runtime_path_is_trusted(
             manifest,
@@ -2764,9 +2770,9 @@ def _camera_runtime_manifest_allows(anchor: _ConnectorRuntimeRootAnchor) -> bool
         loaded = yaml.safe_load(raw.decode("utf-8"))
         return bool(
             isinstance(loaded, dict)
-            and loaded.get("id") == "camsnap"
+            and loaded.get("id") == ("camera-semantic-evaluation" if semantic else "camsnap")
             and loaded.get("required_scopes") == ["hardware.camera:read"]
-            and _CAMERA_RUNTIME_CAPABILITY
+            and ("zettlab.camera.semantic.v1" if semantic else _CAMERA_RUNTIME_CAPABILITY)
             in (loaded.get("runtime_capabilities") or [])
         )
     except (OSError, UnicodeError, ValueError, TypeError):
@@ -2774,7 +2780,7 @@ def _camera_runtime_manifest_allows(anchor: _ConnectorRuntimeRootAnchor) -> bool
 
 
 def _camera_runtime_shell_guard_result(command: str) -> Optional[str]:
-    if _CAMERA_RUNTIME_SCRIPT not in command:
+    if not any(name in command for name in (_CAMERA_RUNTIME_SCRIPT, _CAMERA_SEMANTIC_SCRIPT)):
         return None
     return json.dumps({
         "output": "",
@@ -4334,6 +4340,7 @@ def _run_camera_runtime_command_if_allowed(
 
     anchor = _CONNECTOR_RUNTIME_ROOT_ANCHOR
     script = Path(parsed.argv[1])
+    semantic = script.name == _CAMERA_SEMANTIC_SCRIPT
     expected_digest: Optional[str] = None
     try:
         expected_digest = anchor.file_digests.get(
@@ -4349,7 +4356,7 @@ def _run_camera_runtime_command_if_allowed(
                 anchor.resolved_root,
                 expected_root_identity=parsed.root_identity,
             )
-            and _camera_runtime_manifest_allows(anchor)
+            and _camera_runtime_manifest_allows(anchor, semantic=semantic)
         )
     except (OSError, AttributeError):
         identities_match = False
@@ -4367,16 +4374,25 @@ def _run_camera_runtime_command_if_allowed(
             expected_identity=parsed.script_identity,
             expected_digest=expected_digest,
         )
-        from tools.environments.local import build_camera_runtime_env
+        from tools.environments.local import build_camera_runtime_env, build_camera_semantic_runtime_env
         from tools.trusted_direct_runner import run_trusted_python_script
 
-        trusted_env = build_camera_runtime_env()
+        # zettlab-overlay(ac432-observe): Preserve ordinary limits and validate finite execution budget; upstream: none
+        from gateway.platforms.zet_agent_camera_semantic_arguments import semantic_execution_timeout
+        run_timeout = semantic_execution_timeout(
+            parsed.argv[2:] if semantic else [], timeout, FOREGROUND_MAX_TIMEOUT, _CAMERA_RUNTIME_MAX_TIMEOUT_SECONDS,
+        )
+        trusted_env = build_camera_semantic_runtime_env() if semantic else build_camera_runtime_env()
         trusted_secrets = {
             key: trusted_env.pop(key)
-            for key in (
+            for key in ((
+                "ZETTLAB_AGENT_ACTION_TOKEN",
+                "ZETTLAB_CAMERA_JOB_ID",
+                "ZETTLAB_CAMERA_EXECUTION_ID",
+            ) if semantic else (
                 "ZETTLAB_AGENT_ACTION_TOKEN",
                 "ZETTLAB_HARDWARE_EXECUTION_TOKEN",
-            )
+            ))
         }
         secret_values = list(trusted_secrets.values())
         run_cwd = cwd if cwd and os.path.isdir(cwd) else os.getcwd()
@@ -4387,7 +4403,8 @@ def _run_camera_runtime_command_if_allowed(
             base_env={},
             injected_env=trusted_env,
             injected_secrets=trusted_secrets,
-            timeout=max(1, min(timeout, _CAMERA_RUNTIME_MAX_TIMEOUT_SECONDS)),
+            # zettlab-overlay(ac432-observe): Use the adapter-validated deadline without shortening capture; upstream: none
+            timeout=run_timeout,
             secret_values=secret_values,
             script_bytes=script_bytes,
             stdlib_only=True,

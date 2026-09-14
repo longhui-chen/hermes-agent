@@ -2126,6 +2126,8 @@ CONNECTOR_RUNTIME_ENV_KEYS: frozenset[str] = frozenset({
     # profile by local-server and live in <profile>/.env under the multiplex
     # gateway, so subprocesses must receive the current profile's scope instead
     # of whatever os.environ/shell snapshot happened to contain.
+    # zettlab-overlay(connector-session): Authenticate the profile independently of a turn; upstream: none
+    "ZETTLAB_AGENT_ACTION_TOKEN",
     "ZETTLAB_CONNECTORS_URL",
     "ZETTLAB_CONNECTOR_SESSION_INVOKE_V1",
     "ZET_AGENT_ID",
@@ -2143,6 +2145,8 @@ AGENT_CREATOR_RUNTIME_ENV_KEYS: frozenset[str] = frozenset({
 })
 HARDWARE_RUNTIME_ENV_KEYS: frozenset[str] = frozenset({
     "ZETTLAB_HARDWARE_EXECUTION_TOKEN",
+    "ZETTLAB_CAMERA_JOB_ID",
+    "ZETTLAB_CAMERA_EXECUTION_ID",
 })
 # These names belonged to the removed video BusinessExecution transport.  Keep
 # them in the scrub set (built from fragments so the retirement guard cannot
@@ -2261,11 +2265,12 @@ def _apply_profile_secret_scope_env(
             env[SKILLHUB_CATALOG_TOKEN_ENV_KEY] = catalog_token
 
 
+# zettlab-overlay(connector-session): Keep profile authentication separate from session selection; upstream: none
 def build_connector_runtime_env(base_env: dict | None = None) -> dict[str, str]:
     """Build env for the dedicated connector_runtime.py runner.
 
     This is intentionally separate from the generic terminal env. The
-    allowlisted runner receives only the current session route capability;
+    allowlisted runner receives profile identity and stable session selection;
     provider credentials remain Server-side and never enter a subprocess.
     """
     # ⛔ 起手底座**不继承进程环境**。这里原先是
@@ -2311,6 +2316,20 @@ def build_connector_runtime_env(base_env: dict | None = None) -> dict[str, str]:
         route_capability = zettlab_connector_route_capability()
     except Exception:
         route_capability = ""
+    # zettlab-overlay(connector-session): Carry stable selection without an active-turn grant; upstream: none
+    env.pop("ZETTLAB_CONNECTOR_SESSION_ID", None)
+    env.pop("ZETTLAB_TURN_ID", None)
+    env.pop("HERMES_SESSION_KEY", None)
+    try:
+        from gateway.session_context import get_session_env, zettlab_turn_id
+
+        env["ZETTLAB_TURN_ID"] = str(zettlab_turn_id() or "")
+        session_id = str(get_session_env("HERMES_SESSION_KEY", "") or "").strip()
+        is_cron = bool(get_session_env("HERMES_CRON_SESSION", ""))
+    except Exception:
+        session_id, is_cron = "", False
+    if session_id and not is_cron:
+        env["ZETTLAB_CONNECTOR_SESSION_ID"] = session_id
     if route_capability:
         # Reuse the legacy runner header transport without exposing the real
         # session key as selection authority. Generic terminal subprocesses
@@ -2477,6 +2496,55 @@ def build_overseas_connect_runtime_env() -> tuple[dict[str, str], str]:
             raise RuntimeError("overseas-connect turn id invalid")
         env["ZETTLAB_TURN_ID"] = turn_id
     return env, token
+
+
+def build_camera_semantic_runtime_env() -> dict[str, str]:
+    """Supply only a scheduler-bound profile's camera execution metadata.
+
+    This is not Chat authority. The device rechecks its execution ledger and
+    policy binding on candidate creation and verdict commit.
+    """
+    from agent.secret_scope import current_secret_scope
+    from cron.execution_context import current_execution
+    from hermes_constants import get_hermes_home
+
+    execution = current_execution()
+    scope = current_secret_scope()
+    if (
+        execution is None
+        or scope is None
+        or execution.profile_home != get_hermes_home()
+    ):
+        raise PermissionError("camera scheduler profile context unavailable")
+    # Read the installed profile mapping directly: never fall back to ambient
+    # environment values, including on a single-profile deployment.
+    token = str(scope.get("ZETTLAB_AGENT_ACTION_TOKEN", "") or "").strip()
+    output = str(scope.get("ZET_AGENT_OUTPUT_DIR", "") or "").strip()
+    callback = str(scope.get("ZET_CHAT_APPEND_URL", "") or "").strip()
+    if re.fullmatch(r"[0-9a-f]{64}", token) is None:
+        raise PermissionError("camera profile action token unavailable")
+    if not output or "\x00" in output or len(output.encode("utf-8")) > 4096 or not Path(output).is_absolute():
+        raise PermissionError("camera profile output directory unavailable")
+    try:
+        parsed = urlsplit(callback)
+        valid_url = (
+            parsed.scheme == "http"
+            and ipaddress.ip_address(parsed.hostname or "").is_loopback
+            and parsed.port is not None
+            and not parsed.username and not parsed.password
+            and not parsed.query and not parsed.fragment
+        )
+    except ValueError:
+        valid_url = False
+    if not valid_url:
+        raise PermissionError("camera local service callback unavailable")
+    return {
+        "ZETTLAB_AGENT_ACTION_TOKEN": token,
+        "ZETTLAB_CAMERA_JOB_ID": execution.job_id,
+        "ZETTLAB_CAMERA_EXECUTION_ID": execution.execution_id,
+        "ZET_AGENT_OUTPUT_DIR": output,
+        "ZETTLAB_LOCAL_SERVER_URL": urlunsplit((parsed.scheme, parsed.netloc, "", "", "")),
+    }
 
 
 def build_camera_runtime_env() -> dict[str, str]:

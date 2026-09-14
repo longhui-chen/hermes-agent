@@ -644,7 +644,7 @@ def test_build_connector_runtime_env_single_profile_strips_stale_capabilities(
     monkeypatch.setenv("ZETTLAB_CONNECTORS_URL", "http://single.invalid/rpc")
     monkeypatch.setenv("ZETTLAB_CONNECTORS_AUTH_TOKEN", "single-connector")
     monkeypatch.setenv("ZET_AGENT_ID", "single-agent")
-    monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "stale-action")
+    monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "profile-action")
     monkeypatch.setenv("ZETTLAB_HARDWARE_EXECUTION_TOKEN", "stale-hardware")
 
     env = build_connector_runtime_env()
@@ -652,7 +652,7 @@ def test_build_connector_runtime_env_single_profile_strips_stale_capabilities(
     assert env["ZETTLAB_CONNECTORS_URL"] == "http://single.invalid/rpc"
     assert "ZETTLAB_CONNECTORS_AUTH_TOKEN" not in env
     assert env["ZET_AGENT_ID"] == "single-agent"
-    assert "ZETTLAB_AGENT_ACTION_TOKEN" not in env
+    assert env["ZETTLAB_AGENT_ACTION_TOKEN"] == "profile-action"
     assert "ZETTLAB_HARDWARE_EXECUTION_TOKEN" not in env
 
 

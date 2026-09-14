@@ -1,3 +1,4 @@
+import hashlib
 import asyncio
 import json
 import threading
@@ -33,11 +34,13 @@ def _write_connector_runtime(tmp_path):
     script.write_text(
         textwrap.dedent(
             """
+            import hashlib
             import json
             import os
 
             print(json.dumps({
-                "runner_session_key": os.environ.get("HERMES_SESSION_KEY", ""),
+                "runner_session_key": hashlib.sha256(os.environ.get("HERMES_SESSION_KEY", "").encode()).hexdigest(),
+                "stable_session": hashlib.sha256(os.environ.get("ZETTLAB_CONNECTOR_SESSION_ID", "").encode()).hexdigest(),
                 "connector_action_runtime": os.environ.get(
                     "ZETTLAB_CONNECTOR_ACTION_RUNTIME", ""
                 ),
@@ -134,11 +137,13 @@ async def test_http_capabilities_remain_isolated_through_direct_runner(
 
     expected_runtime = "skills/linear/scripts/connector_runtime.py"
     assert result_a == {
-        "runner_session_key": capability_a,
+        "runner_session_key": hashlib.sha256(capability_a.encode()).hexdigest(),
+        "stable_session": hashlib.sha256(b"route-session-A").hexdigest(),
         "connector_action_runtime": expected_runtime,
     }
     assert result_b == {
-        "runner_session_key": capability_b,
+        "runner_session_key": hashlib.sha256(capability_b.encode()).hexdigest(),
+        "stable_session": hashlib.sha256(b"route-session-B").hexdigest(),
         "connector_action_runtime": expected_runtime,
     }
     combined = json.dumps([result_a, result_b])

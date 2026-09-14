@@ -65,6 +65,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
+# zettlab-overlay(H20-unowned): prestream 观测导入，收敛时 hook 化或迁出稳定层; upstream: none
 from agent.prestream_timing import PRESTREAM_TIMING_CONTEXT, PrestreamTiming
 
 
@@ -88,6 +89,7 @@ _PROFILE_REJECTED = object()
 _api_request_profile: ContextVar[Optional[str]] = ContextVar(
     "api_server_request_profile", default=None
 )
+# zettlab-overlay(H20-unowned): prestream 观测上下文，收敛时 hook 化或迁出稳定层; upstream: none
 _prestream_timing_context = PRESTREAM_TIMING_CONTEXT
 
 def _approval_event_choices(*, smart_denied: bool, allow_permanent: bool) -> list[str]:
@@ -479,6 +481,7 @@ def _auto_truncate_response_history(
                 break
 
     return [conversation_history[index] for index in sorted(kept_indices)]
+# zettlab-overlay(H11-B2b): response_mode / plan_ack / plan_auto_execute 提取，B2b 删除; upstream: none
 def _extract_response_mode(body: Dict[str, Any]) -> str:
     metadata = body.get("metadata")
     if not isinstance(metadata, dict):
@@ -571,6 +574,7 @@ def _resolve_plan_auto_execute(meta_override: Optional[bool]) -> bool:
 # MAX_CANONICAL_FINAL_TURN_ID_LEN 限住会被 governor 当作 pending receipt 键、
 # 并驻留到 TTL 到期的那个 turn_id。正常值是 local-server 的 UUID 类关联令牌，
 # 200 已经很宽松；不设上限则少量请求就能长期占住设备内存。
+# zettlab-overlay(H12-BT): turn_id 提取与长度上限，BT T2 纯搬家到 gateway/platforms/zet_agent.py; upstream: none
 MAX_CANONICAL_FINAL_TURN_ID_LEN = 200
 
 
@@ -606,6 +610,7 @@ def _extract_turn_id(body: Dict[str, Any]) -> str:
     return tid
 
 
+# zettlab-overlay(H13-unowned): 连接器路由能力提取，BT T2 纯搬家到 gateway/platforms/zet_agent.py; upstream: none
 def _extract_connector_route_capability(body: Dict[str, Any]) -> str:
     """Extract local-server's opaque per-turn Connector routing capability.
 
@@ -640,6 +645,7 @@ def _extract_creation_action_receipt_transport(body: Dict[str, Any]) -> str:
 _AGENT_INPUT_MESSAGE_ROLES = frozenset({"user", "assistant"})
 
 
+# zettlab-overlay(H14-B3): 创建建议信封识别与 canonical final 判定，B3 裁决删除; upstream: none
 def _has_creation_recommendation_wrapper(body: Dict[str, Any]) -> bool:
     """正文里是否出现了创建建议动作信封——不看内容是否合法。
 
@@ -753,6 +759,7 @@ def _is_canonical_final_creation_action(body: Dict[str, Any]) -> bool:
     )
 
 
+# zettlab-overlay(H13-unowned): 可信技能入口与执行策略提取，BT T2 纯搬家到 gateway/platforms/zet_agent.py; upstream: none
 def _extract_skill_slug(body: Dict[str, Any]) -> str:
     """Extract metadata.skill_slug — the App quick-pick's EXPLICIT skill
     invocation signal (ZET fork).
@@ -922,6 +929,7 @@ def _normalize_chat_content(
 _TEXT_PART_TYPES = frozenset({"text", "input_text", "output_text"})
 _IMAGE_PART_TYPES = frozenset({"image_url", "input_image"})
 _FILE_PART_TYPES = frozenset({"file", "input_file"})
+# zettlab-overlay(H16-unowned): API-MEDIA-INGRESS 探针与当前 turn 图片上限，诊断代码上游 PR 或删; upstream: none
 _CURRENT_TURN_IMAGE_MAX_BYTES = 5 * 1024 * 1024
 _CURRENT_TURN_IMAGE_MIMES = frozenset({"image/png", "image/jpeg", "image/webp"})
 _API_MEDIA_PROBE_MAX_DATA_HEADER = 128
@@ -1232,6 +1240,7 @@ def _content_has_visible_payload(content: Any) -> bool:
     return False
 
 
+# zettlab-overlay(H13-unowned): 当前 turn 参考图判定，BT T2 纯搬家到 gateway/platforms/zet_agent.py; upstream: none
 def _content_has_image_payload(content: Any) -> bool:
     """Return whether normalized content carries an image attachment."""
     if not isinstance(content, list):
@@ -1294,6 +1303,7 @@ def _extract_current_turn_reference_image(content: Any) -> str:
     return value if valid_magic else ""
 
 
+# zettlab-overlay(H17-B1): 终态单一来源的错误取材与归一，B1 保留; upstream: none
 def _short_error_text(value: Any, *, limit: int = 500) -> str:
     if value is None:
         return ""
@@ -1406,6 +1416,7 @@ def _chat_stream_error_payload(result: Dict[str, Any], finish_reason: str) -> Op
     return payload
 
 
+# zettlab-overlay(H17-B1): hermes.error 与 finish chunk 码保持一致，B1 保留; upstream: none
 def _derive_chat_terminal(result: Dict[str, Any]) -> tuple[str, str, Optional[Dict[str, Any]]]:
     """Derive finish reason and error payload once for both wire channels.
 
@@ -1419,6 +1430,7 @@ def _derive_chat_terminal(result: Dict[str, Any]) -> tuple[str, str, Optional[Di
     return finish_reason, code, payload
 
 
+# zettlab-overlay(H18-BT): 工具完成事件负载，BT 只新增可选 item_id / index; upstream: none
 def _tool_completion_payload(
     tool_call_id: str,
     function_name: str,
@@ -1535,6 +1547,7 @@ def _tool_completion_payload(
 # Tool output is attacker-influenced (any MCP server, connector or plugin can
 # return arbitrary JSON), and an unfiltered projection would let a foreign tool
 # hand the App a handoff entry point pointing at someone else's agent/tab.
+# zettlab-overlay(H19-B3): 接管 UI 提示白名单与提取，B3 迁 ui_map 投影器; upstream: none
 _TAKEOVER_UI_HINT_TOOLS = frozenset({"browser_navigate"})
 
 
@@ -1560,6 +1573,7 @@ def _takeover_ui_hint(decoded: Dict[str, Any], function_name: str = "") -> Optio
     return out
 
 
+# zettlab-overlay(H19-B3): 工具输出里的连接器错误提升，B3 迁 ui_map 投影器; upstream: none
 def _promote_connector_error_from_tool_output(decoded: Dict[str, Any]) -> Dict[str, Any]:
     """Promote connector runtime JSON printed by execute_code/terminal wrappers.
 
@@ -6195,6 +6209,7 @@ class APIServerAdapter(BasePlatformAdapter):
     @_admit_api_agent_request
     async def _handle_chat_completions(self, request: "web.Request") -> "web.Response":
         """POST /v1/chat/completions — OpenAI Chat Completions format."""
+        # zettlab-overlay(H20-unowned): prestream 入口时间戳，收敛时 hook 化或迁出稳定层; upstream: none
         prestream_ingress_at = time.monotonic()
         # Bound total in-flight agent runs (configurable; #7483).
         limited = self._concurrency_limited_response()
@@ -6461,6 +6476,7 @@ class APIServerAdapter(BasePlatformAdapter):
             else ""
         )
 
+        # zettlab-overlay(H20-unowned): prestream 观测里程碑埋点，收敛时 hook 化或迁出稳定层; upstream: none
         prestream_timing: Optional[PrestreamTiming] = None
         if stream and self.platform == Platform.ZET_AGENT:
             prestream_timing = PrestreamTiming(
@@ -7177,7 +7193,7 @@ class APIServerAdapter(BasePlatformAdapter):
             err_msg = _redact_api_error_text(raw_err_msg) if raw_err_msg else raw_err_msg
 
             finish_reason, terminal_code, error_payload = _derive_chat_terminal(result_dict)
-            # zettlab-overlay(B1): terminal interaction frames precede errors.
+            # zettlab-overlay(B1): terminal interaction frames precede errors; upstream: none
             if os.environ.get("ZET_B1_TERMINAL_FRAMES", "1") not in {"0", "false", "False"}:
                 adapter = self
                 emit_terminals = getattr(adapter, "emit_terminal_interactions", None)
@@ -7191,6 +7207,7 @@ class APIServerAdapter(BasePlatformAdapter):
             if error_payload:
                 await _emit(("__hermes_error__", error_payload))
 
+            # zettlab-overlay(H15-B3): 流关闭前补发 transform_suffix，与 H14 同批删除; upstream: none
             # Output-transform hooks run after the model token stream has
             # finished. Chat platforms can edit the streamed message in place,
             # but OpenAI-compatible HTTP clients only understand additional
@@ -7239,6 +7256,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     "total_tokens": usage.get("total_tokens", 0),
                 },
             }
+            # zettlab-overlay(H15-B3): finish chunk 携带 canonical_final_response，与 H14 同批删除; upstream: none
             hermes_terminal: Dict[str, Any] = {}
             if result_dict.get("response_transformed") or result_dict.get(
                 "canonical_response_required"
@@ -8608,6 +8626,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 kwargs["app_slug"] = app_slug
             if import_operation is not None:
                 kwargs["import_operation"] = import_operation
+            # zettlab-overlay(ac432-paused-create): forward optional initial scheduling state; upstream: none
+            if "enabled" in body:
+                kwargs["enabled"] = body["enabled"]
 
             if _cron_job_requires_live_chat_authorization(skills):
                 return web.json_response(

@@ -68,7 +68,33 @@ assess all rules, including “no impact” where appropriate.
    sources. Build-bundle, remote-install, and OTA paths must use that same source;
    development differences belong in environment variables. If this checkout has
    no runtime YAML, use the owning packaging repository instead of inventing one.
-7. **HR-T1 dependency freeze:** while the parent freeze is active, do not add,
+7. **Mechanism restraint / invariants first (HR7):** budgets, state machines,
+   CAS and reconciliation designs must state their operating envelope first;
+   outside the envelope the only exit is reject + count + existing fallback, never
+   a second mechanism. Shared budgets / state need an invariant table and a
+   randomized operation-sequence test before wiring. The same mechanism drawing
+   P1s in three consecutive CR rounds goes back to design.
+8. **Upstream core stays upstream (HR8):** `run_agent.py`, `hermes_state.py`,
+   `agent/**`, `tools/**`, `gateway/run.py`, `gateway/platforms/base.py` and
+   `gateway/platforms/api_server.py` are the stable kernel that tracks
+   NousResearch upstream. Change them upstream first; when an overlay is
+   unavoidable it must be minimal (PR-wide added-lines budget in
+   `scripts/test-harness/overlay_gate.json`, currently 60), every added hunk
+   carries `# zettlab-overlay(<batch>): <one line>; upstream: <PR url | none>`,
+   the PR body carries `upstream-pr:`, and no Zettlab business state (binding
+   tokens, senders, ledgers, handback lists, reject counters) lives in the
+   kernel — that belongs in `gateway/platforms/zet_agent.py`. CI job
+   `Zettlab Overlay Gate` / `overlay-gate` (`scripts/test-harness/overlay_gate.py`)
+   enforces this on every PR from the base branch via `pull_request_target` (the PR
+   head is only diff input) and must stay a required status check in branch
+   protection — never add another job or trigger with that name, a skipped
+   same-named job would satisfy the check; a PR that first introduces or
+   rewrites the gate must not touch kernel files itself (the gate only runs
+   from base after merge); upstream sync PRs are exempt only when the `sync/upstream-*` branch name,
+   the `upstream-sync` label (write access; added by `upstream-release-pr.yml`)
+   and a same-repo head all agree, and they get a manual upstream-diff review
+   against the overlay registry instead.
+9. **HR-T1 dependency freeze:** while the parent freeze is active, do not add,
    upgrade, or downgrade Microsoft/Azure dependency families (`Azure`,
    `Microsoft`, `@azure`, `@microsoft`, `azure-*`, `msal*`). Existing pinned
    versions may remain; removal is allowed.
