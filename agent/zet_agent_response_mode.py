@@ -51,7 +51,8 @@ _ATTESTATION_FIELD = "_zet_agent_trusted_skill_attestation"
 _ATTESTATION_TTL_SECONDS = 30.0
 _ATTESTATION_MAX_ENTRIES = 64
 _CAMERA_SKILL_PATH = "skills/camsnap/SKILL.md"
-_CAMERA_DIRECT_TOOLS = frozenset({"terminal", "vision_analyze"})
+# zettlab-overlay(camera-confirmation): expose the existing trusted client handoff; upstream: none
+_CAMERA_DIRECT_TOOLS = frozenset({"terminal", "vision_analyze", "clarify"})
 _CAMERA_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 _PRINTER3D_SKILL_PATHS = frozenset({
     "skills/printer3d/SKILL.md",
@@ -2191,6 +2192,10 @@ def trusted_skill_operation_block_message(
         allowed = function_name in scope.allowed_tools
         operation_scope = scope
         authorized_args_sha256 = ""
+        # zettlab-overlay(camera-confirmation): validate proposals without granting recording authority; upstream: none
+        if allowed and function_name == "clarify" and scope.relative_path == _CAMERA_SKILL_PATH:
+            from gateway.platforms.zet_agent_camera_chat_intent import camera_confirmation_allowed
+            allowed = not scope.camera_inventory_only and camera_confirmation_allowed(function_args, scope.camera_ids)
         if allowed and function_name == "terminal":
             normalized_args = _normalized_registry_tool_args(
                 function_name,

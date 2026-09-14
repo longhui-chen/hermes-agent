@@ -1298,6 +1298,7 @@ def test_camera_runtime_receipt_requires_attested_camsnap_scope_flow(
         assert trusted_skill_allowed_tool_names(agent) == {
             "terminal",
             "vision_analyze",
+            "clarify",
         }
         policy_error = trusted_skill_operation_block_message(
             agent,

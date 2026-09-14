@@ -36,7 +36,11 @@ def test_camera_scope_error_survives_real_execution_middleware(monkeypatch):
     post = Mock()
     execute = Mock(side_effect=AssertionError("must not dispatch camera"))
     monkeypatch.setattr(tool_executor, "_emit_terminal_post_tool_call", post)
-    agent = SimpleNamespace(platform="zet_agent", session_id="camera-session")
+    set_halt = Mock()
+    agent = SimpleNamespace(
+        platform="zet_agent", session_id="camera-session",
+        _set_tool_guardrail_halt=set_halt,
+    )
     outcome = tool_executor._run_agent_tool_execution_middleware(
         agent, function_name="terminal",
         function_args={"command": "python3 camera_connector.py list"},
@@ -49,6 +53,8 @@ def test_camera_scope_error_survives_real_execution_middleware(monkeypatch):
     assert result["authorization_status"] == "not_checked"
     assert isinstance(result["error"], str)
     execute.assert_not_called()
+    set_halt.assert_called_once()
+    assert set_halt.call_args.args[0].code == "camera_task_scope_missing"
     # Preserve the existing event contract while making the tool payload precise.
     assert post.call_args.kwargs["error_type"] == "zet_agent_plan_mode_block"
 

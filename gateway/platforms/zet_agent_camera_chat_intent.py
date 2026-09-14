@@ -44,3 +44,21 @@ def normalize_camera_recording_setup(value: dict) -> dict:
     if "retention_days" in raw and raw["retention_days"] not in (0, 1, 7, 30):
         raise ValueError("camera_recording_invalid")
     return {"resource_kind": "camera", "recording": dict(raw)}
+
+
+def camera_confirmation_allowed(arguments, camera_ids) -> bool:
+    """Allow only a credential-free proposal for a discovered camera."""
+    from gateway.platforms.zet_agent_connector_setup_intent import normalize_connector_setup
+
+    if set(arguments) - {"question", "connector_setup", "choices", "multi_select"}:
+        return False
+    if arguments.get("choices") or arguments.get("multi_select"):
+        return False
+    try:
+        intent = normalize_connector_setup(arguments.get("connector_setup"))
+    except (ValueError, TypeError):
+        return False
+    if intent.get("resource_kind") != "camera":
+        return False
+    proposal = next((intent[key] for key in ("recording", "live", "observation") if key in intent), None)
+    return isinstance(proposal, dict) and proposal.get("camera_id") in camera_ids
