@@ -1,7 +1,7 @@
 {
   "snapshot_version": 2,
-  "root_commit": "2eefd7ff276ef7c1b1bc8df4682d9f91083fe88d",
-  "sha256": "6c77d15cd59011fb42cd9a3244c0c5638c927cb966ec745a97b712b95e66f74f",
+  "root_commit": "b35de64d330b4d2171285d665bed8388eac1a161",
+  "sha256": "6a4b78a64ae4c87c472c31cd382f78b86308b2e74db6e0f6eb6fe3884a345a6a",
   "payload": {
     "golden": {
       "events": {
@@ -972,7 +972,7 @@
               "summary": "permission denied",
               "content_type": "error",
               "truncated": false,
-              "bytes": 16
+              "bytes": 17
             }
           }
         },
@@ -1050,7 +1050,7 @@
               "summary": "search backend unavailable",
               "content_type": "error",
               "truncated": false,
-              "bytes": 25
+              "bytes": 26
             }
           }
         },
