@@ -6743,12 +6743,17 @@ class APIServerAdapter(BasePlatformAdapter):
             # Ensure SSE drain loops can terminate without relying on polling
             # agent_task.done(), which can race with queue timeout checks.
             def _finish_chat_stream(_fut):
+                bt_transform = getattr(_stream_q, "_zettlab_bt_transform", None)
+                for safe_delta in media_delta_filter.finish():
+                    if callable(bt_transform):
+                        for bt_item in bt_transform(safe_delta):
+                            _stream_q.put(bt_item)
+                    else:
+                        _stream_q.put(safe_delta)
                 # zettlab-overlay(BT): close adapter items before sentinel; upstream: none
                 bt_finish = getattr(_stream_q, "_zettlab_bt_finish", None)
                 if callable(bt_finish):
                     bt_finish()
-                for safe_delta in media_delta_filter.finish():
-                    _stream_q.put(safe_delta)
                 # Terminal interaction frames must be queued while the SSE
                 # consumer is still draining the stream.  The ``None``
                 # sentinel closes the drain loop, so emitting afterwards
@@ -7088,6 +7093,12 @@ class APIServerAdapter(BasePlatformAdapter):
                 #16588 for the ``toolCallId``/``status`` lifecycle fields.
                 """
                 semantic_event = None
+                # zettlab-overlay(BT): transform final/tail text via sequencer; upstream: none
+                bt_transform = getattr(_stream_q, "_zettlab_bt_transform", None)
+                if isinstance(item, str) and not hasattr(item, "item_id") and callable(bt_transform):
+                    for projected in bt_transform(item):
+                        await _emit(projected)
+                    return time.monotonic()
                 if isinstance(item, tuple) and len(item) == 2 and item[0] == "__tool_progress__":
                     # Keep browserState's wire representation identical to its
                     # UTF-8 byte-budget calculation.  ASCII escaping can triple
