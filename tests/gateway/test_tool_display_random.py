@@ -30,3 +30,9 @@ def test_truncation_sets_flag_and_keeps_character_boundary():
     assert display["truncated"] is True
     assert display["bytes"] <= SUMMARY_MAX_BYTES
     display["summary"].encode("utf-8")
+
+
+def test_structured_secret_keys_are_redacted_before_serialization():
+    display = build_tool_start_display("x", {"api_key": "secret", "nested": {"password": "pw"}})["display"]
+    assert "secret" not in display["args_summary"]
+    assert "pw" not in display["args_summary"]

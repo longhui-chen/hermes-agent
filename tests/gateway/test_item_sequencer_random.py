@@ -71,11 +71,9 @@ def test_utf8_snapshot_limit_is_enforced_at_append_and_stays_bounded():
     seq = ItemSequencer()
     frames = seq.process({"type": "text.delta", "text": "🙂" * (MAX_SNAPSHOT_BYTES // 4 + 2)})
     assert frames
-    item = seq.open_items["text"]
-    assert item.snapshot_omitted
-    assert len(item.text.encode("utf-8")) <= MAX_SNAPSHOT_BYTES
-    seq.process({"type": "text.delta", "text": "x" * MAX_SNAPSHOT_BYTES})
-    assert len(item.text.encode("utf-8")) <= MAX_SNAPSHOT_BYTES
+    assert not seq.open_items
+    assert seq.counters.get("item_frame_rejected{reason:text_oversize}") == 1
+    assert seq.counters.get("item_frame_rejected{reason:text_oversize}") == 1
 
 
 def test_uuid7_is_canonical_and_monotonic_same_millisecond():
@@ -120,7 +118,7 @@ def test_near_2048_identity_envelope_rejects_the_2049th_key():
     assert seq.next_index == 2048
     rejected = seq.process({"type": "hermes.attachment", "attachment": {"id": "overflow"}})
     assert rejected == [{"type": "hermes.attachment", "attachment": {"id": "overflow"}}]
-    assert seq.counters["item_frame_rejected"] == 1
+    assert seq.counters["item_frame_rejected{reason:capacity}"] == 1
 
 
 def test_missing_registered_identity_is_rejected_without_consuming_index():
@@ -128,7 +126,7 @@ def test_missing_registered_identity_is_rejected_without_consuming_index():
     frame = {"type": "hermes.attachment", "attachment": {}}
     assert seq.process(frame) == [frame]
     assert seq.next_index == 0
-    assert seq.counters["item_frame_rejected"] == 1
+    assert seq.counters["item_frame_rejected{reason:identity_missing}"] == 1
 
 
 def test_index_exhaustion_does_not_close_open_text_or_raise():
@@ -160,3 +158,35 @@ def test_invalid_unicode_is_rejected_without_opening_item():
     frame = {"type": "text.delta", "text": "bad\ud800"}
     assert seq.process(frame) == [frame]
     assert not seq.open_items
+
+
+def test_random_rejections_are_atomic_and_use_fixed_reason_buckets():
+    cases = [
+        ("capacity", lambda s: (setattr(s, "next_index", s.max_items), s.process({"type": "text.delta", "text": "x"}))),
+        ("identity_missing", lambda s: s.process({"type": "tool.start", "name": "x"})),
+        ("identity_oversize", lambda s: s.process({"type": "tool.start", "call_id": "x" * 600})),
+        ("text_invalid", lambda s: s.process({"type": "text.delta", "text": "bad\ud800"})),
+        ("text_oversize", lambda s: s.process({"type": "text.delta", "text": "x" * (MAX_SNAPSHOT_BYTES + 1)})),
+        ("unregistered", lambda s: s.process({"type": "new.extension", "id": "x"})),
+    ]
+    for reason, operation in cases:
+        seq = ItemSequencer()
+        before = __import__("copy").deepcopy(seq.__dict__)
+        operation(seq)
+        after = __import__("copy").deepcopy(seq.__dict__)
+        if reason != "capacity":
+            assert after["next_index"] == before["next_index"]
+            assert after["items"] == before["items"]
+        assert seq.counters.get(f"item_frame_rejected{{reason:{reason}}}") == 1
+
+
+def test_incremental_utf8_encoding_is_linear_for_single_character_deltas():
+    class CountingText(str):
+        calls = 0
+        def encode(self, *args, **kwargs):
+            type(self).calls += 1
+            return super().encode(*args, **kwargs)
+    seq = ItemSequencer()
+    for _ in range(1000):
+        seq.process({"type": "text.delta", "text": CountingText("x")})
+    assert CountingText.calls <= 3200

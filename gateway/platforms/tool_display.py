@@ -30,8 +30,22 @@ def redact(text: str) -> str:
     return result
 
 
+_SECRET_KEYS = re.compile(r"(?i)(token|api[_-]?key|access[_-]?key|secret|password|cookie)")
+
+
+def _redact_value(value: Any, *, max_chars: int = SUMMARY_MAX_BYTES * 4) -> Any:
+    if isinstance(value, Mapping):
+        return {str(key): "[REDACTED]" if _SECRET_KEYS.search(str(key)) else _redact_value(item, max_chars=max_chars) for key, item in list(value.items())[:256]}
+    if isinstance(value, (list, tuple)):
+        return [_redact_value(item, max_chars=max_chars) for item in list(value)[:256]]
+    if isinstance(value, str):
+        return redact(value)[:max_chars]
+    return value
+
+
 def _truncate_utf8(text: str, limit: int) -> tuple[str, bool, int]:
-    clean = redact(text)
+    source = text if len(text) <= limit * 4 else text[: limit * 4]
+    clean = redact(source)
     raw = clean.encode("utf-8")
     exact = len(raw)
     if exact <= limit:
@@ -47,11 +61,12 @@ def _truncate_utf8(text: str, limit: int) -> tuple[str, bool, int]:
     return clean[:lo], True, len(clean[:lo].encode("utf-8"))
 
 
-def _safe_json(value: Any) -> str:
+def _safe_json(value: Any, *, max_chars: int = SUMMARY_MAX_BYTES * 4) -> str:
+    value = _redact_value(value, max_chars=max_chars)
     if isinstance(value, str):
         return value
     try:
-        return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))[:max_chars]
     except (TypeError, ValueError):
         return str(value)
 
@@ -68,7 +83,7 @@ def source_from_registration(tool_id: str, registration: Mapping[str, Any] | Non
 
 
 def args_summary(arguments: Any) -> dict[str, Any]:
-    text, truncated, _ = _truncate_utf8(_safe_json(arguments), ARGS_MAX_BYTES)
+    text, truncated, _ = _truncate_utf8(_safe_json(arguments, max_chars=ARGS_MAX_BYTES * 4), ARGS_MAX_BYTES)
     return {"args_summary": text, "truncated": truncated}
 
 
@@ -79,7 +94,7 @@ def result_display(output: Any = None, *, error: Any = None, content_type: str |
         value = str(error)
     elif content_type in {"text", "markdown", "json", "error"}:
         kind = content_type
-        value = _safe_json(output)
+        value = _safe_json(output, max_chars=SUMMARY_MAX_BYTES * 4)
     elif isinstance(output, (Mapping, list, tuple)):
         kind = "json"
         value = _safe_json(output)

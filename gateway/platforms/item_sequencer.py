@@ -9,6 +9,7 @@ from __future__ import annotations
 import time
 import threading
 import uuid
+import copy
 from dataclasses import dataclass, field
 from typing import Any, Mapping, MutableMapping
 
@@ -18,6 +19,12 @@ MAX_INDEX = 2**31
 MAX_VERSION = 2**31
 MAX_ITEMS = 2048
 MAX_IDENTITY_BYTES = 512
+
+
+class AdmissionError(ValueError):
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
 
 # UUIDv7 has a 48-bit millisecond timestamp, a 12-bit monotonic counter and a
 # 62-bit random tail.  The lock is deliberately process-local: a sequencer is
@@ -90,8 +97,13 @@ class _Item:
     kind: str
     identity: str
     version: int = 0
-    text: str = ""
+    chunks: list[str] = field(default_factory=list)
+    text_bytes: int = 0
     snapshot_omitted: bool = False
+
+    @property
+    def text(self) -> str:
+        return "".join(self.chunks)
 
 
 @dataclass
@@ -125,13 +137,53 @@ class ItemSequencer:
             name = "item_frame_unregistered"
         self.counters[name] = self.counters.get(name, 0) + 1
 
+    def _reject(self, reason: str) -> None:
+        self._count(f"item_frame_rejected{{reason:{reason}}}")
+        raise AdmissionError(reason)
+
+    def _validate_text(self, value: Any) -> str:
+        if not isinstance(value, str):
+            self._reject("text_invalid")
+        if len(value) > self.max_snapshot_bytes:
+            self._reject("text_oversize")
+        try:
+            encoded = value.encode("utf-8")
+        except UnicodeError:
+            self._reject("text_invalid")
+        if len(encoded) > self.max_snapshot_bytes:
+            self._reject("text_oversize")
+        return value
+
+    def _validate_canonical(self, value: Any) -> str:
+        if not isinstance(value, str):
+            self._reject("text_invalid")
+        if len(value) > self.max_snapshot_bytes:
+            return value
+        try:
+            if len(value.encode("utf-8")) > self.max_snapshot_bytes:
+                return value
+        except UnicodeError:
+            self._reject("text_invalid")
+        return value
+
+    def _identity_ok(self, identity: str) -> None:
+        try:
+            size = len(identity.encode("utf-8"))
+        except UnicodeError:
+            self._reject("identity_missing")
+        if size > MAX_IDENTITY_BYTES:
+            self._reject("identity_oversize")
+
+    def _capacity(self, identities: list[str]) -> None:
+        new_count = sum(1 for identity in identities if identity not in self.items)
+        if self.next_index + new_count > self.max_items:
+            self._reject("capacity")
+
     def _new(self, kind: str, identity: str) -> _Item:
         if len(identity.encode("utf-8")) > MAX_IDENTITY_BYTES:
-            self._count("item_identity_too_large")
-            raise ValueError("item identity exceeds envelope bound")
+            self._reject("identity_oversize")
         if self.next_index >= self.max_items:
-            self._count("item_index_limit")
-            raise ValueError("item index limit exceeded")
+            self._reject("capacity")
         item = _Item(uuid7(), self.next_index, kind, identity)
         self.next_index += 1
         self.items[identity] = item
@@ -163,12 +215,18 @@ class ItemSequencer:
     def _append(self, item: _Item, text: str | None) -> None:
         if not text or item.snapshot_omitted:
             return
-        if _utf8_size(item.text) + _utf8_size(text) > self.max_snapshot_bytes:
-            item.text = ""
+        try:
+            delta_bytes = len(text.encode("utf-8"))
+        except UnicodeError:
+            self._reject("text_invalid")
+        if item.text_bytes + delta_bytes > self.max_snapshot_bytes:
+            item.chunks = []
+            item.text_bytes = 0
             item.snapshot_omitted = True
             self._count("snapshot_omitted")
             return
-        item.text += text
+        item.chunks.append(text)
+        item.text_bytes += delta_bytes
 
     def _close(self, kind: str, *, snapshot: str | None = None, canonical: bool = False) -> list[dict[str, Any]]:
         item = self.open_items.pop(kind, None)
@@ -176,7 +234,7 @@ class ItemSequencer:
             return []
         value = snapshot if snapshot is not None else item.text
         omitted = item.snapshot_omitted if snapshot is None else False
-        if value is not None and _utf8_size(value) > self.max_snapshot_bytes:
+        if value is not None and (len(value) > self.max_snapshot_bytes or len(value.encode("utf-8")) > self.max_snapshot_bytes):
             value = None
             omitted = True
             item.snapshot_omitted = True
@@ -193,14 +251,14 @@ class ItemSequencer:
             payload["canonical"] = True
         # Closed snapshots travel in the output only. Keeping them on all
         # historical keys would multiply the per-open-item budget by 2048.
-        item.text = ""
+        item.chunks = []
+        item.text_bytes = 0
         return [payload]
 
     def _switch(self, kind: str) -> list[dict[str, Any]]:
         other = "reasoning" if kind == "text" else "text"
         if kind not in self.open_items and self.next_index >= self.max_items:
-            self._count("item_index_limit")
-            raise ValueError("item index limit exceeded")
+            self._reject("capacity")
         out = self._close(other)
         if kind not in self.open_items:
             identity = f"{kind}:{len([i for i in self.items.values() if i.kind == kind])}"
@@ -235,6 +293,59 @@ class ItemSequencer:
         # steer_accepted and steer_dropped share one row when they carry the
         # same steer_id, while unrelated fields cannot collide.
         return f"{path}:{value}"
+
+    def _admit(self, frame: Mapping[str, Any] | str) -> Mapping[str, Any]:
+        """Read-only admission pass. No sequencer state is mutated here."""
+        if isinstance(frame, str):
+            frame = {"type": "text.delta", "text": frame}
+        if not isinstance(frame, Mapping):
+            self._reject("text_invalid")
+        frame_type = frame.get("type")
+        data = _frame_data(frame)
+        if frame_type in ("reasoning.delta", "text.delta"):
+            value = _text_from(frame)
+            self._validate_text(value)
+            kind = "reasoning" if frame_type == "reasoning.delta" else "text"
+            identity = next((i.identity for i in self.items.values() if i.kind == kind and self.open_items.get(kind) is i), None)
+            if identity is None:
+                identity = f"{kind}:{len([i for i in self.items.values() if i.kind == kind])}"
+            self._identity_ok(identity)
+            self._capacity([identity])
+            if "text" not in data:
+                return _put_frame_data(frame, {**data, "text": value})
+            return frame
+        if frame_type in ("tool.start", "tool.result") or "toolCallId" in data or "tool_call_id" in data:
+            tool_id = data.get("toolCallId") or data.get("tool_call_id") or data.get("call_id")
+            if not isinstance(tool_id, str) or not tool_id:
+                self._reject("identity_missing")
+            identity = f"tool:{tool_id}"
+            self._identity_ok(identity)
+            if frame_type == "tool.start" or data.get("status") == "running":
+                self._capacity([identity])
+            return frame
+        if frame_type in ("hermes.todo", "todo.update"):
+            self._capacity(["todo:turn"])
+            return frame
+        if frame_type in ("hermes.delegation.progress", "delegation.status"):
+            child = data.get("subagent_id")
+            if not isinstance(child, str) or not child:
+                self._reject("identity_missing")
+            identity = f"subagent:{child}"
+            self._identity_ok(identity)
+            self._capacity([identity])
+            return frame
+        if frame_type in ("item.started", "item.completed"):
+            if not isinstance(data.get("item_id"), str) or not isinstance(data.get("index"), int):
+                self._reject("identity_missing")
+            return frame
+        identity = self._extension_identity(str(frame_type), data)
+        if identity is None and frame_type in self.identity_fields:
+            self._reject("identity_missing")
+        if identity is None:
+            self._reject("unregistered")
+        self._identity_ok(identity)
+        self._capacity([identity])
+        return frame
 
     def _process(self, frame: Mapping[str, Any] | str | Any) -> list[Any]:
         """Process one frame and return lifecycle frame(s) plus the frame."""
@@ -333,9 +444,12 @@ class ItemSequencer:
     def process(self, frame: Mapping[str, Any] | str | Any) -> list[Any]:
         """Process one frame, rejecting malformed/budget-exceeding input."""
         try:
-            return self._process(frame)
+            admitted = self._admit(frame)
+            return self._process(admitted)
+        except AdmissionError:
+            return [frame]
         except (TypeError, ValueError):
-            self._count("item_frame_rejected")
+            self._count("item_frame_rejected{reason:text_invalid}")
             return [frame]
 
     def process_many(self, frames: list[Any]) -> list[Any]:
@@ -358,11 +472,7 @@ class ItemSequencer:
 
     def complete_canonical(self, text: str) -> list[dict[str, Any]]:
         """Close current text with canonical text, opening a new item if needed."""
-        try:
-            text.encode("utf-8")
-        except UnicodeError:
-            self._count("item_frame_rejected")
-            return []
+        self._validate_canonical(text)
         if "text" not in self.open_items and self.next_index >= self.max_items:
             self._count("item_index_limit")
             return []
