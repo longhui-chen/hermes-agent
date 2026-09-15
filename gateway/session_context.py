@@ -279,12 +279,17 @@ _PLAN_ACK_REVISION_REQUESTED: ContextVar = ContextVar(
     "HERMES_PLAN_ACK_REVISION_REQUESTED",
     default=_UNSET,
 )
-# Dedicated capability retained only for hardware skills such as camsnap.
-# It stays outside _VAR_MAP so generic subprocesses cannot inherit it.
-_HARDWARE_EXECUTION_TOKEN: ContextVar = ContextVar(
-    "ZETTLAB_HARDWARE_EXECUTION_TOKEN",
-    default=_UNSET,
-)
+# zettlab-overlay(ac1015-bearer): keep the legacy keyword and introspection
+# symbol accepted by old callers while never storing a hardware bearer; upstream: none
+class _LegacyHardwareExecutionTokenContext:
+    def set(self, _value: object) -> object:
+        return object()
+
+    def get(self) -> object:
+        return _UNSET
+
+
+_HARDWARE_EXECUTION_TOKEN = _LegacyHardwareExecutionTokenContext()
 # Stable caller session identity for long-running turns. It stays outside
 # _VAR_MAP so generic subprocesses cannot inherit host routing metadata.
 _EXECUTION_SESSION_KEY: ContextVar = ContextVar(
@@ -506,7 +511,6 @@ def set_turn_vars(
         _PLAN_ACK_STATUS.set(plan_ack_status),
         _PLAN_ACK_TURN_ID.set(plan_ack_turn_id),
         _PLAN_ACK_REVISION_REQUESTED.set(plan_ack_revision_requested),
-        _HARDWARE_EXECUTION_TOKEN.set(hardware_execution_token),
         _EXECUTION_POLICY.set(execution_policy),
     ]
 
@@ -520,7 +524,6 @@ def clear_turn_vars(tokens: list) -> None:
             _PLAN_ACK_STATUS,
             _PLAN_ACK_TURN_ID,
             _PLAN_ACK_REVISION_REQUESTED,
-            _HARDWARE_EXECUTION_TOKEN,
             _EXECUTION_POLICY,
         ),
         tokens,
@@ -547,12 +550,8 @@ def current_turn_identity() -> tuple[str, object] | None:
 
 
 def hardware_execution_token() -> str:
-    """Return the task-local opaque capability for trusted hardware helpers."""
-    value = _HARDWARE_EXECUTION_TOKEN.get()
-    if value is _UNSET or value is None:
-        return ""
-    normalized = str(value).strip()
-    return normalized if re.fullmatch(r"[0-9a-f]{64}", normalized) else ""
+    """Return the legacy empty value; hardware helpers use owner context."""
+    return ""
 
 
 def execution_policy() -> str:
@@ -812,7 +811,6 @@ def reset_session_vars() -> None:
     for var in _VAR_MAP.values():
         var.set(_UNSET)
     _TURN_BINDING.set(_UNSET)
-    _HARDWARE_EXECUTION_TOKEN.set(_UNSET)
     _EXECUTION_SESSION_KEY.set(_UNSET)
     _EXECUTION_POLICY.set(_UNSET)
     # Reset the async-delivery capability to "never bound here" (_UNSET) for the
