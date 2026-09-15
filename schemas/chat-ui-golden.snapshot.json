@@ -1,7 +1,7 @@
 {
   "snapshot_version": 2,
-  "root_commit": "2b37c20854ae8b42be965e079534648a4d636c8b",
-  "sha256": "d103aa1d4adb22e817aa728424367df92018186133eda55d545af5242c173275",
+  "root_commit": "48e76de3459a7ac327af4a482dc738a69c79edb0",
+  "sha256": "9d20d003c6e422287bd79b242ce74545141be13165b7988aeced6d8648267d3d",
   "payload": {
     "golden": {
       "events": {
@@ -60,7 +60,8 @@
             "validation_target": "terminal",
             "expires_at_ms": 1756973100000,
             "state": "cancelled",
-            "state_reason": "delivery_failed"
+            "state_reason": "delivery_failed",
+            "index": 1
           }
         },
         "approval.cancelled.session_reset": {
@@ -82,7 +83,8 @@
             "validation_target": "terminal",
             "expires_at_ms": 1756973100000,
             "state": "cancelled",
-            "state_reason": "session_reset"
+            "state_reason": "session_reset",
+            "index": 1
           }
         },
         "approval.cancelled.turn_interrupted": {
@@ -104,7 +106,8 @@
             "validation_target": "terminal",
             "expires_at_ms": 1756973100000,
             "state": "cancelled",
-            "state_reason": "turn_interrupted"
+            "state_reason": "turn_interrupted",
+            "index": 1
           }
         },
         "approval.expired.timeout": {
@@ -126,7 +129,8 @@
             "validation_target": "terminal",
             "expires_at_ms": 1756973100000,
             "state": "expired",
-            "state_reason": "timeout"
+            "state_reason": "timeout",
+            "index": 1
           }
         },
         "approval": {
@@ -148,7 +152,8 @@
             "validation_target": "terminal",
             "expires_at_ms": 1756973100000,
             "state": "",
-            "state_reason": ""
+            "state_reason": "",
+            "index": 1
           }
         },
         "approval.runtime_lost.gateway_restart": {
@@ -170,7 +175,8 @@
             "validation_target": "terminal",
             "expires_at_ms": 1756973100000,
             "state": "runtime_lost",
-            "state_reason": "gateway_restart"
+            "state_reason": "gateway_restart",
+            "index": 1
           }
         },
         "approval.runtime_lost.request_unknown": {
@@ -192,7 +198,8 @@
             "validation_target": "terminal",
             "expires_at_ms": 1756973100000,
             "state": "runtime_lost",
-            "state_reason": "request_unknown"
+            "state_reason": "request_unknown",
+            "index": 1
           }
         },
         "attachment.action.ack": {
@@ -251,7 +258,8 @@
               },
               "dedup_key": "connector:notion",
               "fallback_text": "连接 Notion 以继续"
-            }
+            },
+            "index": 1
           }
         },
         "capabilities": {
@@ -266,7 +274,8 @@
             "steer": true,
             "multiple_quotes": false,
             "delegation": true,
-            "attachments": true
+            "attachments": true,
+            "contract_version": 1
           }
         },
         "chat.send.ack": {
@@ -323,7 +332,8 @@
             "expires_at_ms": 1756973100000,
             "state": "cancelled",
             "state_reason": "delivery_failed",
-            "connector_setup": null
+            "connector_setup": null,
+            "index": 1
           }
         },
         "clarify.cancelled.session_reset": {
@@ -343,7 +353,8 @@
             "expires_at_ms": 1756973100000,
             "state": "cancelled",
             "state_reason": "session_reset",
-            "connector_setup": null
+            "connector_setup": null,
+            "index": 1
           }
         },
         "clarify.cancelled.turn_interrupted": {
@@ -363,7 +374,8 @@
             "expires_at_ms": 1756973100000,
             "state": "cancelled",
             "state_reason": "turn_interrupted",
-            "connector_setup": null
+            "connector_setup": null,
+            "index": 1
           }
         },
         "clarify.connector-setup": {
@@ -382,7 +394,8 @@
             "state_reason": "",
             "connector_setup": {
               "resource_kind": "camera"
-            }
+            },
+            "index": 1
           }
         },
         "clarify.expired.timeout": {
@@ -402,7 +415,8 @@
             "expires_at_ms": 1756973100000,
             "state": "expired",
             "state_reason": "timeout",
-            "connector_setup": null
+            "connector_setup": null,
+            "index": 1
           }
         },
         "clarify": {
@@ -422,7 +436,8 @@
             "expires_at_ms": 1756973100000,
             "state": "",
             "state_reason": "",
-            "connector_setup": null
+            "connector_setup": null,
+            "index": 1
           }
         },
         "clarify.runtime_lost.gateway_restart": {
@@ -442,7 +457,8 @@
             "expires_at_ms": 1756973100000,
             "state": "runtime_lost",
             "state_reason": "gateway_restart",
-            "connector_setup": null
+            "connector_setup": null,
+            "index": 1
           }
         },
         "clarify.runtime_lost.request_unknown": {
@@ -462,7 +478,8 @@
             "expires_at_ms": 1756973100000,
             "state": "runtime_lost",
             "state_reason": "request_unknown",
-            "connector_setup": null
+            "connector_setup": null,
+            "index": 1
           }
         },
         "context.compaction": {
@@ -476,7 +493,8 @@
             "state": "done",
             "message": "上下文已压缩",
             "old_session_id": "sess_demo_0001",
-            "new_session_id": "sess_demo_0002"
+            "new_session_id": "sess_demo_0002",
+            "index": 1
           }
         },
         "conversation.title": {
@@ -485,7 +503,8 @@
           "backend": "hermes",
           "data": {
             "title": "周末公园 vlog",
-            "session_id": "sess_demo_0001"
+            "session_id": "sess_demo_0001",
+            "index": 1
           }
         },
         "delegation.status": {
@@ -509,7 +528,10 @@
             "tool": "terminal",
             "preview": "ls /sandbox/demo",
             "status": "running",
-            "duration_seconds": 3.5
+            "duration_seconds": 3.5,
+            "item_id": "01996f2e-7b6a-7c35-9f8e-4a3d6c1b2e90",
+            "index": 4,
+            "v": 1
           }
         },
         "delegation.summary": {
@@ -615,6 +637,99 @@
             "revision_requested": false
           }
         },
+        "item.completed": {
+          "type": "item.completed",
+          "turn_id": "turn_demo_0001",
+          "seq": 40,
+          "fanout_seq": 40,
+          "ts": 1756972800000,
+          "backend": "hermes",
+          "data": {
+            "kind": "reasoning",
+            "item_id": "01996f2e-7b6a-7c31-9f8e-4a3d6c1b2e90",
+            "index": 0,
+            "text": "思考片段",
+            "finished_at": 1756972801000,
+            "snapshot_omitted": false,
+            "canonical": false
+          }
+        },
+        "item.completed.reasoning": {
+          "type": "item.completed",
+          "turn_id": "turn_demo_0001",
+          "seq": 40,
+          "fanout_seq": 40,
+          "ts": 1756972800000,
+          "backend": "hermes",
+          "data": {
+            "kind": "reasoning",
+            "item_id": "01996f2e-7b6a-7c31-9f8e-4a3d6c1b2e90",
+            "index": 0,
+            "text": "思考片段",
+            "finished_at": 1756972801000,
+            "snapshot_omitted": false,
+            "canonical": false
+          }
+        },
+        "item.completed.text": {
+          "type": "item.completed",
+          "turn_id": "turn_demo_0001",
+          "seq": 41,
+          "fanout_seq": 41,
+          "ts": 1756972800000,
+          "backend": "hermes",
+          "data": {
+            "kind": "text",
+            "item_id": "01996f2e-7b6a-7c32-9f8e-4a3d6c1b2e90",
+            "index": 1,
+            "text": "答复片段",
+            "finished_at": 1756972801000,
+            "snapshot_omitted": false,
+            "canonical": true
+          }
+        },
+        "item.started": {
+          "type": "item.started",
+          "turn_id": "turn_demo_0001",
+          "seq": 40,
+          "fanout_seq": 40,
+          "ts": 1756972800000,
+          "backend": "hermes",
+          "data": {
+            "kind": "reasoning",
+            "item_id": "01996f2e-7b6a-7c31-9f8e-4a3d6c1b2e90",
+            "index": 0,
+            "started_at": 1756972800000
+          }
+        },
+        "item.started.reasoning": {
+          "type": "item.started",
+          "turn_id": "turn_demo_0001",
+          "seq": 40,
+          "fanout_seq": 40,
+          "ts": 1756972800000,
+          "backend": "hermes",
+          "data": {
+            "kind": "reasoning",
+            "item_id": "01996f2e-7b6a-7c31-9f8e-4a3d6c1b2e90",
+            "index": 0,
+            "started_at": 1756972800000
+          }
+        },
+        "item.started.text": {
+          "type": "item.started",
+          "turn_id": "turn_demo_0001",
+          "seq": 41,
+          "fanout_seq": 41,
+          "ts": 1756972800000,
+          "backend": "hermes",
+          "data": {
+            "kind": "text",
+            "item_id": "01996f2e-7b6a-7c32-9f8e-4a3d6c1b2e90",
+            "index": 1,
+            "started_at": 1756972800000
+          }
+        },
         "media.ref": {
           "type": "media.ref",
           "turn_id": "turn_demo_0001",
@@ -682,7 +797,8 @@
             ],
             "plan_id": "plan_demo_0001",
             "status": "pending",
-            "revision_requested": false
+            "revision_requested": false,
+            "index": 1
           }
         },
         "reasoning.delta": {
@@ -694,7 +810,8 @@
           "backend": "hermes",
           "data": {
             "text": "用户要剪 vlog，先确认时间范围。",
-            "item_id": "01996f2e-7b6a-7c31-9f8e-4a3d6c1b2e90"
+            "item_id": "01996f2e-7b6a-7c31-9f8e-4a3d6c1b2e90",
+            "index": 0
           }
         },
         "search.result": {
@@ -752,7 +869,8 @@
           "data": {
             "steer_id": "01998f2d-7c00-7000-8000-000000000001",
             "text": "顺便加上字幕",
-            "reason": "unconsumed"
+            "reason": "unconsumed",
+            "index": 1
           }
         },
         "steer": {
@@ -764,7 +882,8 @@
           "backend": "hermes",
           "data": {
             "steer_id": "01998f2d-7c00-7000-8000-000000000001",
-            "text": "顺便加上字幕"
+            "text": "顺便加上字幕",
+            "index": 1
           }
         },
         "text.delta": {
@@ -775,7 +894,9 @@
           "ts": 1756972800000,
           "backend": "hermes",
           "data": {
-            "text": "好的，我先找出上周末的视频。"
+            "text": "好的，我先找出上周末的视频。",
+            "item_id": "01996f2e-7b6a-7c32-9f8e-4a3d6c1b2e90",
+            "index": 1
           }
         },
         "text.reset": {
@@ -810,7 +931,10 @@
               "in_progress": 1,
               "completed": 0,
               "cancelled": 0
-            }
+            },
+            "item_id": "01996f2e-7b6a-7c34-9f8e-4a3d6c1b2e90",
+            "index": 3,
+            "v": 1
           }
         },
         "tool.result": {
@@ -841,7 +965,9 @@
             },
             "browser_content_evidence": {
               "text": "demo"
-            }
+            },
+            "item_id": "01996f2e-7b6a-7c33-9f8e-4a3d6c1b2e90",
+            "index": 2
           }
         },
         "tool.start": {
@@ -858,7 +984,9 @@
             "arguments": {
               "target": "nas",
               "query": "上周末 公园 视频"
-            }
+            },
+            "item_id": "01996f2e-7b6a-7c33-9f8e-4a3d6c1b2e90",
+            "index": 2
           }
         },
         "turn.end": {
@@ -1223,6 +1351,25 @@
         }
       },
       "hermes": {
+        "content-chunk": {
+          "id": "chatcmpl_demo_0001",
+          "object": "chat.completion.chunk",
+          "created": 1756972800,
+          "model": "demo-model",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "content": "答复片段"
+              },
+              "finish_reason": null
+            }
+          ],
+          "hermes": {
+            "item_id": "01996f2e-7b6a-7c32-9f8e-4a3d6c1b2e90",
+            "index": 1
+          }
+        },
         "context.compaction": {
           "type": "context.compaction",
           "turn_id": "turn_demo_0001",
@@ -1234,12 +1381,14 @@
           "before_tokens": 18000,
           "after_messages": 12,
           "after_tokens": 6000,
-          "error": ""
+          "error": "",
+          "index": 7
         },
         "conversation.title": {
           "type": "conversation.title",
           "turn_id": "turn_demo_0001",
-          "title": "周末公园 vlog"
+          "title": "周末公园 vlog",
+          "index": 9
         },
         "finish-chunk": {
           "id": "chatcmpl_demo_0001",
@@ -1376,7 +1525,8 @@
             "rm -rf"
           ],
           "expires_at_ms": 1756973100000,
-          "validation_target": "terminal"
+          "validation_target": "terminal",
+          "index": 6
         },
         "hermes.attachment": {
           "type": "hermes.attachment",
@@ -1395,7 +1545,8 @@
                 }
               ]
             }
-          }
+          },
+          "index": 4
         },
         "hermes.clarify.cancelled.delivery_failed": {
           "type": "hermes.clarify",
@@ -1473,7 +1624,8 @@
           "turn_id": "turn_demo_0001",
           "connector_setup": {
             "resource_kind": "camera"
-          }
+          },
+          "index": 5
         },
         "hermes.delegation.progress": {
           "type": "hermes.delegation.progress",
@@ -1492,7 +1644,10 @@
           "duration_seconds": 3.5,
           "parent_id": "sub_demo_root",
           "depth": 1,
-          "exit_reason": ""
+          "exit_reason": "",
+          "item_id": "01996f2e-7b6a-7c35-9f8e-4a3d6c1b2e90",
+          "index": 4,
+          "v": 1
         },
         "hermes.plan": {
           "type": "hermes.plan",
@@ -1509,7 +1664,8 @@
               ]
             }
           ],
-          "auto_execute": false
+          "auto_execute": false,
+          "index": 8
         },
         "hermes.todo": {
           "type": "hermes.todo",
@@ -1529,25 +1685,51 @@
             "in_progress": 1,
             "completed": 0,
             "cancelled": 0
-          }
+          },
+          "item_id": "01996f2e-7b6a-7c34-9f8e-4a3d6c1b2e90",
+          "index": 3,
+          "v": 1
+        },
+        "item.completed": {
+          "type": "item.completed",
+          "turn_id": "turn_demo_0001",
+          "kind": "reasoning",
+          "item_id": "01996f2e-7b6a-7c31-9f8e-4a3d6c1b2e90",
+          "index": 0,
+          "text": "思考片段",
+          "finished_at": 1756972801000,
+          "snapshot_omitted": false,
+          "canonical": false
+        },
+        "item.started": {
+          "type": "item.started",
+          "turn_id": "turn_demo_0001",
+          "kind": "reasoning",
+          "item_id": "01996f2e-7b6a-7c31-9f8e-4a3d6c1b2e90",
+          "index": 0,
+          "started_at": 1756972800000
         },
         "reasoning.delta": {
           "type": "reasoning.delta",
           "turn_id": "turn_demo_0001",
-          "text": "用户要剪 vlog，先确认时间范围。"
+          "text": "用户要剪 vlog，先确认时间范围。",
+          "item_id": "01996f2e-7b6a-7c31-9f8e-4a3d6c1b2e90",
+          "index": 0
         },
         "steer_accepted": {
           "type": "steer_accepted",
           "steer_id": "01998f2d-7c00-7000-8000-000000000001",
           "turn_id": "turn_demo_0001",
-          "text": "顺便加上字幕"
+          "text": "顺便加上字幕",
+          "index": 10
         },
         "steer_dropped": {
           "type": "steer_dropped",
           "steer_id": "01998f2d-7c00-7000-8000-000000000001",
           "turn_id": "turn_demo_0001",
           "text": "顺便加上字幕",
-          "reason": "unconsumed"
+          "reason": "unconsumed",
+          "index": 11
         },
         "tool-frame.completed": {
           "tool": "image_generate",
@@ -1569,7 +1751,9 @@
           },
           "browserContentEvidence": {
             "text": "demo"
-          }
+          },
+          "item_id": "01996f2e-7b6a-7c33-9f8e-4a3d6c1b2e90",
+          "index": 2
         },
         "tool-frame.error": {
           "tool": "connector_call",
@@ -1589,14 +1773,18 @@
           },
           "output": {
             "success": false
-          }
+          },
+          "item_id": "01996f2e-7b6a-7c33-9f8e-4a3d6c1b2e90",
+          "index": 2
         },
         "tool-frame.running": {
           "tool": "search_files",
           "emoji": "🔍",
           "label": "搜索素材",
           "toolCallId": "call_demo_0001",
-          "status": "running"
+          "status": "running",
+          "item_id": "01996f2e-7b6a-7c33-9f8e-4a3d6c1b2e90",
+          "index": 2
         }
       },
       "http": {
@@ -1948,6 +2136,10 @@
               "required": true,
               "type": "number"
             },
+            "index": {
+              "required": false,
+              "type": "number"
+            },
             "pattern_key": {
               "required": true,
               "type": "string"
@@ -2088,6 +2280,10 @@
                   }
                 }
               }
+            },
+            "index": {
+              "required": false,
+              "type": "number"
             }
           }
         },
@@ -2097,6 +2293,10 @@
             "attachments": {
               "required": false,
               "type": "boolean"
+            },
+            "contract_version": {
+              "required": false,
+              "type": "number"
             },
             "delegation": {
               "required": false,
@@ -2302,6 +2502,10 @@
               "required": true,
               "type": "number"
             },
+            "index": {
+              "required": false,
+              "type": "number"
+            },
             "question": {
               "required": true,
               "type": "string"
@@ -2319,6 +2523,10 @@
         "context.compaction": {
           "struct": "ContextCompactionData",
           "fields": {
+            "index": {
+              "required": false,
+              "type": "number"
+            },
             "message": {
               "required": false,
               "type": "string"
@@ -2340,6 +2548,10 @@
         "conversation.title": {
           "struct": "ConversationTitleData",
           "fields": {
+            "index": {
+              "required": false,
+              "type": "number"
+            },
             "session_id": {
               "required": false,
               "type": "string"
@@ -2366,6 +2578,14 @@
               "type": "string"
             },
             "goal": {
+              "required": false,
+              "type": "string"
+            },
+            "index": {
+              "required": false,
+              "type": "number"
+            },
+            "item_id": {
               "required": false,
               "type": "string"
             },
@@ -2408,6 +2628,10 @@
             "turn_id": {
               "required": false,
               "type": "string"
+            },
+            "v": {
+              "required": false,
+              "type": "number"
             }
           }
         },
@@ -2597,6 +2821,60 @@
             }
           }
         },
+        "item.completed": {
+          "struct": "ItemCompletedData",
+          "fields": {
+            "canonical": {
+              "required": false,
+              "type": "boolean"
+            },
+            "finished_at": {
+              "required": true,
+              "type": "number"
+            },
+            "index": {
+              "required": true,
+              "type": "number"
+            },
+            "item_id": {
+              "required": true,
+              "type": "string"
+            },
+            "kind": {
+              "required": true,
+              "type": "string"
+            },
+            "snapshot_omitted": {
+              "required": false,
+              "type": "boolean"
+            },
+            "text": {
+              "required": false,
+              "type": "string"
+            }
+          }
+        },
+        "item.started": {
+          "struct": "ItemStartedData",
+          "fields": {
+            "index": {
+              "required": true,
+              "type": "number"
+            },
+            "item_id": {
+              "required": true,
+              "type": "string"
+            },
+            "kind": {
+              "required": true,
+              "type": "string"
+            },
+            "started_at": {
+              "required": true,
+              "type": "number"
+            }
+          }
+        },
         "media.ref": {
           "struct": "MediaRefData",
           "fields": {
@@ -2776,6 +3054,10 @@
                     "required": true,
                     "type": "number"
                   },
+                  "index": {
+                    "required": false,
+                    "type": "number"
+                  },
                   "question": {
                     "required": true,
                     "type": "string"
@@ -2865,6 +3147,10 @@
                 }
               }
             },
+            "index": {
+              "required": false,
+              "type": "number"
+            },
             "plan_id": {
               "required": false,
               "type": "string"
@@ -2886,6 +3172,10 @@
         "reasoning.delta": {
           "struct": "ReasoningDeltaData",
           "fields": {
+            "index": {
+              "required": false,
+              "type": "number"
+            },
             "item_id": {
               "required": false,
               "type": "string"
@@ -3023,6 +3313,10 @@
         "steer": {
           "struct": "SteerData",
           "fields": {
+            "index": {
+              "required": false,
+              "type": "number"
+            },
             "steer_id": {
               "required": false,
               "type": "string"
@@ -3036,6 +3330,10 @@
         "steer.dropped": {
           "struct": "SteerDroppedData",
           "fields": {
+            "index": {
+              "required": false,
+              "type": "number"
+            },
             "reason": {
               "required": false,
               "type": "string"
@@ -3053,6 +3351,14 @@
         "text.delta": {
           "struct": "TextDeltaData",
           "fields": {
+            "index": {
+              "required": false,
+              "type": "number"
+            },
+            "item_id": {
+              "required": false,
+              "type": "string"
+            },
             "text": {
               "required": true,
               "type": "string"
@@ -3066,6 +3372,14 @@
         "todo.update": {
           "struct": "TodoUpdateData",
           "fields": {
+            "index": {
+              "required": false,
+              "type": "number"
+            },
+            "item_id": {
+              "required": false,
+              "type": "string"
+            },
             "summary": {
               "required": true,
               "type": "object",
@@ -3123,6 +3437,10 @@
                   }
                 }
               }
+            },
+            "v": {
+              "required": false,
+              "type": "number"
             }
           }
         },
@@ -3161,6 +3479,14 @@
               "required": false,
               "type": "string"
             },
+            "index": {
+              "required": false,
+              "type": "number"
+            },
+            "item_id": {
+              "required": false,
+              "type": "string"
+            },
             "output": {
               "required": false,
               "type": "any"
@@ -3192,6 +3518,14 @@
             },
             "call_id": {
               "required": true,
+              "type": "string"
+            },
+            "index": {
+              "required": false,
+              "type": "number"
+            },
+            "item_id": {
+              "required": false,
               "type": "string"
             },
             "label": {
@@ -4175,7 +4509,25 @@
         "reason": "Non-frame dict literals in zet_agent.py that also carry a \"type\" key: reasoning-config `disabled`, the OpenAI-style error body `invalid_request_error`, and `text` content blocks. Any other undotted type literal is a new frame until registered here.",
         "frame_shape_exempt": {
           "context.compaction": "The frame is the upstream compaction status payload forwarded as-is (dict(payload) + type); its fields are frozen by golden/hermes/context.compaction.json and asserted by tests/gateway/test_zet_agent_producer_conformance.py against the three real producer shapes."
-        }
+        },
+        "identity_fields": {
+          "hermes.attachment": "attachment.id",
+          "hermes.clarify": "clarify_id",
+          "hermes.approval": "approval_id",
+          "steer_accepted": "steer_id",
+          "steer_dropped": "steer_id",
+          "context.compaction": "fixed",
+          "hermes.plan": "fixed",
+          "conversation.title": "fixed"
+        },
+        "item_kinds": [
+          "reasoning",
+          "text",
+          "tool",
+          "todo",
+          "subagent"
+        ],
+        "identity_fields_reason": "BT-T1 frozen identity paths are producer-owned and must be mirrored before T2 wiring."
       },
       "registry": {
         "web": {

@@ -1,0 +1,342 @@
+"""Pure, unconnected timeline item sequencing for the BT contract.
+
+The adapter owns this state machine; the SSE writer will call it in T2.  Keeping
+it independent of the writer makes the ordering and bounded snapshot invariants
+executable before any runtime wiring is enabled.
+"""
+from __future__ import annotations
+
+import time
+import threading
+import uuid
+from dataclasses import dataclass, field
+from typing import Any, Mapping, MutableMapping
+
+UUID7_RE = r"^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+MAX_SNAPSHOT_BYTES = 256 * 1024
+MAX_INDEX = 2**31
+MAX_VERSION = 2**31
+MAX_ITEMS = 2048
+MAX_IDENTITY_BYTES = 512
+
+# UUIDv7 has a 48-bit millisecond timestamp, a 12-bit monotonic counter and a
+# 62-bit random tail.  The lock is deliberately process-local: a sequencer is
+# scoped to one request/profile and no cross-turn state is retained.
+_last_uuid_ms = -1
+_uuid_counter = 0
+_uuid_lock = threading.Lock()
+
+
+def uuid7(*, now_ms: int | None = None) -> str:
+    """Return a lowercase, canonical UUIDv7 with same-ms monotonic ordering."""
+    global _last_uuid_ms, _uuid_counter
+    ms = int(time.time_ns() // 1_000_000 if now_ms is None else now_ms)
+    if not 0 <= ms < 1 << 48:
+        raise ValueError("UUIDv7 timestamp out of range")
+    with _uuid_lock:
+        ms = max(ms, _last_uuid_ms)
+        counter = _uuid_counter + 1 if ms == _last_uuid_ms else 0
+        if counter > 0xFFF:
+            ms, counter = ms + 1, 0
+        if ms >= 1 << 48:
+            raise ValueError("UUIDv7 timestamp exhausted")
+        _last_uuid_ms, _uuid_counter = ms, counter
+        rand = uuid.uuid4().int & ((1 << 62) - 1)
+        value = (ms << 80) | (0x7 << 76) | (counter << 64) | (0x2 << 62) | rand
+    return str(uuid.UUID(int=value))
+
+
+# Descriptive aliases keep call sites readable while the public helper remains
+# compatible with tests and the future adapter hook.
+generate_uuid7 = uuid7
+new_uuid7 = uuid7
+
+
+def _utf8_size(value: str) -> int:
+    return len(value.encode("utf-8"))
+
+
+def _frame_data(frame: Mapping[str, Any]) -> MutableMapping[str, Any]:
+    data = frame.get("data")
+    if isinstance(data, MutableMapping):
+        return dict(data)
+    return dict(frame)
+
+
+def _put_frame_data(frame: Mapping[str, Any], data: Mapping[str, Any]) -> dict[str, Any]:
+    out = dict(frame)
+    if isinstance(frame.get("data"), Mapping):
+        out["data"] = dict(data)
+        return out
+    out.update(data)
+    return out
+
+
+def _text_from(frame: Mapping[str, Any]) -> str | None:
+    data = _frame_data(frame)
+    for key in ("text", "content", "delta"):
+        value = data.get(key)
+        if isinstance(value, str):
+            return value
+    return None
+
+
+@dataclass
+class _Item:
+    item_id: str
+    index: int
+    kind: str
+    identity: str
+    version: int = 0
+    text: str = ""
+    snapshot_omitted: bool = False
+
+
+@dataclass
+class ItemSequencer:
+    """Deterministically add item identity and ordering fields to frames.
+
+    ``process`` returns a list because opening/closing a reasoning or text item
+    emits lifecycle frames around the original delta.  No method performs I/O
+    or depends on the gateway, so callers can replay arbitrary interleavings.
+    """
+
+    max_snapshot_bytes: int = MAX_SNAPSHOT_BYTES
+    max_items: int = MAX_ITEMS
+    identity_fields: Mapping[str, str] = field(default_factory=dict)
+    next_index: int = 0
+    items: dict[str, _Item] = field(default_factory=dict)
+    open_items: dict[str, _Item] = field(default_factory=dict)
+    _todo: _Item | None = None
+    _delegation: dict[str, _Item] = field(default_factory=dict)
+    counters: dict[str, int] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not 0 < self.max_snapshot_bytes <= MAX_SNAPSHOT_BYTES:
+            raise ValueError("snapshot limit outside BT envelope")
+        if not 0 < self.max_items <= MAX_ITEMS:
+            raise ValueError("item limit outside BT envelope")
+
+    def _count(self, name: str) -> None:
+        self.counters[name] = self.counters.get(name, 0) + 1
+
+    def _new(self, kind: str, identity: str) -> _Item:
+        if len(identity.encode("utf-8")) > MAX_IDENTITY_BYTES:
+            self._count("item_identity_too_large")
+            raise ValueError("item identity exceeds envelope bound")
+        if self.next_index >= self.max_items:
+            self._count("item_index_limit")
+            raise ValueError("item index limit exceeded")
+        item = _Item(uuid7(), self.next_index, kind, identity)
+        self.next_index += 1
+        self.items[identity] = item
+        return item
+
+    def _ensure(self, kind: str, identity: str) -> tuple[_Item, bool]:
+        item = self.items.get(identity)
+        if item is not None:
+            if item.kind != kind:
+                self._count("item_identity_collision")
+                raise ValueError("item identity reused for another kind")
+            return item, False
+        return self._new(kind, identity), True
+
+    @staticmethod
+    def _lifecycle(kind: str, item: _Item, completed: bool = False, **extra: Any) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "type": "item.completed" if completed else "item.started",
+            "kind": kind,
+            "item_id": item.item_id,
+            "index": item.index,
+        }
+        payload.update(extra)
+        return payload
+
+    def _append(self, item: _Item, text: str | None) -> None:
+        if not text or item.snapshot_omitted:
+            return
+        if _utf8_size(item.text) + _utf8_size(text) > self.max_snapshot_bytes:
+            item.text = ""
+            item.snapshot_omitted = True
+            self._count("snapshot_omitted")
+            return
+        item.text += text
+
+    def _close(self, kind: str, *, snapshot: str | None = None, canonical: bool = False) -> list[dict[str, Any]]:
+        item = self.open_items.pop(kind, None)
+        if item is None:
+            return []
+        value = snapshot if snapshot is not None else item.text
+        omitted = item.snapshot_omitted if snapshot is None else False
+        if value is not None and _utf8_size(value) > self.max_snapshot_bytes:
+            value = None
+            omitted = True
+            item.snapshot_omitted = True
+        payload: dict[str, Any] = self._lifecycle(
+            kind,
+            item,
+            completed=True,
+            finished_at_ms=int(time.time() * 1000),
+        )
+        if value is not None and not omitted:
+            payload["text"] = value
+        if omitted:
+            payload["snapshot_omitted"] = True
+        if canonical:
+            payload["canonical"] = True
+        # Closed snapshots travel in the output only. Keeping them on all
+        # historical keys would multiply the per-open-item budget by 2048.
+        item.text = ""
+        return [payload]
+
+    def _switch(self, kind: str) -> list[dict[str, Any]]:
+        other = "reasoning" if kind == "text" else "text"
+        out = self._close(other)
+        if kind not in self.open_items:
+            identity = f"{kind}:{len([i for i in self.items.values() if i.kind == kind])}"
+            item, created = self._ensure(kind, identity)
+            self.open_items[kind] = item
+            if created:
+                out.append(self._lifecycle(kind, item))
+        return out
+
+    def _attach(self, frame: Mapping[str, Any], item: _Item, *, version: int | None = None) -> dict[str, Any]:
+        data = _frame_data(frame)
+        data["item_id"] = item.item_id
+        data["index"] = item.index
+        if version is not None:
+            data["v"] = version
+        return _put_frame_data(frame, data)
+
+    def _extension_identity(self, frame_type: str, data: Mapping[str, Any]) -> str | None:
+        path = self.identity_fields.get(frame_type)
+        if path == "fixed":
+            return f"fixed:{frame_type}"
+        if not path:
+            return None
+        value: Any = data
+        for part in path.split("."):
+            if not isinstance(value, Mapping):
+                return None
+            value = value.get(part)
+        if value in (None, ""):
+            return None
+        # The path is the identity namespace. This intentionally lets
+        # steer_accepted and steer_dropped share one row when they carry the
+        # same steer_id, while unrelated fields cannot collide.
+        return f"{path}:{value}"
+
+    def _process(self, frame: Mapping[str, Any] | str | Any) -> list[Any]:
+        """Process one frame and return lifecycle frame(s) plus the frame."""
+        if isinstance(frame, str):
+            frame = {"type": "text.delta", "text": frame}
+        if not isinstance(frame, Mapping):
+            self._count("item_frame_unclassified")
+            return [frame]
+        frame_type = frame.get("type")
+        data = _frame_data(frame)
+        out: list[dict[str, Any]] = []
+
+        if frame_type in ("reasoning.delta", "text.delta"):
+            kind = "reasoning" if frame_type == "reasoning.delta" else "text"
+            out.extend(self._switch(kind))
+            item = self.open_items[kind]
+            text = _text_from(frame)
+            self._append(item, text)
+            out.append(self._attach(frame, item))
+            return out
+
+        if frame_type in ("tool.start", "tool.result") or "toolCallId" in data or "tool_call_id" in data:
+            if frame_type == "tool.start" or data.get("status") == "running":
+                out.extend(self._close("reasoning"))
+                out.extend(self._close("text"))
+            tool_id = data.get("toolCallId") or data.get("tool_call_id") or data.get("call_id")
+            identity = f"tool:{tool_id}" if tool_id not in (None, "") else f"tool:orphan:{len(self.items)}"
+            item, _ = self._ensure("tool", identity)
+            out.append(self._attach(frame, item))
+            return out
+
+        if frame_type in ("hermes.todo", "todo.update"):
+            if self._todo is None:
+                self._todo, _ = self._ensure("todo", "todo:turn")
+            if self._todo.version + 1 >= MAX_VERSION:
+                raise ValueError("item version exhausted")
+            self._todo.version += 1
+            out.append(self._attach(frame, self._todo, version=self._todo.version))
+            return out
+
+        if frame_type in ("hermes.delegation.progress", "delegation.status"):
+            child = data.get("subagent_id")
+            if not isinstance(child, str) or not child:
+                raise ValueError("subagent_id is required")
+            identity = f"subagent:{child}"
+            item = self._delegation.get(identity)
+            if item is None:
+                item, _ = self._ensure("subagent", identity)
+                self._delegation[identity] = item
+            if item.version + 1 >= MAX_VERSION:
+                raise ValueError("item version exhausted")
+            item.version += 1
+            out.append(self._attach(frame, item, version=item.version))
+            return out
+
+        if frame_type in ("item.started", "item.completed"):
+            item_id = data.get("item_id")
+            index = data.get("index")
+            if not isinstance(item_id, str) or not isinstance(index, int):
+                self._count("item_frame_rejected")
+                return []
+            out.append(dict(frame))
+            return out
+
+        identity = self._extension_identity(str(frame_type), data)
+        if identity is None and frame_type in self.identity_fields:
+            identity = f"{frame_type}:empty:{len(self.items)}"
+        if identity is None:
+            self._count(f"item_frame_unregistered:{frame_type}")
+            return [dict(frame)]
+        item, _ = self._ensure("extension", identity)
+        # Extension frames carry ordering only, never item identity.
+        out.append(_put_frame_data(frame, {**data, "index": item.index}))
+        return out
+
+    def process(self, frame: Mapping[str, Any] | str | Any) -> list[Any]:
+        """Process one frame, rejecting malformed/budget-exceeding input."""
+        try:
+            return self._process(frame)
+        except (TypeError, ValueError):
+            self._count("item_frame_rejected")
+            return [frame]
+
+    def process_many(self, frames: list[Any]) -> list[Any]:
+        out: list[Any] = []
+        for frame in frames:
+            out.extend(self.process(frame))
+        return out
+
+    sequence = process
+    feed = process
+
+    def open_item(self, kind: str, identity: str) -> dict[str, Any]:
+        item, _ = self._ensure(kind, identity)
+        self.open_items[kind] = item
+        return self._lifecycle(kind, item)
+
+    def close_item(self, kind: str, *, snapshot: str | None = None) -> dict[str, Any] | None:
+        frames = self._close(kind, snapshot=snapshot)
+        return frames[0] if frames else None
+
+    def complete_canonical(self, text: str) -> list[dict[str, Any]]:
+        """Close current text with canonical text, opening a new item if needed."""
+        out = self._close("reasoning")
+        if "text" in self.open_items:
+            out.extend(self._close("text", snapshot=text, canonical=True))
+        else:
+            item, _ = self._ensure("text", f"text:canonical:{len(self.items)}")
+            self.open_items["text"] = item
+            out.append(self._lifecycle("text", item))
+            out.extend(self._close("text", snapshot=text, canonical=True))
+        return out
+
+    def snapshot(self, item_id: str) -> str | None:
+        return next((i.text for i in self.items.values() if i.item_id == item_id and not i.snapshot_omitted), None)

@@ -167,6 +167,8 @@ _zet_agent_cron.install()
 logger = logging.getLogger(__name__)
 
 _STEER_SOURCE_TOKEN = object()
+# BT-T1 contract-only declarations. T2 wires these into the SSE writer.
+_BT_T1_ITEM_FRAME_TYPES = ("item.started", "item.completed")
 _RESERVED_STEER_PROGRESS_TYPES = frozenset({"steer_accepted", "steer_dropped"})
 _STEER_REJECTION_COUNTS: Counter[str] = Counter()
 _STEER_REJECTION_LOCK = threading.Lock()
