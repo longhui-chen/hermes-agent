@@ -2562,13 +2562,11 @@ def build_camera_runtime_env() -> dict[str, str]:
     except Exception:
         frozen_receipt = {}
     session_id = str(frozen_receipt.get("HERMES_SESSION_KEY", "") or "").strip()
+    hardware_token = str(frozen_receipt.get("ZETTLAB_HARDWARE_EXECUTION_TOKEN", "") or "").strip()
     env = {
         "ZET_AGENT_ID": str(frozen_receipt.get("ZET_AGENT_ID", "") or "").strip(),
         "ZETTLAB_AGENT_ACTION_TOKEN": str(
             frozen_receipt.get("ZETTLAB_AGENT_ACTION_TOKEN", "") or ""
-        ).strip(),
-        "ZETTLAB_HARDWARE_EXECUTION_TOKEN": str(
-            frozen_receipt.get("ZETTLAB_HARDWARE_EXECUTION_TOKEN", "") or ""
         ).strip(),
         "HERMES_TURN_ID": str(frozen_receipt.get("HERMES_TURN_ID", "") or "").strip(),
         "HERMES_SESSION_ID": session_id,
@@ -2578,6 +2576,8 @@ def build_camera_runtime_env() -> dict[str, str]:
     user_id = str(frozen_receipt.get("ZETTLAB_USER_ID", "") or "").strip()
     if user_id:
         env["ZETTLAB_USER_ID"] = user_id
+    if hardware_token:
+        env["ZETTLAB_HARDWARE_EXECUTION_TOKEN"] = hardware_token
     limits = {
         "ZET_AGENT_ID": 128,
         "ZETTLAB_AGENT_ACTION_TOKEN": 128,

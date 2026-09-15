@@ -597,6 +597,7 @@ def _capture_trusted_execution_receipt(
         gateway_session_key=str(gateway_session_key or "").strip(),
         execution_policy=str(bound_execution_policy or "").strip().lower(),
     )
+    require_hardware_token = relative_path != _CAMERA_SKILL_PATH
     present = {
         "agent_id": bool(receipt.agent_id),
         "turn_id": bool(receipt.turn_id),
@@ -604,7 +605,7 @@ def _capture_trusted_execution_receipt(
     present.update(
         {
             "action_token": bool(receipt.action_token),
-            "hardware_execution_token": bool(receipt.hardware_execution_token),
+            "hardware_execution_token": bool(receipt.hardware_execution_token) if require_hardware_token else True,
             "session_id": bool(receipt.session_id),
         }
     )
@@ -616,8 +617,7 @@ def _capture_trusted_execution_receipt(
         return None
     if (
         not _is_opaque_action_token(receipt.action_token)
-        or re.fullmatch(r"[0-9a-f]{64}", receipt.hardware_execution_token)
-        is None
+        or (require_hardware_token and re.fullmatch(r"[0-9a-f]{64}", receipt.hardware_execution_token) is None)
     ):
         logger.warning("zet_agent: hardware execution receipt is malformed")
         return None
@@ -647,40 +647,46 @@ def _trusted_skill_path_for_slug(skill_slug: str) -> str:
     return f"skills/{normalized}/SKILL.md"
 
 
-def trusted_camera_runtime_receipt() -> Mapping[str, str]:
+def _trusted_runtime_receipt(require_hardware_token: bool) -> Mapping[str, str]:
     """Return the private one-operation receipt for the camsnap helper."""
     receipt = _TRUSTED_HARDWARE_RUNTIME_RECEIPT.get()
     if (
         receipt is None
         or not _is_opaque_action_token(receipt.action_token)
-        or re.fullmatch(r"[0-9a-f]{64}", receipt.hardware_execution_token)
-        is None
+        or (require_hardware_token and re.fullmatch(r"[0-9a-f]{64}", receipt.hardware_execution_token) is None)
         or not receipt.session_id
     ):
         return {}
-    return {
+    values = {
         "ZET_AGENT_ID": receipt.agent_id,
         "ZETTLAB_AGENT_ACTION_TOKEN": receipt.action_token,
-        "ZETTLAB_HARDWARE_EXECUTION_TOKEN": receipt.hardware_execution_token,
         "HERMES_TURN_ID": receipt.turn_id,
         "HERMES_SESSION_KEY": receipt.session_id,
         "ZETTLAB_USER_ID": receipt.user_id,
     }
+    if receipt.hardware_execution_token:
+        values["ZETTLAB_HARDWARE_EXECUTION_TOKEN"] = receipt.hardware_execution_token
+    return values
+
+
+def trusted_camera_runtime_receipt() -> Mapping[str, str]:
+    """Return camera context; the hardware execution bearer is optional."""
+    return _trusted_runtime_receipt(require_hardware_token=False)
 
 
 def trusted_printer3d_runtime_receipt() -> Mapping[str, str]:
     """Return the private one-operation receipt for signed printer helpers."""
-    return trusted_camera_runtime_receipt()
+    return _trusted_runtime_receipt(require_hardware_token=True)
 
 
 def trusted_plaud_runtime_receipt() -> Mapping[str, str]:
     """Return the private one-operation receipt for the PLAUD helper."""
-    return trusted_camera_runtime_receipt()
+    return _trusted_runtime_receipt(require_hardware_token=True)
 
 
 def trusted_smart_home_runtime_receipt() -> Mapping[str, str]:
     """Return the private one-operation receipt for the light helper."""
-    return trusted_camera_runtime_receipt()
+    return _trusted_runtime_receipt(require_hardware_token=True)
 
 
 def _stat_fingerprint(value: os.stat_result) -> tuple[int, ...]:
