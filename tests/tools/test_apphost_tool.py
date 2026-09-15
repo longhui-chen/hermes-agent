@@ -2004,3 +2004,80 @@ def test_reload_does_not_ask_again(monkeypatch):
             }))
     assert out["ok"] is True
     assert "data_refresh" not in json.loads(seen["req"].data.decode("utf-8"))
+
+
+# --- 就地创建 / 就地发布 -------------------------------------------------------
+
+def test_prepare_asks_the_platform_for_the_app_directory(monkeypatch):
+    """一个应用从创建到退役只有一个目录，而那个目录的位置是平台的口径。
+
+    模型不再自己在 output 下拼一个带哈希的工地路径——它问平台要，平台建好目录
+    和版本库再把绝对路径交出来。这条钉住线上的形状：POST /prepare，只带 slug。
+    """
+    seen = {}
+    with mux_profile_scope(monkeypatch, _scope()):
+        # /prepare 回的是裸对象，不是 {code,data} 信封（服务端 c.JSON(200, prepared)）。
+        with patch("tools.apphost_tool._urlopen", _capture_urlopen(seen, {
+            "dir": "/volume1/subvol/apps/mood-journal",
+            "installed": False,
+            "build_output": "bin/app.new",
+        })):
+            out = json.loads(app_host_tool({"action": "prepare", "slug": "mood-journal"}))
+    assert out["ok"] is True
+    assert seen["req"].get_method() == "POST"
+    assert seen["req"].full_url.endswith("/prepare")
+    assert json.loads(seen["req"].data.decode()) == {"slug": "mood-journal"}
+    assert out["data"]["dir"] == "/volume1/subvol/apps/mood-journal"
+    # 编译输出由平台指定：绝不能是 bin/app——改一个在跑的应用时，那底下是正在
+    # 被执行的文件。
+    assert out["data"]["build_output"] == "bin/app.new"
+
+
+def test_prepare_refuses_without_a_slug(monkeypatch):
+    with mux_profile_scope(monkeypatch, _scope()):
+        out = json.loads(app_host_tool({"action": "prepare"}))
+    assert out["ok"] is False
+    assert "slug" in out["error"]["message"]
+
+
+def test_in_place_publish_sends_no_source_subdir(monkeypatch):
+    """就地发布不拷贝任何东西，所以线上没有 source_subdir 可言，改成报应用名。"""
+    seen = {}
+    with mux_profile_scope(monkeypatch, _scope()):
+        with patch("tools.apphost_tool._urlopen", _capture_urlopen(seen, {"code": 200, "data": {}})):
+            out = json.loads(app_host_tool({
+                "action": "publish", "mode": "reload",
+                "in_place": True, "slug": "mood-journal", "note": "改了首页",
+            }))
+    assert out["ok"] is True
+    body = json.loads(seen["req"].data.decode())
+    assert body["in_place"] is True and body["slug"] == "mood-journal"
+    assert "source_subdir" not in body
+    assert body["note"] == "改了首页"
+
+
+def test_in_place_publish_requires_a_slug(monkeypatch):
+    with mux_profile_scope(monkeypatch, _scope()):
+        out = json.loads(app_host_tool({"action": "publish", "mode": "reload", "in_place": True}))
+    assert out["ok"] is False
+    assert "slug" in out["error"]["message"]
+
+
+def test_discard_sends_only_the_slug(monkeypatch):
+    """「改砸了退回去」只需要说清是哪个应用——退到哪一版由平台的指针决定，
+    不给模型任何「退到我说的那一版」的余地。"""
+    seen = {}
+    with mux_profile_scope(monkeypatch, _scope()):
+        with patch("tools.apphost_tool._urlopen", _capture_urlopen(seen, {"discarded": True})):
+            out = json.loads(app_host_tool({"action": "discard", "slug": "mood-journal"}))
+    assert out["ok"] is True
+    assert seen["req"].get_method() == "POST"
+    assert seen["req"].full_url.endswith("/discard")
+    assert json.loads(seen["req"].data.decode()) == {"slug": "mood-journal"}
+
+
+def test_discard_refuses_without_a_slug(monkeypatch):
+    with mux_profile_scope(monkeypatch, _scope()):
+        out = json.loads(app_host_tool({"action": "discard"}))
+    assert out["ok"] is False
+    assert "slug" in out["error"]["message"]

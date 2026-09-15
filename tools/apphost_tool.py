@@ -105,6 +105,16 @@ _CALL_WRITE_PATHS = frozenset({"/api/refresh"})
 # it (an action token authenticates one agent, not the device); recovery from
 # the recycle bin lives on the JWT member face, i.e. the client app's list.
 _HTTP_ACTIONS = (
+    # prepare hands back the one directory an app lives in — the platform
+    # creates it (and its version repository) for a new app, and puts an
+    # existing app's working tree back on the live version for a change.
+    # Everything after it happens in that directory: write source, compile,
+    # publish. Nothing is copied, and the model never invents a path.
+    "prepare",
+    # discard throws away everything done since the published version: the
+    # source goes back, the half-built binary is dropped, and the app never
+    # stopped serving. This is the failure exit — there is no other way back.
+    "discard",
     "probe", "list", "acquire_slot", "release_slot", "publish", "install",
     "reload", "rollback", "delete", "lifecycle", "logs", "call",
     # Typed AppOperation endpoints are intentionally distinct from the
@@ -119,7 +129,12 @@ APP_HOST_SCHEMA = {
     "description": (
         "Manage device-hosted generated applications via the local App Host. "
         "Hermes holds the credentials and performs the HTTP calls — never try "
-        "to reach App Host endpoints from shell. Actions: probe (capability + "
+        "to reach App Host endpoints from shell. Actions: prepare (get the "
+        "one directory this app lives in — create it for a new app, or put an "
+        "existing one's source back on its live version; write code and "
+        "compile THERE, then publish with in_place), discard (throw away "
+        "unpublished changes and put the app directory back to the version in "
+        "service — the app itself is never affected), probe (capability + "
         "storage headroom check), list (installed apps), acquire_slot / "
         "release_slot (build-slot admission before compiling; acquire answers "
         "immediately with a slot token, or queue_ahead while queued — poll by "
@@ -175,8 +190,9 @@ APP_HOST_SCHEMA = {
             "slug": {
                 "type": "string",
                 "description": (
-                    "Application slug. Required for install, reload, "
-                    "rollback, delete, lifecycle, logs, and call."
+                    "Application slug. Required for prepare, publish with "
+                    "in_place, install, reload, rollback, delete, lifecycle, "
+                    "logs, and call."
                 ),
             },
             "path": {
@@ -210,6 +226,15 @@ APP_HOST_SCHEMA = {
                 "description": (
                     "Required for publish: install creates a new app; reload "
                     "updates an existing app owned by the current agent."
+                ),
+            },
+            "in_place": {
+                "type": "boolean",
+                "description": (
+                    "Publish what is already in the app's own directory — the "
+                    "one prepare handed you. Nothing is copied. Requires slug. "
+                    "This is the normal way to publish: build there, publish "
+                    "from there."
                 ),
             },
             "source_subdir": {
@@ -690,14 +715,34 @@ def _build_request(action, args):
         if not slot_token:
             raise _BadRequest("release_slot 需要提供 slot_token 参数")
         return "DELETE", "/buildslot/" + quote(slot_token, safe=""), None, timeout
+    if action == "prepare":
+        slug = str(args.get("slug", "") or "").strip()
+        if not slug:
+            raise _BadRequest("prepare 需要提供 slug 参数（这个应用的名字）")
+        return "POST", "/prepare", {"slug": slug}, timeout
+    if action == "discard":
+        slug = str(args.get("slug", "") or "").strip()
+        if not slug:
+            raise _BadRequest("discard 需要提供 slug 参数（要退回的那个应用）")
+        return "POST", "/discard", {"slug": slug}, timeout
     if action == "publish":
         mode = str(args.get("mode", "") or "").strip()
         if mode not in _PUBLISH_MODES:
             raise _BadRequest("publish 需要 mode 参数（install/reload）")
         body = {"mode": mode}
-        source_subdir = _require_source_subdir(args)
-        if source_subdir:
-            body["source_subdir"] = source_subdir
+        # 就地发布：源码已经在 prepare 给的那个应用目录里，平台什么都不拷。
+        # 这时没有 source_subdir 可言，改成必须报上应用名。
+        in_place = bool(args.get("in_place"))
+        if in_place:
+            slug = str(args.get("slug", "") or "").strip()
+            if not slug:
+                raise _BadRequest("in_place 发布需要提供 slug 参数（prepare 时用的那个名字）")
+            body["in_place"] = True
+            body["slug"] = slug
+        else:
+            source_subdir = _require_source_subdir(args)
+            if source_subdir:
+                body["source_subdir"] = source_subdir
         note = str(args.get("note", "") or "").strip()
         if note:
             body["note"] = note
@@ -879,6 +924,7 @@ def _build_env_result():
 _COMPLETION_STATUS = {
     "probe": {200}, "list": {200}, "app_capabilities": {200},
     "app_operation": {200}, "acquire_slot": {200}, "release_slot": {204},
+    "prepare": {200}, "discard": {200},
     "publish": {200, 202}, "install": {200, 202}, "reload": {200, 202}, "rollback": {200},
     "delete": {204}, "lifecycle": {200}, "logs": {200}, "call": {200},
     "workflow_operation_status": {200, 202}, "workflow_operation_resume": {200, 202},
