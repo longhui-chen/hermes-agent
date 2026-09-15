@@ -154,6 +154,7 @@ def ssh_control_tool(args: dict[str, Any], **_: Any) -> str:
     except (TypeError, ValueError) as exc:
         return json.dumps({"success": False, "code": "invalid_action", "error": str(exc)}, ensure_ascii=False)
     action_token, session_id, turn_id = _runtime_context()
+    # zettlab-overlay(ac1015-bearer): require outer SSH identity only; upstream: none
     if not all((action_token, session_id, turn_id)):
         return json.dumps({"success": False, "code": "ssh_authorization_unavailable"})
     timeout_seconds = payload.get("timeout_seconds", _DEFAULT_TIMEOUT_SECONDS - 5)
