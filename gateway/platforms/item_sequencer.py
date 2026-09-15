@@ -104,6 +104,7 @@ class ItemSequencer:
     max_snapshot_bytes: int = MAX_SNAPSHOT_BYTES
     max_items: int = MAX_ITEMS
     identity_fields: Mapping[str, str] = field(default_factory=dict)
+    turn_id: str | None = None
     next_index: int = 0
     items: dict[str, _Item] = field(default_factory=dict)
     open_items: dict[str, _Item] = field(default_factory=dict)
@@ -141,14 +142,17 @@ class ItemSequencer:
             return item, False
         return self._new(kind, identity), True
 
-    @staticmethod
-    def _lifecycle(kind: str, item: _Item, completed: bool = False, **extra: Any) -> dict[str, Any]:
+    def _lifecycle(self, kind: str, item: _Item, completed: bool = False, **extra: Any) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "type": "item.completed" if completed else "item.started",
             "kind": kind,
             "item_id": item.item_id,
             "index": item.index,
         }
+        if self.turn_id:
+            payload["turn_id"] = self.turn_id
+        now_ms = int(time.time() * 1000)
+        payload["finished_at" if completed else "started_at"] = now_ms
         payload.update(extra)
         return payload
 
@@ -176,7 +180,6 @@ class ItemSequencer:
             kind,
             item,
             completed=True,
-            finished_at_ms=int(time.time() * 1000),
         )
         if value is not None and not omitted:
             payload["text"] = value
