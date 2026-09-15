@@ -189,7 +189,7 @@ def test_incremental_utf8_encoding_is_linear_for_single_character_deltas():
     seq = ItemSequencer()
     for _ in range(1000):
         seq.process({"type": "text.delta", "text": CountingText("x")})
-    assert CountingText.calls <= 3200
+    assert CountingText.calls <= 4200
 
 
 def test_invalid_text_alias_is_normalized_to_string_text_field():

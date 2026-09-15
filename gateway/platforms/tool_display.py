@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Mapping
+from itertools import islice
 from typing import Any
 
 ARGS_MAX_BYTES = 256
@@ -39,9 +40,9 @@ _SECRET_KEYS = re.compile(r"(?i)(token|api[_-]?key|access[_-]?key|secret|passwor
 
 def _redact_value(value: Any, *, max_chars: int = SUMMARY_MAX_BYTES * 4) -> Any:
     if isinstance(value, Mapping):
-        return {str(key): "[REDACTED]" if _SECRET_KEYS.search(str(key)) else _redact_value(item, max_chars=max_chars) for key, item in list(value.items())[:256]}
+        return {str(key): "[REDACTED]" if _SECRET_KEYS.search(str(key)) else _redact_value(item, max_chars=max_chars) for key, item in islice(value.items(), 256)}
     if isinstance(value, (list, tuple)):
-        return [_redact_value(item, max_chars=max_chars) for item in list(value)[:256]]
+        return [_redact_value(item, max_chars=max_chars) for item in islice(value, 256)]
     if isinstance(value, str):
         return redact(value)[:max_chars]
     return value

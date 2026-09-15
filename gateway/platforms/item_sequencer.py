@@ -9,7 +9,6 @@ from __future__ import annotations
 import time
 import threading
 import uuid
-import copy
 from dataclasses import dataclass, field
 from typing import Any, Mapping, MutableMapping
 
@@ -25,6 +24,17 @@ class AdmissionError(ValueError):
     def __init__(self, reason: str) -> None:
         super().__init__(reason)
         self.reason = reason
+
+
+@dataclass(frozen=True)
+class Admission:
+    frame: Mapping[str, Any]
+    kind: str | None
+    identity: str | None
+    needs_new_index: bool
+    normalized_text: str | None = None
+    text_bytes: int = 0
+    version_next: int | None = None
 
 # UUIDv7 has a 48-bit millisecond timestamp, a 12-bit monotonic counter and a
 # 62-bit random tail.  The lock is deliberately process-local: a sequencer is
@@ -98,7 +108,7 @@ class _Item:
     identity: str
     version: int = 0
     chunks: list[str] = field(default_factory=list)
-    text_bytes: int = 0
+    bytes_total: int = 0
     snapshot_omitted: bool = False
 
     @property
@@ -124,6 +134,7 @@ class ItemSequencer:
     open_items: dict[str, _Item] = field(default_factory=dict)
     _todo: _Item | None = None
     _delegation: dict[str, _Item] = field(default_factory=dict)
+    kind_counts: dict[str, int] = field(default_factory=dict)
     counters: dict[str, int] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -138,7 +149,6 @@ class ItemSequencer:
         self.counters[name] = self.counters.get(name, 0) + 1
 
     def _reject(self, reason: str) -> None:
-        self._count(f"item_frame_rejected{{reason:{reason}}}")
         raise AdmissionError(reason)
 
     def _validate_text(self, value: Any) -> str:
@@ -187,6 +197,7 @@ class ItemSequencer:
         item = _Item(uuid7(), self.next_index, kind, identity)
         self.next_index += 1
         self.items[identity] = item
+        self.kind_counts[kind] = self.kind_counts.get(kind, 0) + 1
         return item
 
     def _ensure(self, kind: str, identity: str) -> tuple[_Item, bool]:
@@ -219,14 +230,14 @@ class ItemSequencer:
             delta_bytes = len(text.encode("utf-8"))
         except UnicodeError:
             self._reject("text_invalid")
-        if item.text_bytes + delta_bytes > self.max_snapshot_bytes:
+        if item.bytes_total + delta_bytes > self.max_snapshot_bytes:
             item.chunks = []
-            item.text_bytes = 0
+            item.bytes_total = 0
             item.snapshot_omitted = True
             self._count("snapshot_omitted")
             return
         item.chunks.append(text)
-        item.text_bytes += delta_bytes
+        item.bytes_total += delta_bytes
 
     def _close(self, kind: str, *, snapshot: str | None = None, canonical: bool = False) -> list[dict[str, Any]]:
         item = self.open_items.pop(kind, None)
@@ -252,7 +263,7 @@ class ItemSequencer:
         # Closed snapshots travel in the output only. Keeping them on all
         # historical keys would multiply the per-open-item budget by 2048.
         item.chunks = []
-        item.text_bytes = 0
+        item.bytes_total = 0
         return [payload]
 
     def _switch(self, kind: str) -> list[dict[str, Any]]:
@@ -261,7 +272,7 @@ class ItemSequencer:
             self._reject("capacity")
         out = self._close(other)
         if kind not in self.open_items:
-            identity = f"{kind}:{len([i for i in self.items.values() if i.kind == kind])}"
+            identity = f"{kind}:{self.kind_counts.get(kind, 0)}"
             item, created = self._ensure(kind, identity)
             self.open_items[kind] = item
             if created:
@@ -294,7 +305,7 @@ class ItemSequencer:
         # same steer_id, while unrelated fields cannot collide.
         return f"{path}:{value}"
 
-    def _admit(self, frame: Mapping[str, Any] | str) -> Mapping[str, Any]:
+    def _admit(self, frame: Mapping[str, Any] | str) -> Admission:
         """Read-only admission pass. No sequencer state is mutated here."""
         if isinstance(frame, str):
             frame = {"type": "text.delta", "text": frame}
@@ -308,12 +319,11 @@ class ItemSequencer:
             kind = "reasoning" if frame_type == "reasoning.delta" else "text"
             identity = next((i.identity for i in self.items.values() if i.kind == kind and self.open_items.get(kind) is i), None)
             if identity is None:
-                identity = f"{kind}:{len([i for i in self.items.values() if i.kind == kind])}"
+                identity = f"{kind}:{self.kind_counts.get(kind, 0)}"
             self._identity_ok(identity)
             self._capacity([identity])
-            if not isinstance(data.get("text"), str):
-                return _put_frame_data(frame, {**data, "text": value})
-            return frame
+            normalized = _put_frame_data(frame, {**data, "text": value}) if not isinstance(data.get("text"), str) else frame
+            return Admission(normalized, kind, identity, identity not in self.items, value, len(value.encode("utf-8")))
         if frame_type in ("tool.start", "tool.result") or "toolCallId" in data or "tool_call_id" in data:
             tool_id = data.get("toolCallId") or data.get("tool_call_id") or data.get("call_id")
             if not isinstance(tool_id, str) or not tool_id:
@@ -322,10 +332,10 @@ class ItemSequencer:
             self._identity_ok(identity)
             if frame_type == "tool.start" or data.get("status") == "running":
                 self._capacity([identity])
-            return frame
+            return Admission(frame, "tool", identity, identity not in self.items)
         if frame_type in ("hermes.todo", "todo.update"):
             self._capacity(["todo:turn"])
-            return frame
+            return Admission(frame, "todo", "todo:turn", "todo:turn" not in self.items, version_next=(self._todo.version + 1 if self._todo else 1))
         if frame_type in ("hermes.delegation.progress", "delegation.status"):
             child = data.get("subagent_id")
             if not isinstance(child, str) or not child:
@@ -333,11 +343,11 @@ class ItemSequencer:
             identity = f"subagent:{child}"
             self._identity_ok(identity)
             self._capacity([identity])
-            return frame
+            return Admission(frame, "subagent", identity, identity not in self.items, version_next=(self.items.get(identity).version + 1 if identity in self.items else 1))
         if frame_type in ("item.started", "item.completed"):
             if not isinstance(data.get("item_id"), str) or not isinstance(data.get("index"), int):
                 self._reject("identity_missing")
-            return frame
+            return Admission(frame, str(data.get("kind")), str(data.get("item_id")), False)
         identity = self._extension_identity(str(frame_type), data)
         if identity is None and frame_type in self.identity_fields:
             self._reject("identity_missing")
@@ -345,7 +355,7 @@ class ItemSequencer:
             self._reject("unregistered")
         self._identity_ok(identity)
         self._capacity([identity])
-        return frame
+        return Admission(frame, "extension", identity, identity not in self.items)
 
     def _process(self, frame: Mapping[str, Any] | str | Any) -> list[Any]:
         """Process one frame and return lifecycle frame(s) plus the frame."""
@@ -445,8 +455,9 @@ class ItemSequencer:
         """Process one frame, rejecting malformed/budget-exceeding input."""
         try:
             admitted = self._admit(frame)
-            return self._process(admitted)
-        except AdmissionError:
+            return self._process(admitted.frame)
+        except AdmissionError as exc:
+            self._count(f"item_frame_rejected{{reason:{exc.reason}}}")
             return [frame]
         except (TypeError, ValueError):
             self._count("item_frame_rejected{reason:text_invalid}")
