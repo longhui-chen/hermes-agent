@@ -257,7 +257,7 @@ def test_plaud_trusted_scope_binds_exact_command_to_current_turn(monkeypatch, tm
         assert dispatch_error is None
         assert receipt is not None
         assert receipt.action_token == ACTION_TOKEN
-        assert receipt.hardware_execution_token == HARDWARE_TOKEN
+        assert not hasattr(receipt, "hardware_execution_token")
     finally:
         clear_turn_vars(turn_tokens)
         clear_session_vars(session_tokens)
