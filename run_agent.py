@@ -3415,9 +3415,9 @@ class AIAgent:
         if callable(hook):
             outcome = hook(cleaned)
             return bool(outcome.get("accepted")) if isinstance(outcome, dict) else bool(outcome)
-        # zettlab-overlay(U2d): stub fallback for agents built via object.__new__ (no
-        # __init__, so no lock); upstream: H26 `_steer_closed` refusal after the turn
-        # finalizer's closing drain, kept verbatim on the list representation
+        # H26 的 stub 兜底（object.__new__ 建的测试替身跳过 __init__，因而没有锁）与
+        # `_steer_closed` 拒绝，在 U8-pre 回灌时合流到 U2d 的 list 表示上。
+        # zettlab-overlay(U2d): stub fallback plus the closed-slot refusal on the list slot; upstream: none
         _lock = getattr(self, "_pending_steer_lock", None)
         if _lock is None:
             if getattr(self, "_steer_closed", False):
@@ -3429,8 +3429,8 @@ class AIAgent:
                 return False
             existing.append((None, cleaned))
             return True
-        # zettlab-overlay(U2d): append legacy text as an identity-free tuple; upstream:
-        # H26 folds `_steer_closed` into the same refusal as the closed-slot sentinel
+        # H26 的 `_steer_closed` 与「槽位已关闭」哨兵并进同一个拒绝判断。
+        # zettlab-overlay(U2d): append legacy text as an identity-free tuple; upstream: none
         with _lock:
             if self._pending_steer is None or getattr(self, "_steer_closed", False) or self._interrupt_requested:
                 return False
