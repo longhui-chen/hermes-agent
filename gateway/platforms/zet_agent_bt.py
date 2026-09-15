@@ -11,8 +11,9 @@ from .tool_display import build_tool_result_display, build_tool_start_display
 def bind_item_callbacks(
     *, stream_q: Any, turn_id: str | None, reasoning: Callable[..., Any] | None,
     tool_start: Callable[..., Any] | None, tool_complete: Callable[..., Any] | None,
-) -> tuple[Callable[..., Any], Callable[..., Any], Callable[..., Any]]:
+) -> tuple[Callable[..., Any], Callable[..., Any], Callable[..., Any], Callable[[], None]]:
     sequencer = ItemSequencer(turn_id=turn_id)
+    finished = False
 
     def emit(frame: Any) -> None:
         for item in sequencer.process(frame):
@@ -38,4 +39,13 @@ def bind_item_callbacks(
         if tool_complete:
             tool_complete(call_id, name, args, result)
 
-    return on_reasoning, on_start, on_complete
+    def finish() -> None:
+        nonlocal finished
+        if finished:
+            return
+        finished = True
+        for kind in ("reasoning", "text", "tool"):
+            for frame in sequencer._close(kind):
+                stream_q.put(("__tool_progress__", frame))
+
+    return on_reasoning, on_start, on_complete, finish

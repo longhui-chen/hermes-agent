@@ -5459,7 +5459,7 @@ class ZetAgentAdapter(APIServerAdapter):
             )
 
         # zettlab-overlay(BT): route item/display frames through the adapter; upstream: none
-        _bt_reasoning, _bt_start, _bt_complete = bind_item_callbacks(
+        _bt_reasoning, _bt_start, _bt_complete, _bt_finish = bind_item_callbacks(
             stream_q=stream_q, turn_id=extension_turn_id,
             reasoning=_reasoning_cb, tool_start=tool_start_callback,
             tool_complete=tool_complete_callback,
@@ -5467,6 +5467,7 @@ class ZetAgentAdapter(APIServerAdapter):
         agent.reasoning_callback, agent.tool_start_callback, agent.tool_complete_callback = (
             _bt_reasoning, _bt_start, _bt_complete
         )
+        agent._bt_finish_items = _bt_finish
 
         # 2. Structured lifecycle status: late-bind so only the sniffed
         # chat-completions stream receives the App-specific extension event.
@@ -6033,6 +6034,10 @@ class ZetAgentAdapter(APIServerAdapter):
                 and isinstance(result[0], dict)
                 else {}
             )
+            # zettlab-overlay(BT): close open reasoning/text items before SSE sentinel; upstream: none
+            _bt_finish = getattr(agent_ref[0] if agent_ref else None, "_bt_finish_items", None)
+            if callable(_bt_finish):
+                _bt_finish()
             runtime_agent = agent_ref[0] if agent_ref else None
             runtime_shell_reusable = bool(
                 runtime_agent is not None
@@ -6042,6 +6047,9 @@ class ZetAgentAdapter(APIServerAdapter):
             )
             return result
         finally:
+            _bt_finish = getattr(agent_ref[0] if agent_ref else None, "_bt_finish_items", None)
+            if callable(_bt_finish):
+                _bt_finish()
             if attachment_emitter_token is not None:
                 try:
                     from hermes_cli.plugins import reset_attachment_emitter
