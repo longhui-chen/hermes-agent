@@ -7140,6 +7140,11 @@ class APIServerAdapter(BasePlatformAdapter):
                         "created": created, "model": model,
                         "choices": [{"index": 0, "delta": {"content": item}, "finish_reason": None}],
                     }
+                    # zettlab-overlay(BT): attach sequencer identity to content chunks; upstream: none
+                    item_id = getattr(item, "item_id", None)
+                    item_index = getattr(item, "index", None)
+                    if isinstance(item_id, str) and isinstance(item_index, int):
+                        content_chunk["hermes"] = {"item_id": item_id, "index": item_index}
                     await response.write(f"data: {json.dumps(content_chunk)}\n\n".encode())
                 if prestream_timing is not None:
                     try:

@@ -8,10 +8,20 @@ from .item_sequencer import ItemSequencer
 from .tool_display import build_tool_result_display, build_tool_start_display
 
 
+class BTContentDelta(str):
+    """A text delta carrying the sequencer identity for the SSE writer."""
+
+    def __new__(cls, value: str, *, item_id: str, index: int):
+        result = super().__new__(cls, value)
+        result.item_id = item_id
+        result.index = index
+        return result
+
+
 def bind_item_callbacks(
     *, stream_q: Any, turn_id: str | None, reasoning: Callable[..., Any] | None,
     tool_start: Callable[..., Any] | None, tool_complete: Callable[..., Any] | None,
-) -> tuple[Callable[..., Any], Callable[..., Any], Callable[..., Any], Callable[[], None]]:
+) -> tuple[Callable[..., Any], Callable[..., Any], Callable[..., Any], Callable[[], None], Callable[..., list[Any]]]:
     sequencer = ItemSequencer(turn_id=turn_id)
     finished = False
 
@@ -24,7 +34,13 @@ def bind_item_callbacks(
         if delta is None:
             return []
         frames = sequencer.process(delta)
-        return [delta] + [("__tool_progress__", frame) for frame in frames if isinstance(frame, dict)]
+        item = sequencer.open_items.get("text")
+        content = (
+            BTContentDelta(delta, item_id=item.item_id, index=item.index)
+            if isinstance(delta, str) and item is not None
+            else delta
+        )
+        return [content] + [("__tool_progress__", frame) for frame in frames if isinstance(frame, dict)]
 
     def on_reasoning(text: Any) -> None:
         if text:

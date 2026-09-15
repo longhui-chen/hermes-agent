@@ -61,3 +61,17 @@ def test_callbacks_preserve_legacy_callbacks():
     start("c", "tool", {})
     complete("c", "tool", {}, {"ok": True})
     assert [name for name, _ in calls] == ["start", "complete"]
+
+
+def test_transform_attaches_item_identity_without_duplicate_text():
+    queue = Queue()
+    _, _, _, _, transform = bind_item_callbacks(
+        stream_q=queue, turn_id="turn-1", reasoning=None,
+        tool_start=None, tool_complete=None,
+    )
+    emitted = transform("hello")
+    assert len([item for item in emitted if isinstance(item, str)]) == 1
+    content = next(item for item in emitted if isinstance(item, str))
+    assert content == "hello"
+    assert isinstance(content.item_id, str)
+    assert isinstance(content.index, int)
