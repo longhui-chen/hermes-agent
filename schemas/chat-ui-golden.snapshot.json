@@ -1,7 +1,7 @@
 {
   "snapshot_version": 2,
-  "root_commit": "ec5159f3dd3cb8080cf002503f3318ac2c798d67",
-  "sha256": "8786152e05bad84f238c08dd3e0d381f333ca061b4ec7442ecf4a782606f63f9",
+  "root_commit": "2eefd7ff276ef7c1b1bc8df4682d9f91083fe88d",
+  "sha256": "6c77d15cd59011fb42cd9a3244c0c5638c927cb966ec745a97b712b95e66f74f",
   "payload": {
     "golden": {
       "events": {
@@ -937,6 +937,84 @@
             "v": 1
           }
         },
+        "tool.result.display.error": {
+          "type": "tool.result",
+          "turn_id": "turn_demo_0001",
+          "seq": 106,
+          "fanout_seq": 6,
+          "ts": 1756972800000,
+          "backend": "hermes",
+          "data": {
+            "call_id": "call_demo_0001",
+            "status": "error",
+            "duration_s": 1.25,
+            "output": {
+              "total_count": 0
+            },
+            "error": "search backend unavailable",
+            "error_code": "tool_error",
+            "component_id": "browser-runtime",
+            "reference_id": "ref_demo_0001",
+            "provider": "demo-provider",
+            "status_code": 503,
+            "connector_error": {
+              "code": "connector_unavailable"
+            },
+            "browser_state": {
+              "url": "https://example.invalid/"
+            },
+            "browser_content_evidence": {
+              "text": "demo"
+            },
+            "item_id": "01996f2e-7b6a-7c33-9f8e-4a3d6c1b2e90",
+            "index": 2,
+            "display": {
+              "summary": "permission denied",
+              "content_type": "error",
+              "truncated": false,
+              "bytes": 16
+            }
+          }
+        },
+        "tool.result.display.truncated": {
+          "type": "tool.result",
+          "turn_id": "turn_demo_0001",
+          "seq": 106,
+          "fanout_seq": 6,
+          "ts": 1756972800000,
+          "backend": "hermes",
+          "data": {
+            "call_id": "call_demo_0001",
+            "status": "error",
+            "duration_s": 1.25,
+            "output": {
+              "total_count": 0
+            },
+            "error": "search backend unavailable",
+            "error_code": "tool_error",
+            "component_id": "browser-runtime",
+            "reference_id": "ref_demo_0001",
+            "provider": "demo-provider",
+            "status_code": 503,
+            "connector_error": {
+              "code": "connector_unavailable"
+            },
+            "browser_state": {
+              "url": "https://example.invalid/"
+            },
+            "browser_content_evidence": {
+              "text": "demo"
+            },
+            "item_id": "01996f2e-7b6a-7c33-9f8e-4a3d6c1b2e90",
+            "index": 2,
+            "display": {
+              "summary": "x",
+              "content_type": "text",
+              "truncated": true,
+              "bytes": 1
+            }
+          }
+        },
         "tool.result": {
           "type": "tool.result",
           "turn_id": "turn_demo_0001",
@@ -967,7 +1045,41 @@
               "text": "demo"
             },
             "item_id": "01996f2e-7b6a-7c33-9f8e-4a3d6c1b2e90",
-            "index": 2
+            "index": 2,
+            "display": {
+              "summary": "search backend unavailable",
+              "content_type": "error",
+              "truncated": false,
+              "bytes": 25
+            }
+          }
+        },
+        "tool.start.display": {
+          "type": "tool.start",
+          "turn_id": "turn_demo_0001",
+          "seq": 105,
+          "fanout_seq": 5,
+          "ts": 1756972800000,
+          "backend": "hermes",
+          "data": {
+            "call_id": "call_demo_0001",
+            "name": "search_files",
+            "label": "搜索素材",
+            "arguments": {
+              "target": "nas",
+              "query": "上周末 公园 视频"
+            },
+            "item_id": "01996f2e-7b6a-7c33-9f8e-4a3d6c1b2e90",
+            "index": 2,
+            "source": {
+              "kind": "builtin",
+              "id": "search_files",
+              "label": "Search files"
+            },
+            "display": {
+              "args_summary": "target=nas query=demo",
+              "truncated": false
+            }
           }
         },
         "tool.start": {
@@ -986,7 +1098,16 @@
               "query": "上周末 公园 视频"
             },
             "item_id": "01996f2e-7b6a-7c33-9f8e-4a3d6c1b2e90",
-            "index": 2
+            "index": 2,
+            "source": {
+              "kind": "mcp",
+              "id": "search",
+              "label": "Search"
+            },
+            "display": {
+              "args_summary": "query=上周末视频",
+              "truncated": false
+            }
           }
         },
         "turn.end": {
@@ -1753,7 +1874,13 @@
             "text": "demo"
           },
           "item_id": "01996f2e-7b6a-7c33-9f8e-4a3d6c1b2e90",
-          "index": 2
+          "index": 2,
+          "display": {
+            "summary": "result",
+            "content_type": "text",
+            "truncated": false,
+            "bytes": 6
+          }
         },
         "tool-frame.error": {
           "tool": "connector_call",
@@ -1775,7 +1902,13 @@
             "success": false
           },
           "item_id": "01996f2e-7b6a-7c33-9f8e-4a3d6c1b2e90",
-          "index": 2
+          "index": 2,
+          "display": {
+            "summary": "permission denied",
+            "content_type": "error",
+            "truncated": false,
+            "bytes": 16
+          }
         },
         "tool-frame.running": {
           "tool": "search_files",
@@ -1784,7 +1917,16 @@
           "toolCallId": "call_demo_0001",
           "status": "running",
           "item_id": "01996f2e-7b6a-7c33-9f8e-4a3d6c1b2e90",
-          "index": 2
+          "index": 2,
+          "source": {
+            "kind": "mcp",
+            "id": "search",
+            "label": "Search"
+          },
+          "display": {
+            "args_summary": "query=demo",
+            "truncated": false
+          }
         }
       },
       "http": {
@@ -3467,6 +3609,31 @@
               "required": false,
               "type": "any"
             },
+            "display": {
+              "required": false,
+              "type": "object",
+              "items": {
+                "struct": "ToolResultDisplayData",
+                "fields": {
+                  "bytes": {
+                    "required": true,
+                    "type": "number"
+                  },
+                  "content_type": {
+                    "required": true,
+                    "type": "string"
+                  },
+                  "summary": {
+                    "required": true,
+                    "type": "string"
+                  },
+                  "truncated": {
+                    "required": true,
+                    "type": "boolean"
+                  }
+                }
+              }
+            },
             "duration_s": {
               "required": false,
               "type": "number"
@@ -3520,6 +3687,23 @@
               "required": true,
               "type": "string"
             },
+            "display": {
+              "required": false,
+              "type": "object",
+              "items": {
+                "struct": "ToolStartDisplayData",
+                "fields": {
+                  "args_summary": {
+                    "required": false,
+                    "type": "string"
+                  },
+                  "truncated": {
+                    "required": false,
+                    "type": "boolean"
+                  }
+                }
+              }
+            },
             "index": {
               "required": false,
               "type": "number"
@@ -3535,6 +3719,27 @@
             "name": {
               "required": true,
               "type": "string"
+            },
+            "source": {
+              "required": false,
+              "type": "object",
+              "items": {
+                "struct": "ToolSourceData",
+                "fields": {
+                  "id": {
+                    "required": true,
+                    "type": "string"
+                  },
+                  "kind": {
+                    "required": true,
+                    "type": "string"
+                  },
+                  "label": {
+                    "required": true,
+                    "type": "string"
+                  }
+                }
+              }
             }
           }
         },
