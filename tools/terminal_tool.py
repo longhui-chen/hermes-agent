@@ -4383,17 +4383,28 @@ def _run_camera_runtime_command_if_allowed(
             parsed.argv[2:] if semantic else [], timeout, FOREGROUND_MAX_TIMEOUT, _CAMERA_RUNTIME_MAX_TIMEOUT_SECONDS,
         )
         trusted_env = build_camera_semantic_runtime_env() if semantic else build_camera_runtime_env()
-        trusted_secrets = {
-            key: trusted_env.pop(key)
-            for key in ((
+        secret_keys = (
+            (
                 "ZETTLAB_AGENT_ACTION_TOKEN",
                 "ZETTLAB_CAMERA_JOB_ID",
                 "ZETTLAB_CAMERA_EXECUTION_ID",
-            ) if semantic else (
-                "ZETTLAB_AGENT_ACTION_TOKEN",
-                "ZETTLAB_HARDWARE_EXECUTION_TOKEN",
-            ))
+            )
+            if semantic
+            else ("ZETTLAB_AGENT_ACTION_TOKEN",)
+        )
+        trusted_secrets = {
+            key: trusted_env.pop(key)
+            for key in secret_keys
+            if key in trusted_env
         }
+        # Camera ownership is resolved by local-server's authenticated
+        # connector projection. Keep the legacy hardware bearer optional
+        # during migration so existing helpers continue to work while new
+        # calls no longer depend on an internally issued ticket.
+        if not semantic and "ZETTLAB_HARDWARE_EXECUTION_TOKEN" in trusted_env:
+            trusted_secrets["ZETTLAB_HARDWARE_EXECUTION_TOKEN"] = trusted_env.pop(
+                "ZETTLAB_HARDWARE_EXECUTION_TOKEN"
+            )
         secret_values = list(trusted_secrets.values())
         run_cwd = cwd if cwd and os.path.isdir(cwd) else os.getcwd()
         completed = run_trusted_python_script(

@@ -579,7 +579,7 @@ def _capture_trusted_execution_receipt(
         session_id = get_session_env("HERMES_SESSION_ID")
         if not session_id:
             session_id = gateway_session_key
-        user_id = zettlab_auth_principal()
+        user_id = zettlab_auth_principal() or get_session_env("HERMES_SESSION_USER_ID")
     except Exception:
         hardware_token = ""
         bound_execution_policy = ""
