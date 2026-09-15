@@ -298,6 +298,11 @@ class ItemSequencer:
             value = value.get(part)
         if not isinstance(value, str) or not value:
             return None
+        try:
+            if len(value) > MAX_IDENTITY_BYTES or len(value.encode("utf-8")) > MAX_IDENTITY_BYTES:
+                self._reject("identity_oversize")
+        except UnicodeError:
+            self._reject("identity_missing")
         # The path is the identity namespace. This intentionally lets
         # steer_accepted and steer_dropped share one row when they carry the
         # same steer_id, while unrelated fields cannot collide.
@@ -310,6 +315,8 @@ class ItemSequencer:
         if not isinstance(frame, Mapping):
             self._reject("text_invalid")
         frame_type = frame.get("type")
+        if not isinstance(frame_type, str):
+            self._reject("unregistered")
         data = _frame_data(frame)
         if frame_type in ("reasoning.delta", "text.delta", "canonical.final"):
             value = _text_from(frame)

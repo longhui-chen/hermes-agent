@@ -17,6 +17,7 @@ SUMMARY_MAX_BYTES = 4 * 1024
 
 _SECRET_PATTERNS = (
     (re.compile(r"(?i)(bearer\s+)[^\s,;]+"), r"\1[REDACTED]"),
+    (re.compile(r"(?i)((?:authorization\s*:\s*)(?:basic|bearer)\s+)[^\s,;]+"), r"\1[REDACTED]"),
     (re.compile(r"(?i)((?:token|api[_-]?key|access[_-]?key|secret|password|cookie)\s*[:=]\s*)[^\s,;]+"), r"\1[REDACTED]"),
     (re.compile(r"(?i)(cookie\s*:\s*)[^\r\n]+"), r"\1[REDACTED]"),
     (re.compile(r"(?i)([\"'](?:token|api[_-]?key|access[_-]?key|secret|password|cookie)[\"']\s*:\s*[\"'])[^\"']*([\"'])"), r"\1[REDACTED]\2"),
@@ -39,11 +40,20 @@ def redact(text: str) -> str:
 _SECRET_KEYS = re.compile(r"(?i)(token|api[_-]?key|access[_-]?key|secret|password|cookie)")
 
 
-def _redact_value(value: Any, *, max_chars: int = SUMMARY_MAX_BYTES * 4) -> Any:
+def _redact_value(value: Any, *, max_chars: int = SUMMARY_MAX_BYTES * 4, _seen: set[int] | None = None, _depth: int = 0) -> Any:
+    seen = _seen if _seen is not None else set()
+    if _depth > 16:
+        return "[DEPTH_LIMIT]"
     if isinstance(value, Mapping):
-        return {str(key): "[REDACTED]" if _SECRET_KEYS.search(str(key)) else _redact_value(item, max_chars=max_chars) for key, item in islice(value.items(), 256)}
+        if id(value) in seen:
+            return "[CYCLE]"
+        seen.add(id(value))
+        return {str(key): "[REDACTED]" if _SECRET_KEYS.search(str(key)) else _redact_value(item, max_chars=max_chars, _seen=seen, _depth=_depth + 1) for key, item in islice(value.items(), 256)}
     if isinstance(value, (list, tuple)):
-        return [_redact_value(item, max_chars=max_chars) for item in islice(value, 256)]
+        if id(value) in seen:
+            return "[CYCLE]"
+        seen.add(id(value))
+        return [_redact_value(item, max_chars=max_chars, _seen=seen, _depth=_depth + 1) for item in islice(value, 256)]
     if isinstance(value, str):
         return redact(value)[:max_chars]
     return value
@@ -89,7 +99,7 @@ def source_from_registration(tool_id: str, registration: Mapping[str, Any] | Non
         kind = "builtin"
     source_id = str(row.get("id") or row.get("server") or tool_id)
     label = str(row.get("label") or row.get("server_label") or row.get("name") or source_id)
-    return {"kind": kind, "id": source_id, "label": label}
+    return {"kind": kind, "id": _truncate_utf8(source_id, SUMMARY_MAX_BYTES)[0], "label": _truncate_utf8(label, SUMMARY_MAX_BYTES)[0]}
 
 
 def args_summary(arguments: Any) -> dict[str, Any]:
@@ -101,7 +111,7 @@ def result_display(output: Any = None, *, error: Any = None, content_type: str |
     is_error = error not in (None, "")
     if is_error:
         kind = "error"
-        value = str(error)
+        value = error
     elif content_type in {"text", "markdown", "json", "error"}:
         kind = content_type
         value = _safe_json(output, max_chars=SUMMARY_MAX_BYTES * 4)
@@ -111,6 +121,8 @@ def result_display(output: Any = None, *, error: Any = None, content_type: str |
     else:
         value = "" if output is None else str(output)
         kind = "markdown" if "```" in value else "text"
+    if not isinstance(value, str):
+        value = _safe_json(value, max_chars=SUMMARY_MAX_BYTES * 4)
     summary, truncated, _ = _truncate_utf8(value, SUMMARY_MAX_BYTES)
     return {"summary": summary, "content_type": "error" if is_error else kind, "truncated": truncated, "bytes": len(summary.encode("utf-8"))}
 
