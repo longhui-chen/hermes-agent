@@ -380,6 +380,8 @@ class ItemSequencer:
             if frame.get("type") == "tool.start" or data.get("status") == "running":
                 out.extend(self._close("reasoning"))
                 out.extend(self._close("text"))
+                self.open_items[kind] = item
+                out.append(self._lifecycle(kind, item))
         if admission.version_next is not None:
             item.version = admission.version_next
             if kind == "todo":
@@ -390,6 +392,8 @@ class ItemSequencer:
             out.append(_put_frame_data(frame, {**_frame_data(frame), "index": item.index}))
         else:
             out.append(self._attach(frame, item, version=admission.version_next))
+        if kind == "tool" and frame.get("type") == "tool.result":
+            out.extend(self._close(kind))
         return out
 
     def process(self, frame: Any) -> list[Any]:

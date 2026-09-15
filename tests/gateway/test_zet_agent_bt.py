@@ -22,8 +22,21 @@ def test_callbacks_emit_item_lifecycle_and_display():
     assert frames[0]["type"] == "item.started"
     assert any(frame.get("type") == "tool.start" for frame in frames)
     assert any(frame.get("type") == "tool.result" for frame in frames)
+    assert [frame["type"] for frame in frames].count("item.started") >= 2
+    assert [frame["type"] for frame in frames].count("item.completed") >= 1
     assert "[REDACTED]" in next(frame for frame in frames if frame.get("type") == "tool.start")["display"]["args_summary"]
     assert seen[0] == "hello"
+
+
+def test_error_result_is_error_and_redacts_authorization_key():
+    queue = Queue()
+    _, _, complete = bind_item_callbacks(
+        stream_q=queue, turn_id=None, reasoning=None, tool_start=None, tool_complete=None
+    )
+    complete("c", "tool", {}, {"status": "error", "authorization": "Bearer secret"})
+    result = next(frame for frame in _frames(queue) if frame.get("type") == "tool.result")
+    assert result["display"]["content_type"] == "error"
+    assert "secret" not in result["display"]["summary"]
 
 
 def test_callbacks_preserve_legacy_callbacks():

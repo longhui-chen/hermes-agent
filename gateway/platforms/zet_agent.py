@@ -5447,7 +5447,6 @@ class ZetAgentAdapter(APIServerAdapter):
             try:
                 if prestream_timing is not None:
                     prestream_timing.observe_queued_semantic("reasoning")
-                _put_progress(stream_q, {"type": "reasoning.delta", "text": text})
             except Exception:
                 logger.debug("[zet_agent] reasoning_cb push failed", exc_info=True)
 

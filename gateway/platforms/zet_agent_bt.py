@@ -1,6 +1,7 @@
 """BT adapter hooks kept outside the upstream gateway kernel."""
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any, Callable
 
 from .item_sequencer import ItemSequencer
@@ -30,7 +31,10 @@ def bind_item_callbacks(
             tool_start(call_id, name, args)
 
     def on_complete(call_id: Any, name: Any, args: Any, result: Any) -> None:
-        emit({"type": "tool.result", "toolCallId": call_id, **build_tool_result_display(result)})
+        error = result if isinstance(result, BaseException) else None
+        if isinstance(result, Mapping) and (result.get("error") or result.get("status") == "error"):
+            error = result.get("error") or result
+        emit({"type": "tool.result", "toolCallId": call_id, **build_tool_result_display(result, error=error)})
         if tool_complete:
             tool_complete(call_id, name, args, result)
 
