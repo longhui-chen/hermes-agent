@@ -40,7 +40,16 @@ def bind_item_callbacks(
             if isinstance(delta, str) and item is not None
             else delta
         )
-        return [content] + [("__tool_progress__", frame) for frame in frames if isinstance(frame, dict)]
+        lifecycle = []
+        for frame in frames:
+            if not isinstance(frame, dict):
+                continue
+            # The raw BTContentDelta is the sole wire representation of a
+            # text delta. Keep lifecycle frames before it and drop the
+            # attached text.delta projection to avoid duplicate content.
+            if frame.get("type") != "text.delta":
+                lifecycle.append(("__tool_progress__", frame))
+        return lifecycle + [content]
 
     def on_reasoning(text: Any) -> None:
         if text:
