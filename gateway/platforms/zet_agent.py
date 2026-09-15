@@ -104,6 +104,7 @@ from gateway.platforms._chat_ui_enums import TERMINAL_STATES as _TERMINAL_STATES
 # 比抛异常更难查。
 import uuid
 import weakref
+import gateway.platforms.zet_agent_connector_chat_tool  # noqa: F401 - register fork-owned Chat Connector tool
 from collections import Counter, OrderedDict
 from contextlib import contextmanager
 from contextvars import ContextVar
