@@ -145,3 +145,18 @@ def test_canonical_after_index_exhaustion_uses_existing_open_item_or_fallback():
     seq.process({"type": "tool.start", "call_id": "tool"})
     assert seq.complete_canonical("final") == []
     assert seq.counters["item_index_limit"] == 1
+
+
+def test_tool_without_call_id_is_rejected_before_closing_text():
+    seq = ItemSequencer(max_items=2)
+    seq.process({"type": "text.delta", "text": "open"})
+    frame = {"type": "tool.start", "name": "bad"}
+    assert seq.process(frame) == [frame]
+    assert "text" in seq.open_items
+
+
+def test_invalid_unicode_is_rejected_without_opening_item():
+    seq = ItemSequencer()
+    frame = {"type": "text.delta", "text": "bad\ud800"}
+    assert seq.process(frame) == [frame]
+    assert not seq.open_items

@@ -249,19 +249,38 @@ class ItemSequencer:
 
         if frame_type in ("reasoning.delta", "text.delta"):
             kind = "reasoning" if frame_type == "reasoning.delta" else "text"
+            text = _text_from(frame)
+            if text is None:
+                self._count("item_frame_rejected")
+                return [dict(frame)]
+            # Normalize accepted provider aliases into the frozen wire shape.
+            if "text" not in data:
+                frame = _put_frame_data(frame, {**data, "text": text})
+                data = _frame_data(frame)
+            try:
+                text.encode("utf-8")
+            except UnicodeError:
+                self._count("item_frame_rejected")
+                return [frame]
             out.extend(self._switch(kind))
             item = self.open_items[kind]
-            text = _text_from(frame)
             self._append(item, text)
             out.append(self._attach(frame, item))
             return out
 
         if frame_type in ("tool.start", "tool.result") or "toolCallId" in data or "tool_call_id" in data:
+            tool_id = data.get("toolCallId") or data.get("tool_call_id") or data.get("call_id")
+            if not isinstance(tool_id, str) or not tool_id:
+                self._count("item_frame_rejected")
+                return [dict(frame)]
+            if frame_type == "tool.start" or data.get("status") == "running":
+                if self.next_index >= self.max_items and not any(i.kind == "tool" and i.identity == f"tool:{tool_id}" for i in self.items.values()):
+                    self._count("item_index_limit")
+                    return [dict(frame)]
             if frame_type == "tool.start" or data.get("status") == "running":
                 out.extend(self._close("reasoning"))
                 out.extend(self._close("text"))
-            tool_id = data.get("toolCallId") or data.get("tool_call_id") or data.get("call_id")
-            identity = f"tool:{tool_id}" if tool_id not in (None, "") else f"tool:orphan:{len(self.items)}"
+            identity = f"tool:{tool_id}"
             item, _ = self._ensure("tool", identity)
             out.append(self._attach(frame, item))
             return out
@@ -339,6 +358,11 @@ class ItemSequencer:
 
     def complete_canonical(self, text: str) -> list[dict[str, Any]]:
         """Close current text with canonical text, opening a new item if needed."""
+        try:
+            text.encode("utf-8")
+        except UnicodeError:
+            self._count("item_frame_rejected")
+            return []
         if "text" not in self.open_items and self.next_index >= self.max_items:
             self._count("item_index_limit")
             return []

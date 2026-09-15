@@ -1,7 +1,7 @@
 {
   "snapshot_version": 2,
-  "root_commit": "86ff097b2f0fcfad91e27075d84e823e5995a1e4",
-  "sha256": "9d20d003c6e422287bd79b242ce74545141be13165b7988aeced6d8648267d3d",
+  "root_commit": "ec5159f3dd3cb8080cf002503f3318ac2c798d67",
+  "sha256": "8786152e05bad84f238c08dd3e0d381f333ca061b4ec7442ecf4a782606f63f9",
   "payload": {
     "golden": {
       "events": {
@@ -530,7 +530,7 @@
             "status": "running",
             "duration_seconds": 3.5,
             "item_id": "01996f2e-7b6a-7c35-9f8e-4a3d6c1b2e90",
-            "index": 4,
+            "index": 5,
             "v": 1
           }
         },
@@ -1646,7 +1646,7 @@
           "depth": 1,
           "exit_reason": "",
           "item_id": "01996f2e-7b6a-7c35-9f8e-4a3d6c1b2e90",
-          "index": 4,
+          "index": 5,
           "v": 1
         },
         "hermes.plan": {
@@ -1729,7 +1729,7 @@
           "turn_id": "turn_demo_0001",
           "text": "顺便加上字幕",
           "reason": "unconsumed",
-          "index": 11
+          "index": 10
         },
         "tool-frame.completed": {
           "tool": "image_generate",
