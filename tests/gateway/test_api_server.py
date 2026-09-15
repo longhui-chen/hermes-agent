@@ -5925,11 +5925,11 @@ class TestTakeoverUIHintOverSSE:
         assert "snapshot" not in completed[0]
 
 
-def test_hardware_execution_token_parser_accepts_only_fixed_opaque_header():
+def test_hardware_execution_token_parser_rejects_legacy_header():
     request = types.SimpleNamespace(
         headers={"X-Zettlab-Hardware-Execution-Token": "b" * 64}
     )
-    assert api_server_module._extract_hardware_execution_token(request) == "b" * 64
+    assert api_server_module._extract_hardware_execution_token(request) == ""
     assert api_server_module._extract_hardware_execution_token(
         types.SimpleNamespace(
             headers={"X-Zettlab-Hardware-Execution-Token": "not-a-token"}
@@ -5938,7 +5938,7 @@ def test_hardware_execution_token_parser_accepts_only_fixed_opaque_header():
 
 
 @pytest.mark.asyncio
-async def test_hardware_execution_token_relays_opaquely_to_agent(auth_adapter):
+async def test_hardware_execution_token_is_not_relayed_to_agent(auth_adapter):
     app = _create_app(auth_adapter)
     async with TestClient(TestServer(app)) as cli:
         with patch.object(
@@ -5965,4 +5965,4 @@ async def test_hardware_execution_token_relays_opaquely_to_agent(auth_adapter):
             )
 
     assert response.status == 200
-    assert run_agent.await_args.kwargs["hardware_execution_token"] == "b" * 64
+    assert run_agent.await_args.kwargs["hardware_execution_token"] == ""

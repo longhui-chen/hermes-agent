@@ -835,17 +835,9 @@ def _is_video_edit_skill_slug(skill_slug: str) -> bool:
     }
 
 
-_HARDWARE_EXECUTION_TOKEN_HEADER = "X-Zettlab-Hardware-Execution-Token"
-
-
 def _extract_hardware_execution_token(request: Any) -> str:
-    """Relay the dedicated capability only to trusted hardware helpers."""
-    if request is None:
-        return ""
-    token = str(
-        request.headers.get(_HARDWARE_EXECUTION_TOKEN_HEADER, "") or ""
-    ).strip()
-    return token if re.fullmatch(r"[0-9a-f]{64}", token) is not None else ""
+    """Legacy compatibility hook; hardware bearers are no longer accepted."""
+    return ""
 
 
 def _extract_requested_execution_policy(body: Dict[str, Any]) -> str:
