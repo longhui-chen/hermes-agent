@@ -2548,9 +2548,9 @@ def build_camera_semantic_runtime_env() -> dict[str, str]:
 
 
 def build_camera_runtime_env() -> dict[str, str]:
+    # zettlab-overlay(ac1015-bearer): remove hardware bearer from helper env; upstream: none
     """Build the exact request-scoped env for the trusted camera helper.
 
-    # zettlab-overlay(ac1015-bearer): remove hardware bearer from helper env; upstream: none
     The helper receives the profile action token and turn/session correlation.
     Generic subprocesses
     continue to have all of these values stripped by
@@ -2583,6 +2583,7 @@ def build_camera_runtime_env() -> dict[str, str]:
         "HERMES_TURN_ID": 256,
         "HERMES_SESSION_ID": 1024,
         "HERMES_SESSION_KEY": 1024,
+        # zettlab-overlay(ac1015-bearer): bound owner context size; upstream: none
         "ZETTLAB_USER_ID": 768,
     }
     if any(
@@ -2641,6 +2642,7 @@ def build_smart_home_runtime_env() -> dict[str, str]:
         "HERMES_SESSION_ID": session_id,
         "HERMES_SESSION_KEY": session_id,
     }
+    # zettlab-overlay(ac1015-bearer): validate bearer-free smart-home env; upstream: none
     limits = {"ZET_AGENT_ID": 128, "ZETTLAB_AGENT_ACTION_TOKEN": 128, "HERMES_TURN_ID": 256, "HERMES_SESSION_ID": 1024, "HERMES_SESSION_KEY": 1024}
     if any(not value or "\x00" in value or len(value.encode("utf-8")) > limits[key] for key, value in env.items()):
         raise PermissionError("trusted smart-home execution receipt unavailable")
@@ -2672,6 +2674,7 @@ def build_plaud_runtime_env() -> dict[str, str]:
         "HERMES_SESSION_KEY": 1024,
     }
     if any(
+        # zettlab-overlay(ac1015-bearer): reject malformed bearer-free env; upstream: none
         not value or "\x00" in value
         or len(value.encode("utf-8")) > limits[key]
         for key, value in env.items()

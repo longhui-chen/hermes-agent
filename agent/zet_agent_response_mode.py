@@ -568,6 +568,7 @@ def _capture_trusted_execution_receipt(
             execution_session_key,
             execution_policy,
             get_session_env,
+            # zettlab-overlay(ac1015-bearer): resolve authenticated owner; upstream: none
             zettlab_auth_principal,
         )
         bound_execution_policy = execution_policy()
@@ -583,6 +584,7 @@ def _capture_trusted_execution_receipt(
         bound_execution_policy = ""
         session_id = ""
         gateway_session_key = ""
+        # zettlab-overlay(ac1015-bearer): clear owner context on lookup failure; upstream: none
         user_id = ""
 
     # zettlab-overlay(ac1015-bearer): construct bearer-free receipt; upstream: none
@@ -591,6 +593,7 @@ def _capture_trusted_execution_receipt(
         action_token=_profile_value("ZETTLAB_AGENT_ACTION_TOKEN"),
         turn_id=str(turn_identity[0] or "").strip(),
         session_id=str(session_id or "").strip(),
+        # zettlab-overlay(ac1015-bearer): retain owner context for connector routing; upstream: none
         user_id=str(user_id or "").strip(),
         gateway_session_key=str(gateway_session_key or "").strip(),
         execution_policy=str(bound_execution_policy or "").strip().lower(),
@@ -660,6 +663,7 @@ def _trusted_runtime_receipt() -> Mapping[str, str]:
         "ZETTLAB_AGENT_ACTION_TOKEN": receipt.action_token,
         "HERMES_TURN_ID": receipt.turn_id,
         "HERMES_SESSION_KEY": receipt.session_id,
+        # zettlab-overlay(ac1015-bearer): expose owner identity without bearer; upstream: none
         "ZETTLAB_USER_ID": receipt.user_id,
     }
     return values
