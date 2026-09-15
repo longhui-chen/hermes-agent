@@ -157,6 +157,8 @@ from gateway.platforms.zet_agent_metrics import (
     interaction_opened as _metric_interaction_opened,
     interaction_terminal as _metric_interaction_terminal,
 )
+# zettlab-overlay(BT): bind bounded item/display callbacks at the adapter seam; upstream: none
+from gateway.platforms.zet_agent_bt import bind_item_callbacks
 # ZettClaw cron event hook — monkey-patches cron.scheduler at import time
 # so cron triggers POST a webhook to local-server. zero hermes main-line
 # changes; see zet_agent_cron.py docstring for the full rationale.
@@ -5456,6 +5458,16 @@ class ZetAgentAdapter(APIServerAdapter):
                 "[zet_agent] failed to attach reasoning_callback; degrading",
                 exc_info=True,
             )
+
+        # zettlab-overlay(BT): route item/display frames through the adapter; upstream: none
+        _bt_reasoning, _bt_start, _bt_complete = bind_item_callbacks(
+            stream_q=stream_q, turn_id=extension_turn_id,
+            reasoning=_reasoning_cb, tool_start=tool_start_callback,
+            tool_complete=tool_complete_callback,
+        )
+        agent.reasoning_callback, agent.tool_start_callback, agent.tool_complete_callback = (
+            _bt_reasoning, _bt_start, _bt_complete
+        )
 
         # 2. Structured lifecycle status: late-bind so only the sniffed
         # chat-completions stream receives the App-specific extension event.

@@ -1,0 +1,37 @@
+"""BT adapter hooks kept outside the upstream gateway kernel."""
+from __future__ import annotations
+
+from typing import Any, Callable
+
+from .item_sequencer import ItemSequencer
+from .tool_display import build_tool_result_display, build_tool_start_display
+
+
+def bind_item_callbacks(
+    *, stream_q: Any, turn_id: str | None, reasoning: Callable[..., Any] | None,
+    tool_start: Callable[..., Any] | None, tool_complete: Callable[..., Any] | None,
+) -> tuple[Callable[..., Any], Callable[..., Any], Callable[..., Any]]:
+    sequencer = ItemSequencer(turn_id=turn_id)
+
+    def emit(frame: Any) -> None:
+        for item in sequencer.process(frame):
+            if isinstance(item, dict):
+                stream_q.put(("__tool_progress__", item))
+
+    def on_reasoning(text: Any) -> None:
+        if text:
+            emit({"type": "reasoning.delta", "text": text})
+        if reasoning:
+            reasoning(text)
+
+    def on_start(call_id: Any, name: Any, args: Any) -> None:
+        emit({"type": "tool.start", "toolCallId": call_id, **build_tool_start_display(str(name), args)})
+        if tool_start:
+            tool_start(call_id, name, args)
+
+    def on_complete(call_id: Any, name: Any, args: Any, result: Any) -> None:
+        emit({"type": "tool.result", "toolCallId": call_id, **build_tool_result_display(result)})
+        if tool_complete:
+            tool_complete(call_id, name, args, result)
+
+    return on_reasoning, on_start, on_complete
