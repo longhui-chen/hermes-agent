@@ -121,6 +121,7 @@ except ImportError:
     web = None  # type: ignore[assignment]
 
 from gateway.sensitive_process_boundary import (
+    gateway_sensitive_process_boundary_ready,  # retained for legacy test/adapter patching
     initialize_gateway_sensitive_process_boundary,
 )
 from gateway.config import Platform, PlatformConfig
