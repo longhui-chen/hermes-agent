@@ -311,7 +311,7 @@ class ItemSequencer:
                 identity = f"{kind}:{len([i for i in self.items.values() if i.kind == kind])}"
             self._identity_ok(identity)
             self._capacity([identity])
-            if "text" not in data:
+            if not isinstance(data.get("text"), str):
                 return _put_frame_data(frame, {**data, "text": value})
             return frame
         if frame_type in ("tool.start", "tool.result") or "toolCallId" in data or "tool_call_id" in data:
@@ -365,7 +365,7 @@ class ItemSequencer:
                 self._count("item_frame_rejected")
                 return [dict(frame)]
             # Normalize accepted provider aliases into the frozen wire shape.
-            if "text" not in data:
+            if not isinstance(data.get("text"), str):
                 frame = _put_frame_data(frame, {**data, "text": text})
                 data = _frame_data(frame)
             try:

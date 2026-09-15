@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import random
 
-from gateway.platforms.tool_display import ARGS_MAX_BYTES, SUMMARY_MAX_BYTES, build_tool_result_display, build_tool_start_display
+from gateway.platforms.tool_display import ARGS_MAX_BYTES, SUMMARY_MAX_BYTES, build_tool_result_display, build_tool_start_display, result_display
 
 
 def test_random_redaction_and_utf8_bounds():
@@ -36,3 +36,9 @@ def test_structured_secret_keys_are_redacted_before_serialization():
     display = build_tool_start_display("x", {"api_key": "secret", "nested": {"password": "pw"}})["display"]
     assert "secret" not in display["args_summary"]
     assert "pw" not in display["args_summary"]
+
+
+def test_zero_false_and_invalid_unicode_are_safe_display_values():
+    assert result_display(0)["summary"] == "0"
+    assert result_display(False)["summary"] == "False"
+    assert "INVALID_TEXT" in result_display("bad\ud800")["summary"]

@@ -24,7 +24,11 @@ _SECRET_PATTERNS = (
 
 def redact(text: str) -> str:
     """Redact credentials and private local paths before persistence."""
-    result = str(text)
+    try:
+        result = str(text)
+        result.encode("utf-8")
+    except UnicodeError:
+        return "[INVALID_TEXT]"
     for pattern, replacement in _SECRET_PATTERNS:
         result = pattern.sub(replacement, result)
     return result
@@ -46,7 +50,11 @@ def _redact_value(value: Any, *, max_chars: int = SUMMARY_MAX_BYTES * 4) -> Any:
 def _truncate_utf8(text: str, limit: int) -> tuple[str, bool, int]:
     source = text if len(text) <= limit * 4 else text[: limit * 4]
     clean = redact(source)
-    raw = clean.encode("utf-8")
+    try:
+        raw = clean.encode("utf-8")
+    except UnicodeError:
+        clean = "[INVALID_TEXT]"
+        raw = clean.encode("utf-8")
     exact = len(raw)
     if exact <= limit:
         return clean, False, exact
@@ -99,7 +107,7 @@ def result_display(output: Any = None, *, error: Any = None, content_type: str |
         kind = "json"
         value = _safe_json(output)
     else:
-        value = str(output or "")
+        value = "" if output is None else str(output)
         kind = "markdown" if "```" in value else "text"
     summary, truncated, _ = _truncate_utf8(value, SUMMARY_MAX_BYTES)
     return {"summary": summary, "content_type": "error" if is_error else kind, "truncated": truncated, "bytes": len(summary.encode("utf-8"))}
