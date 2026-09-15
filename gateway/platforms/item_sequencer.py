@@ -53,6 +53,8 @@ new_uuid7 = uuid7
 
 
 def _utf8_size(value: str) -> int:
+    if len(value) > MAX_SNAPSHOT_BYTES:
+        return MAX_SNAPSHOT_BYTES + 1
     return len(value.encode("utf-8"))
 
 
@@ -119,6 +121,8 @@ class ItemSequencer:
             raise ValueError("item limit outside BT envelope")
 
     def _count(self, name: str) -> None:
+        if name.startswith("item_frame_unregistered:"):
+            name = "item_frame_unregistered"
         self.counters[name] = self.counters.get(name, 0) + 1
 
     def _new(self, kind: str, identity: str) -> _Item:
@@ -194,6 +198,9 @@ class ItemSequencer:
 
     def _switch(self, kind: str) -> list[dict[str, Any]]:
         other = "reasoning" if kind == "text" else "text"
+        if kind not in self.open_items and self.next_index >= self.max_items:
+            self._count("item_index_limit")
+            raise ValueError("item index limit exceeded")
         out = self._close(other)
         if kind not in self.open_items:
             identity = f"{kind}:{len([i for i in self.items.values() if i.kind == kind])}"
@@ -294,7 +301,8 @@ class ItemSequencer:
 
         identity = self._extension_identity(str(frame_type), data)
         if identity is None and frame_type in self.identity_fields:
-            identity = f"{frame_type}:empty:{len(self.items)}"
+            self._count("item_frame_rejected")
+            return [dict(frame)]
         if identity is None:
             self._count(f"item_frame_unregistered:{frame_type}")
             return [dict(frame)]
@@ -331,6 +339,9 @@ class ItemSequencer:
 
     def complete_canonical(self, text: str) -> list[dict[str, Any]]:
         """Close current text with canonical text, opening a new item if needed."""
+        if "text" not in self.open_items and self.next_index >= self.max_items:
+            self._count("item_index_limit")
+            return []
         out = self._close("reasoning")
         if "text" in self.open_items:
             out.extend(self._close("text", snapshot=text, canonical=True))

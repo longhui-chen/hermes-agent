@@ -121,3 +121,27 @@ def test_near_2048_identity_envelope_rejects_the_2049th_key():
     rejected = seq.process({"type": "hermes.attachment", "attachment": {"id": "overflow"}})
     assert rejected == [{"type": "hermes.attachment", "attachment": {"id": "overflow"}}]
     assert seq.counters["item_frame_rejected"] == 1
+
+
+def test_missing_registered_identity_is_rejected_without_consuming_index():
+    seq = ItemSequencer(identity_fields={"hermes.attachment": "attachment.id"})
+    frame = {"type": "hermes.attachment", "attachment": {}}
+    assert seq.process(frame) == [frame]
+    assert seq.next_index == 0
+    assert seq.counters["item_frame_rejected"] == 1
+
+
+def test_index_exhaustion_does_not_close_open_text_or_raise():
+    seq = ItemSequencer(max_items=1)
+    first = seq.process({"type": "text.delta", "text": "open"})
+    second = {"type": "reasoning.delta", "text": "late"}
+    assert seq.process(second) == [second]
+    assert "text" in seq.open_items
+    assert first[0]["type"] == "item.started"
+
+
+def test_canonical_after_index_exhaustion_uses_existing_open_item_or_fallback():
+    seq = ItemSequencer(max_items=1)
+    seq.process({"type": "tool.start", "call_id": "tool"})
+    assert seq.complete_canonical("final") == []
+    assert seq.counters["item_index_limit"] == 1
