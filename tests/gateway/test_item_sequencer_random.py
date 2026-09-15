@@ -101,13 +101,12 @@ def test_registered_extension_identity_is_shared_across_frame_variants():
     assert frames[0]["index"] == frames[1]["index"]
 
 
-def test_canonical_limit_omits_snapshot_and_releases_text():
+def test_canonical_limit_rejects_before_state_change():
     seq = ItemSequencer()
     seq.process({"type": "text.delta", "text": "hello"})
-    completed = seq.complete_canonical("x" * (MAX_SNAPSHOT_BYTES + 1))[-1]
-    assert completed["snapshot_omitted"] is True
-    assert "text" not in completed
-    assert all(len(item.text.encode("utf-8")) <= MAX_SNAPSHOT_BYTES for item in seq.items.values())
+    assert seq.complete_canonical("x" * (MAX_SNAPSHOT_BYTES + 1)) == []
+    assert "text" in seq.open_items
+    assert seq.counters["item_frame_rejected{reason:text_oversize}"] == 1
 
 
 def test_near_2048_identity_envelope_rejects_the_2049th_key():
@@ -142,7 +141,7 @@ def test_canonical_after_index_exhaustion_uses_existing_open_item_or_fallback():
     seq = ItemSequencer(max_items=1)
     seq.process({"type": "tool.start", "call_id": "tool"})
     assert seq.complete_canonical("final") == []
-    assert seq.counters["item_index_limit"] == 1
+    assert seq.counters["item_frame_rejected{reason:capacity}"] == 1
 
 
 def test_tool_without_call_id_is_rejected_before_closing_text():

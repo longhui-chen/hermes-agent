@@ -42,3 +42,8 @@ def test_zero_false_and_invalid_unicode_are_safe_display_values():
     assert result_display(0)["summary"] == "0"
     assert result_display(False)["summary"] == "False"
     assert "INVALID_TEXT" in result_display("bad\ud800")["summary"]
+
+
+def test_string_json_sensitive_keys_are_redacted():
+    display = build_tool_start_display("x", '{"api_key":"secret","ok":true}')['display']
+    assert "secret" not in display["args_summary"]

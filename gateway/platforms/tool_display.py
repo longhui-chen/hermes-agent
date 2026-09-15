@@ -19,6 +19,7 @@ _SECRET_PATTERNS = (
     (re.compile(r"(?i)(bearer\s+)[^\s,;]+"), r"\1[REDACTED]"),
     (re.compile(r"(?i)((?:token|api[_-]?key|access[_-]?key|secret|password|cookie)\s*[:=]\s*)[^\s,;]+"), r"\1[REDACTED]"),
     (re.compile(r"(?i)(cookie\s*:\s*)[^\r\n]+"), r"\1[REDACTED]"),
+    (re.compile(r"(?i)([\"'](?:token|api[_-]?key|access[_-]?key|secret|password|cookie)[\"']\s*:\s*[\"'])[^\"']*([\"'])"), r"\1[REDACTED]\2"),
     (re.compile(r"(?:/Users/[^\s/'\"]+|/home/[^\s/'\"]+|/private/tmp/[^\s/'\"]+)"), "[PRIVATE_PATH]"),
 )
 

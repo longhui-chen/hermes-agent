@@ -177,6 +177,8 @@ class ItemSequencer:
         return value
 
     def _identity_ok(self, identity: str) -> None:
+        if len(identity) > MAX_IDENTITY_BYTES:
+            self._reject("identity_oversize")
         try:
             size = len(identity.encode("utf-8"))
         except UnicodeError:
@@ -223,13 +225,9 @@ class ItemSequencer:
         payload.update(extra)
         return payload
 
-    def _append(self, item: _Item, text: str | None) -> None:
+    def _append(self, item: _Item, text: str | None, delta_bytes: int) -> None:
         if not text or item.snapshot_omitted:
             return
-        try:
-            delta_bytes = len(text.encode("utf-8"))
-        except UnicodeError:
-            self._reject("text_invalid")
         if item.bytes_total + delta_bytes > self.max_snapshot_bytes:
             item.chunks = []
             item.bytes_total = 0
@@ -298,7 +296,7 @@ class ItemSequencer:
             if not isinstance(value, Mapping):
                 return None
             value = value.get(part)
-        if value in (None, ""):
+        if not isinstance(value, str) or not value:
             return None
         # The path is the identity namespace. This intentionally lets
         # steer_accepted and steer_dropped share one row when they carry the
@@ -313,15 +311,15 @@ class ItemSequencer:
             self._reject("text_invalid")
         frame_type = frame.get("type")
         data = _frame_data(frame)
-        if frame_type in ("reasoning.delta", "text.delta"):
+        if frame_type in ("reasoning.delta", "text.delta", "canonical.final"):
             value = _text_from(frame)
-            self._validate_text(value)
             kind = "reasoning" if frame_type == "reasoning.delta" else "text"
-            identity = next((i.identity for i in self.items.values() if i.kind == kind and self.open_items.get(kind) is i), None)
+            identity = self.open_items[kind].identity if kind in self.open_items else None
             if identity is None:
                 identity = f"{kind}:{self.kind_counts.get(kind, 0)}"
             self._identity_ok(identity)
             self._capacity([identity])
+            self._validate_text(value)
             normalized = _put_frame_data(frame, {**data, "text": value}) if not isinstance(data.get("text"), str) else frame
             return Admission(normalized, kind, identity, identity not in self.items, value, len(value.encode("utf-8")))
         if frame_type in ("tool.start", "tool.result") or "toolCallId" in data or "tool_call_id" in data:
@@ -330,8 +328,7 @@ class ItemSequencer:
                 self._reject("identity_missing")
             identity = f"tool:{tool_id}"
             self._identity_ok(identity)
-            if frame_type == "tool.start" or data.get("status") == "running":
-                self._capacity([identity])
+            self._capacity([identity])
             return Admission(frame, "tool", identity, identity not in self.items)
         if frame_type in ("hermes.todo", "todo.update"):
             self._capacity(["todo:turn"])
@@ -344,10 +341,6 @@ class ItemSequencer:
             self._identity_ok(identity)
             self._capacity([identity])
             return Admission(frame, "subagent", identity, identity not in self.items, version_next=(self.items.get(identity).version + 1 if identity in self.items else 1))
-        if frame_type in ("item.started", "item.completed"):
-            if not isinstance(data.get("item_id"), str) or not isinstance(data.get("index"), int):
-                self._reject("identity_missing")
-            return Admission(frame, str(data.get("kind")), str(data.get("item_id")), False)
         identity = self._extension_identity(str(frame_type), data)
         if identity is None and frame_type in self.identity_fields:
             self._reject("identity_missing")
@@ -357,111 +350,48 @@ class ItemSequencer:
         self._capacity([identity])
         return Admission(frame, "extension", identity, identity not in self.items)
 
-    def _process(self, frame: Mapping[str, Any] | str | Any) -> list[Any]:
-        """Process one frame and return lifecycle frame(s) plus the frame."""
-        if isinstance(frame, str):
-            frame = {"type": "text.delta", "text": frame}
-        if not isinstance(frame, Mapping):
-            self._count("item_frame_unclassified")
-            return [frame]
-        frame_type = frame.get("type")
-        data = _frame_data(frame)
-        out: list[dict[str, Any]] = []
-
-        if frame_type in ("reasoning.delta", "text.delta"):
-            kind = "reasoning" if frame_type == "reasoning.delta" else "text"
-            text = _text_from(frame)
-            if text is None:
-                self._count("item_frame_rejected")
-                return [dict(frame)]
-            # Normalize accepted provider aliases into the frozen wire shape.
-            if not isinstance(data.get("text"), str):
-                frame = _put_frame_data(frame, {**data, "text": text})
-                data = _frame_data(frame)
-            try:
-                text.encode("utf-8")
-            except UnicodeError:
-                self._count("item_frame_rejected")
-                return [frame]
-            out.extend(self._switch(kind))
-            item = self.open_items[kind]
-            self._append(item, text)
-            out.append(self._attach(frame, item))
+    def _apply(self, admission: Admission) -> list[Any]:
+        """Apply already validated input; no admission decisions live here."""
+        frame, kind, identity = admission.frame, admission.kind, admission.identity
+        out = []
+        if kind in ("reasoning", "text"):
+            item = self.open_items.get(kind)
+            if item is None:
+                out.extend(self._close("reasoning" if kind == "text" else "text"))
+                item = self._new(kind, identity)
+                self.open_items[kind] = item
+                out.append(self._lifecycle(kind, item))
+            if frame.get("type") == "canonical.final":
+                out.extend(self._close(kind, snapshot=admission.normalized_text, canonical=True))
+            else:
+                self._append(item, admission.normalized_text, admission.text_bytes)
+                out.append(self._attach(frame, item))
             return out
-
-        if frame_type in ("tool.start", "tool.result") or "toolCallId" in data or "tool_call_id" in data:
-            tool_id = data.get("toolCallId") or data.get("tool_call_id") or data.get("call_id")
-            if not isinstance(tool_id, str) or not tool_id:
-                self._count("item_frame_rejected")
-                return [dict(frame)]
-            if frame_type == "tool.start" or data.get("status") == "running":
-                if self.next_index >= self.max_items and not any(i.kind == "tool" and i.identity == f"tool:{tool_id}" for i in self.items.values()):
-                    self._count("item_index_limit")
-                    return [dict(frame)]
-            if frame_type == "tool.start" or data.get("status") == "running":
+        item = self._new(kind, identity) if admission.needs_new_index else self.items[identity]
+        if kind == "tool":
+            data = _frame_data(frame)
+            if frame.get("type") == "tool.start" or data.get("status") == "running":
                 out.extend(self._close("reasoning"))
                 out.extend(self._close("text"))
-            identity = f"tool:{tool_id}"
-            item, _ = self._ensure("tool", identity)
-            out.append(self._attach(frame, item))
-            return out
-
-        if frame_type in ("hermes.todo", "todo.update"):
-            if self._todo is None:
-                self._todo, _ = self._ensure("todo", "todo:turn")
-            if self._todo.version + 1 >= MAX_VERSION:
-                raise ValueError("item version exhausted")
-            self._todo.version += 1
-            out.append(self._attach(frame, self._todo, version=self._todo.version))
-            return out
-
-        if frame_type in ("hermes.delegation.progress", "delegation.status"):
-            child = data.get("subagent_id")
-            if not isinstance(child, str) or not child:
-                raise ValueError("subagent_id is required")
-            identity = f"subagent:{child}"
-            item = self._delegation.get(identity)
-            if item is None:
-                item, _ = self._ensure("subagent", identity)
+        if admission.version_next is not None:
+            item.version = admission.version_next
+            if kind == "todo":
+                self._todo = item
+            else:
                 self._delegation[identity] = item
-            if item.version + 1 >= MAX_VERSION:
-                raise ValueError("item version exhausted")
-            item.version += 1
-            out.append(self._attach(frame, item, version=item.version))
-            return out
-
-        if frame_type in ("item.started", "item.completed"):
-            item_id = data.get("item_id")
-            index = data.get("index")
-            if not isinstance(item_id, str) or not isinstance(index, int):
-                self._count("item_frame_rejected")
-                return []
-            out.append(dict(frame))
-            return out
-
-        identity = self._extension_identity(str(frame_type), data)
-        if identity is None and frame_type in self.identity_fields:
-            self._count("item_frame_rejected")
-            return [dict(frame)]
-        if identity is None:
-            self._count(f"item_frame_unregistered:{frame_type}")
-            return [dict(frame)]
-        item, _ = self._ensure("extension", identity)
-        # Extension frames carry ordering only, never item identity.
-        out.append(_put_frame_data(frame, {**data, "index": item.index}))
+        if kind == "extension":
+            out.append(_put_frame_data(frame, {**_frame_data(frame), "index": item.index}))
+        else:
+            out.append(self._attach(frame, item, version=admission.version_next))
         return out
 
-    def process(self, frame: Mapping[str, Any] | str | Any) -> list[Any]:
-        """Process one frame, rejecting malformed/budget-exceeding input."""
+    def process(self, frame: Any) -> list[Any]:
         try:
-            admitted = self._admit(frame)
-            return self._process(admitted.frame)
+            admission = self._admit(frame)
         except AdmissionError as exc:
             self._count(f"item_frame_rejected{{reason:{exc.reason}}}")
             return [frame]
-        except (TypeError, ValueError):
-            self._count("item_frame_rejected{reason:text_invalid}")
-            return [frame]
+        return self._apply(admission)
 
     def process_many(self, frames: list[Any]) -> list[Any]:
         out: list[Any] = []
@@ -482,20 +412,13 @@ class ItemSequencer:
         return frames[0] if frames else None
 
     def complete_canonical(self, text: str) -> list[dict[str, Any]]:
-        """Close current text with canonical text, opening a new item if needed."""
-        self._validate_canonical(text)
-        if "text" not in self.open_items and self.next_index >= self.max_items:
-            self._count("item_index_limit")
+        frame = {"type": "canonical.final", "text": text}
+        try:
+            admission = self._admit(frame)
+        except AdmissionError as exc:
+            self._count(f"item_frame_rejected{{reason:{exc.reason}}}")
             return []
-        out = self._close("reasoning")
-        if "text" in self.open_items:
-            out.extend(self._close("text", snapshot=text, canonical=True))
-        else:
-            item, _ = self._ensure("text", f"text:canonical:{len(self.items)}")
-            self.open_items["text"] = item
-            out.append(self._lifecycle("text", item))
-            out.extend(self._close("text", snapshot=text, canonical=True))
-        return out
+        return self._apply(admission)
 
     def snapshot(self, item_id: str) -> str | None:
         return next((i.text for i in self.items.values() if i.item_id == item_id and not i.snapshot_omitted), None)
