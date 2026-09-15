@@ -2575,6 +2575,9 @@ def build_camera_runtime_env() -> dict[str, str]:
         # Keep the legacy alias for already deployed camsnap v0.1.x helpers.
         "HERMES_SESSION_KEY": session_id,
     }
+    user_id = str(frozen_receipt.get("ZETTLAB_USER_ID", "") or "").strip()
+    if user_id:
+        env["ZETTLAB_USER_ID"] = user_id
     limits = {
         "ZET_AGENT_ID": 128,
         "ZETTLAB_AGENT_ACTION_TOKEN": 128,
@@ -2582,6 +2585,7 @@ def build_camera_runtime_env() -> dict[str, str]:
         "HERMES_TURN_ID": 256,
         "HERMES_SESSION_ID": 1024,
         "HERMES_SESSION_KEY": 1024,
+        "ZETTLAB_USER_ID": 768,
     }
     if any(
         not value

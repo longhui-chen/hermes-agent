@@ -337,6 +337,7 @@ class _TrustedExecutionReceipt:
     hardware_execution_token: str = field(repr=False)
     turn_id: str
     session_id: str
+    user_id: str = ""
     gateway_session_key: str = ""
     execution_policy: str = ""
 
@@ -567,6 +568,7 @@ def _capture_trusted_execution_receipt(
             execution_policy,
             get_session_env,
             hardware_execution_token,
+            zettlab_auth_principal,
         )
 
         hardware_token = hardware_execution_token()
@@ -577,11 +579,13 @@ def _capture_trusted_execution_receipt(
         session_id = get_session_env("HERMES_SESSION_ID")
         if not session_id:
             session_id = gateway_session_key
+        user_id = zettlab_auth_principal()
     except Exception:
         hardware_token = ""
         bound_execution_policy = ""
         session_id = ""
         gateway_session_key = ""
+        user_id = ""
 
     receipt = _TrustedExecutionReceipt(
         agent_id=_profile_value("ZET_AGENT_ID"),
@@ -589,6 +593,7 @@ def _capture_trusted_execution_receipt(
         hardware_execution_token=str(hardware_token or "").strip(),
         turn_id=str(turn_identity[0] or "").strip(),
         session_id=str(session_id or "").strip(),
+        user_id=str(user_id or "").strip(),
         gateway_session_key=str(gateway_session_key or "").strip(),
         execution_policy=str(bound_execution_policy or "").strip().lower(),
     )
@@ -659,6 +664,7 @@ def trusted_camera_runtime_receipt() -> Mapping[str, str]:
         "ZETTLAB_HARDWARE_EXECUTION_TOKEN": receipt.hardware_execution_token,
         "HERMES_TURN_ID": receipt.turn_id,
         "HERMES_SESSION_KEY": receipt.session_id,
+        "ZETTLAB_USER_ID": receipt.user_id,
     }
 
 
