@@ -157,6 +157,8 @@ from gateway.platforms.zet_agent_metrics import (
     interaction_opened as _metric_interaction_opened,
     interaction_terminal as _metric_interaction_terminal,
 )
+# zettlab-overlay(BT): bind bounded item/display callbacks at the adapter seam; upstream: none
+from gateway.platforms.zet_agent_bt import bind_item_callbacks
 # ZettClaw cron event hook — monkey-patches cron.scheduler at import time
 # so cron triggers POST a webhook to local-server. zero hermes main-line
 # changes; see zet_agent_cron.py docstring for the full rationale.
@@ -5445,7 +5447,6 @@ class ZetAgentAdapter(APIServerAdapter):
             try:
                 if prestream_timing is not None:
                     prestream_timing.observe_queued_semantic("reasoning")
-                _put_progress(stream_q, {"type": "reasoning.delta", "text": text})
             except Exception:
                 logger.debug("[zet_agent] reasoning_cb push failed", exc_info=True)
 
@@ -5456,6 +5457,17 @@ class ZetAgentAdapter(APIServerAdapter):
                 "[zet_agent] failed to attach reasoning_callback; degrading",
                 exc_info=True,
             )
+
+        # zettlab-overlay(BT): route item/display frames through the adapter; upstream: none
+        _bt_reasoning, _bt_start, _bt_complete, _bt_finish = bind_item_callbacks(
+            stream_q=stream_q, turn_id=extension_turn_id,
+            reasoning=_reasoning_cb, tool_start=tool_start_callback,
+            tool_complete=tool_complete_callback,
+        )
+        agent.reasoning_callback, agent.tool_start_callback, agent.tool_complete_callback = (
+            _bt_reasoning, _bt_start, _bt_complete
+        )
+        agent._bt_finish_items = _bt_finish
 
         # 2. Structured lifecycle status: late-bind so only the sniffed
         # chat-completions stream receives the App-specific extension event.
@@ -6022,6 +6034,10 @@ class ZetAgentAdapter(APIServerAdapter):
                 and isinstance(result[0], dict)
                 else {}
             )
+            # zettlab-overlay(BT): close open reasoning/text items before SSE sentinel; upstream: none
+            _bt_finish = getattr(agent_ref[0] if agent_ref else None, "_bt_finish_items", None)
+            if callable(_bt_finish):
+                _bt_finish()
             runtime_agent = agent_ref[0] if agent_ref else None
             runtime_shell_reusable = bool(
                 runtime_agent is not None
@@ -6031,6 +6047,9 @@ class ZetAgentAdapter(APIServerAdapter):
             )
             return result
         finally:
+            _bt_finish = getattr(agent_ref[0] if agent_ref else None, "_bt_finish_items", None)
+            if callable(_bt_finish):
+                _bt_finish()
             if attachment_emitter_token is not None:
                 try:
                     from hermes_cli.plugins import reset_attachment_emitter

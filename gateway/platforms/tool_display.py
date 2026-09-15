@@ -37,7 +37,7 @@ def redact(text: str) -> str:
     return result
 
 
-_SECRET_KEYS = re.compile(r"(?i)(token|api[_-]?key|access[_-]?key|secret|password|cookie)")
+_SECRET_KEYS = re.compile(r"(?i)(token|api[_-]?key|access[_-]?key|secret|password|cookie|authorization|credential|private[_-]?key|session[_-]?secret)")
 
 
 def _redact_value(value: Any, *, max_chars: int = SUMMARY_MAX_BYTES * 4, _seen: set[int] | None = None, _depth: int = 0) -> Any:
