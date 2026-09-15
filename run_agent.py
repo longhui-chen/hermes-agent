@@ -3377,10 +3377,13 @@ class AIAgent:
         # meant for the agent's next tool-call iteration, which will no
         # longer happen. Drop it instead of surprising the user with a
         # late injection on the post-interrupt turn.
-        _steer_lock = getattr(self, "_pending_steer_lock", None)
-        if _steer_lock is not None:
-            with _steer_lock:
-                self._pending_steer = None
+        # zettlab-overlay(U2d): let the adapter close named pending steers; upstream: none
+        hook = getattr(self, "_steer_admission_hook", None)
+        if hook is not None and callable(getattr(hook, "on_interrupt", None)):
+            hook.on_interrupt()
+        else:
+            with self._pending_steer_lock:
+                self._pending_steer = []
         return True
 
     def steer(self, text: str) -> bool:
@@ -3407,38 +3410,32 @@ class AIAgent:
         if not text or not text.strip():
             return False
         cleaned = text.strip()
+        # zettlab-overlay(U2d): route bound steer admission to the adapter; upstream: none
+        hook = getattr(self, "_steer_admission_hook", None)
+        if callable(hook):
+            outcome = hook(cleaned)
+            return bool(outcome.get("accepted")) if isinstance(outcome, dict) else bool(outcome)
+        # H26 的 stub 兜底（object.__new__ 建的测试替身跳过 __init__，因而没有锁）与
+        # `_steer_closed` 拒绝，在 U8-pre 回灌时合流到 U2d 的 list 表示上。
+        # zettlab-overlay(U2d): stub fallback plus the closed-slot refusal on the list slot; upstream: none
         _lock = getattr(self, "_pending_steer_lock", None)
         if _lock is None:
-            # Test stubs that built AIAgent via object.__new__ skip __init__.
-            # Fall back to direct attribute set; no concurrent callers expected
-            # in those stubs.
-            # zettlab-overlay(H26-unowned): steer 通道关闭后拒绝追加，触及 B1 与 U2d 待收敛; upstream: none
             if getattr(self, "_steer_closed", False):
                 return False
             if getattr(self, "_interrupt_requested", False):
                 return False
             existing = getattr(self, "_pending_steer", None)
-            self._pending_steer = (existing + "\n" + cleaned) if existing else cleaned
+            # zettlab-overlay(U2d): list slot replaces the upstream string concat; upstream: none
+            if existing is None:
+                return False
+            existing.append((None, cleaned))
             return True
+        # H26 的 `_steer_closed` 与「槽位已关闭」哨兵并进同一个拒绝判断。
+        # zettlab-overlay(U2d): append legacy text as an identity-free tuple; upstream: none
         with _lock:
-            # After the turn finalizer's closing drain there is no consumer
-            # left for this slot (the SSE task may linger for a moment, so
-            # task.done() alone can't catch this window) — refuse so the
-            # caller re-delivers the text as a normal next-turn message
-            # instead of it vanishing.
-            if getattr(self, "_steer_closed", False):
+            if self._pending_steer is None or getattr(self, "_steer_closed", False) or self._interrupt_requested:
                 return False
-            # A hard interrupt is winding the turn down: the pre-API drain
-            # refuses to inject while the flag is up, and the finalizer's
-            # interrupted branch discards leftovers WITHOUT a steer_dropped
-            # receipt (stop supersedes steer by design) — text accepted in
-            # this window would vanish silently. Refuse so callers re-queue.
-            if getattr(self, "_interrupt_requested", False):
-                return False
-            if self._pending_steer:
-                self._pending_steer = self._pending_steer + "\n" + cleaned
-            else:
-                self._pending_steer = cleaned
+            self._pending_steer.append((None, cleaned))
         return True
 
     def redirect(self, text: str) -> bool:
@@ -3553,8 +3550,9 @@ class AIAgent:
             self._pending_redirect = None
         return text
 
+    # zettlab-overlay(U2d): expose generic close hook for adapter state; upstream: none
     def _drain_pending_steer(self, close: bool = False) -> Optional[str]:
-        """Return the pending steer text (if any) and clear the slot.
+        """Return pending steer text after the optional adapter close hook.
 
         Safe to call from the agent execution thread after appending tool
         results. Returns None when no steer is pending.
@@ -3567,19 +3565,15 @@ class AIAgent:
                 ``run_conversation`` reopens the slot at the next turn's
                 start.
         """
-        _lock = getattr(self, "_pending_steer_lock", None)
-        if _lock is None:
-            text = getattr(self, "_pending_steer", None)
-            self._pending_steer = None
-            if close:
-                self._steer_closed = True
-            return text
-        with _lock:
-            text = self._pending_steer
-            self._pending_steer = None
-            if close:
-                self._steer_closed = True
-        return text
+        # zettlab-overlay(U2d): close through the adapter hook and return text; upstream: none
+        with self._pending_steer_lock:
+            raw_pending = self._pending_steer
+            pending = [] if raw_pending is None else [(None, raw_pending)] if isinstance(raw_pending, str) else list(raw_pending)
+            hook = getattr(self, "_steer_admission_hook", None)
+            self._pending_steer = [] if close and hook is not None else None if close else []
+            if close and hook is not None and callable(getattr(hook, "close", None)):
+                pending = hook.close(pending)
+        return "\n".join(text for _, text in pending) or None
 
     def _record_file_mutation_result(
         self,

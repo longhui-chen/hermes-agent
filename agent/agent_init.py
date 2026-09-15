@@ -810,12 +810,9 @@ def init_agent(
     # last tool result's content so the model sees it on its next
     # iteration. Message-role alternation is preserved (we modify an
     # existing tool message rather than inserting a new user turn).
-    agent._pending_steer: Optional[str] = None
+    # zettlab-overlay(U2d): preserve steer identity for the adapter hook; upstream: none
+    agent._pending_steer: List[tuple[Optional[str], str]] = []
     agent._pending_steer_lock = threading.Lock()
-    # Closed by the turn finalizer's last drain (steer() refuses while set);
-    # reopened at the next run_conversation start. Guards the SSE-teardown
-    # window where a stashed steer would have no consumer left.
-    agent._steer_closed = False
 
     # Active-turn redirect mechanism. A regular follow-up sent while the model
     # is generating is different from a hard /stop: preserve the valid turn
