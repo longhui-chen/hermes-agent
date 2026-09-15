@@ -42,9 +42,7 @@ def _write_runtime(tmp_path: Path, *, control: bool) -> Path:
         print(json.dumps({
             "argv": sys.argv[1:],
             "action": secret("ZETTLAB_AGENT_ACTION_TOKEN"),
-            "hardware": secret("ZETTLAB_HARDWARE_EXECUTION_TOKEN"),
             "action_plain": os.environ.get("ZETTLAB_AGENT_ACTION_TOKEN", ""),
-            "hardware_plain": os.environ.get("ZETTLAB_HARDWARE_EXECUTION_TOKEN", ""),
         }))
     """).lstrip(), encoding="utf-8")
     manifest = root / "skills" / skill_id / "manifest.yaml"
@@ -144,8 +142,8 @@ def test_printer3d_runtime_direct_runner_uses_private_fds(monkeypatch, tmp_path)
     assert ACTION_TOKEN not in result["output"] and HARDWARE_TOKEN not in result["output"]
     payload = json.loads(result["output"])
     assert payload["argv"] == ["pause", "--printer-id", "printer-1", "--idempotency-key", "idem-1"]
-    assert payload["action"] == "[REDACTED]" and payload["hardware"] == ""
-    assert payload["action_plain"] == "" and payload["hardware_plain"] == ""
+    assert payload["action"] == "[REDACTED]"
+    assert payload["action_plain"] == ""
 
 
 def test_printer3d_runtime_rejects_untrusted_manifest(monkeypatch, tmp_path):

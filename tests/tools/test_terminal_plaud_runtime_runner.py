@@ -51,9 +51,7 @@ def _write_runtime(tmp_path: Path) -> Path:
             print(json.dumps({
                 "argv": sys.argv[1:],
                 "action": secret("ZETTLAB_AGENT_ACTION_TOKEN"),
-                "hardware": secret("ZETTLAB_HARDWARE_EXECUTION_TOKEN"),
                 "action_plain": os.environ.get("ZETTLAB_AGENT_ACTION_TOKEN", ""),
-                "hardware_plain": os.environ.get("ZETTLAB_HARDWARE_EXECUTION_TOKEN", ""),
             }))
             """
         ).lstrip(),
@@ -168,9 +166,7 @@ def test_plaud_runtime_direct_runner_uses_private_fds(monkeypatch, tmp_path):
     payload = json.loads(result["output"])
     assert payload["argv"] == ["list", "--page", "1", "--page-size", "20"]
     assert payload["action"] == "[REDACTED]"
-    assert payload["hardware"] == ""
     assert payload["action_plain"] == ""
-    assert payload["hardware_plain"] == ""
 
 
 def test_plaud_runtime_rejects_untrusted_manifest(monkeypatch, tmp_path):

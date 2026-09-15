@@ -2144,7 +2144,6 @@ AGENT_CREATOR_RUNTIME_ENV_KEYS: frozenset[str] = frozenset({
     "ZETTLAB_AGENT_ACTION_TOKEN",
 })
 HARDWARE_RUNTIME_ENV_KEYS: frozenset[str] = frozenset({
-    "ZETTLAB_HARDWARE_EXECUTION_TOKEN",
     "ZETTLAB_CAMERA_JOB_ID",
     "ZETTLAB_CAMERA_EXECUTION_ID",
 })
@@ -2550,8 +2549,8 @@ def build_camera_semantic_runtime_env() -> dict[str, str]:
 def build_camera_runtime_env() -> dict[str, str]:
     """Build the exact request-scoped env for the trusted camera helper.
 
-    The helper receives the profile action token and the independently scoped
-    hardware capability plus turn/session correlation. Generic subprocesses
+    The helper receives the profile action token and turn/session correlation.
+    Generic subprocesses
     continue to have all of these values stripped by
     :func:`_apply_profile_secret_scope_env`.
     """
@@ -2562,7 +2561,6 @@ def build_camera_runtime_env() -> dict[str, str]:
     except Exception:
         frozen_receipt = {}
     session_id = str(frozen_receipt.get("HERMES_SESSION_KEY", "") or "").strip()
-    hardware_token = str(frozen_receipt.get("ZETTLAB_HARDWARE_EXECUTION_TOKEN", "") or "").strip()
     env = {
         "ZET_AGENT_ID": str(frozen_receipt.get("ZET_AGENT_ID", "") or "").strip(),
         "ZETTLAB_AGENT_ACTION_TOKEN": str(
@@ -2576,12 +2574,9 @@ def build_camera_runtime_env() -> dict[str, str]:
     user_id = str(frozen_receipt.get("ZETTLAB_USER_ID", "") or "").strip()
     if user_id:
         env["ZETTLAB_USER_ID"] = user_id
-    if hardware_token:
-        env["ZETTLAB_HARDWARE_EXECUTION_TOKEN"] = hardware_token
     limits = {
         "ZET_AGENT_ID": 128,
         "ZETTLAB_AGENT_ACTION_TOKEN": 128,
-        "ZETTLAB_HARDWARE_EXECUTION_TOKEN": 128,
         "HERMES_TURN_ID": 256,
         "HERMES_SESSION_ID": 1024,
         "HERMES_SESSION_KEY": 1024,
@@ -2609,7 +2604,6 @@ def build_printer3d_runtime_env() -> dict[str, str]:
     env = {
         "ZET_AGENT_ID": str(frozen_receipt.get("ZET_AGENT_ID", "") or "").strip(),
         "ZETTLAB_AGENT_ACTION_TOKEN": str(frozen_receipt.get("ZETTLAB_AGENT_ACTION_TOKEN", "") or "").strip(),
-        "ZETTLAB_HARDWARE_EXECUTION_TOKEN": "",
         "HERMES_TURN_ID": str(frozen_receipt.get("HERMES_TURN_ID", "") or "").strip(),
         "HERMES_SESSION_ID": session_id,
         "HERMES_SESSION_KEY": session_id,
@@ -2617,12 +2611,11 @@ def build_printer3d_runtime_env() -> dict[str, str]:
     limits = {
         "ZET_AGENT_ID": 128,
         "ZETTLAB_AGENT_ACTION_TOKEN": 128,
-        "ZETTLAB_HARDWARE_EXECUTION_TOKEN": 128,
         "HERMES_TURN_ID": 256,
         "HERMES_SESSION_ID": 1024,
         "HERMES_SESSION_KEY": 1024,
     }
-    if any((not value and key != "ZETTLAB_HARDWARE_EXECUTION_TOKEN") or "\x00" in value or len(value.encode("utf-8")) > limits[key] for key, value in env.items()):
+    if any(not value or "\x00" in value or len(value.encode("utf-8")) > limits[key] for key, value in env.items()):
         raise PermissionError("trusted printer3d execution receipt unavailable")
     return env
 
@@ -2639,13 +2632,12 @@ def build_smart_home_runtime_env() -> dict[str, str]:
     env = {
         "ZET_AGENT_ID": str(frozen_receipt.get("ZET_AGENT_ID", "") or "").strip(),
         "ZETTLAB_AGENT_ACTION_TOKEN": str(frozen_receipt.get("ZETTLAB_AGENT_ACTION_TOKEN", "") or "").strip(),
-        "ZETTLAB_HARDWARE_EXECUTION_TOKEN": "",
         "HERMES_TURN_ID": str(frozen_receipt.get("HERMES_TURN_ID", "") or "").strip(),
         "HERMES_SESSION_ID": session_id,
         "HERMES_SESSION_KEY": session_id,
     }
-    limits = {"ZET_AGENT_ID": 128, "ZETTLAB_AGENT_ACTION_TOKEN": 128, "ZETTLAB_HARDWARE_EXECUTION_TOKEN": 128, "HERMES_TURN_ID": 256, "HERMES_SESSION_ID": 1024, "HERMES_SESSION_KEY": 1024}
-    if any((not value and key != "ZETTLAB_HARDWARE_EXECUTION_TOKEN") or "\x00" in value or len(value.encode("utf-8")) > limits[key] for key, value in env.items()):
+    limits = {"ZET_AGENT_ID": 128, "ZETTLAB_AGENT_ACTION_TOKEN": 128, "HERMES_TURN_ID": 256, "HERMES_SESSION_ID": 1024, "HERMES_SESSION_KEY": 1024}
+    if any(not value or "\x00" in value or len(value.encode("utf-8")) > limits[key] for key, value in env.items()):
         raise PermissionError("trusted smart-home execution receipt unavailable")
     return env
 
@@ -2662,7 +2654,6 @@ def build_plaud_runtime_env() -> dict[str, str]:
     env = {
         "ZET_AGENT_ID": str(frozen_receipt.get("ZET_AGENT_ID", "") or "").strip(),
         "ZETTLAB_AGENT_ACTION_TOKEN": str(frozen_receipt.get("ZETTLAB_AGENT_ACTION_TOKEN", "") or "").strip(),
-        "ZETTLAB_HARDWARE_EXECUTION_TOKEN": "",
         "HERMES_TURN_ID": str(frozen_receipt.get("HERMES_TURN_ID", "") or "").strip(),
         "HERMES_SESSION_ID": session_id,
         "HERMES_SESSION_KEY": session_id,
@@ -2670,14 +2661,12 @@ def build_plaud_runtime_env() -> dict[str, str]:
     limits = {
         "ZET_AGENT_ID": 128,
         "ZETTLAB_AGENT_ACTION_TOKEN": 128,
-        "ZETTLAB_HARDWARE_EXECUTION_TOKEN": 128,
         "HERMES_TURN_ID": 256,
         "HERMES_SESSION_ID": 1024,
         "HERMES_SESSION_KEY": 1024,
     }
     if any(
-        (not value and key != "ZETTLAB_HARDWARE_EXECUTION_TOKEN")
-        or "\x00" in value
+        not value or "\x00" in value
         or len(value.encode("utf-8")) > limits[key]
         for key, value in env.items()
     ):

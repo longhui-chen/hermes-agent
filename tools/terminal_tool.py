@@ -4386,7 +4386,6 @@ def _run_camera_runtime_command_if_allowed(
         secret_keys = (
             (
                 "ZETTLAB_AGENT_ACTION_TOKEN",
-                "ZETTLAB_HARDWARE_EXECUTION_TOKEN",
                 "ZETTLAB_CAMERA_JOB_ID",
                 "ZETTLAB_CAMERA_EXECUTION_ID",
             )
@@ -4398,14 +4397,6 @@ def _run_camera_runtime_command_if_allowed(
             for key in secret_keys
             if key in trusted_env
         }
-        # Camera ownership is resolved by local-server's authenticated
-        # connector projection. Keep the legacy hardware bearer optional
-        # during migration so existing helpers continue to work while new
-        # calls no longer depend on an internally issued ticket.
-        if not semantic and "ZETTLAB_HARDWARE_EXECUTION_TOKEN" in trusted_env:
-            trusted_secrets["ZETTLAB_HARDWARE_EXECUTION_TOKEN"] = trusted_env.pop(
-                "ZETTLAB_HARDWARE_EXECUTION_TOKEN"
-            )
         secret_values = list(trusted_secrets.values())
         run_cwd = cwd if cwd and os.path.isdir(cwd) else os.getcwd()
         completed = run_trusted_python_script(
@@ -4500,7 +4491,6 @@ def _run_printer3d_runtime_command_if_allowed(
             key: trusted_env.pop(key)
             for key in (
                 "ZETTLAB_AGENT_ACTION_TOKEN",
-                "ZETTLAB_HARDWARE_EXECUTION_TOKEN",
             )
         }
         secret_values = list(trusted_secrets.values())
@@ -4568,7 +4558,7 @@ def _run_smart_home_runtime_command_if_allowed(
         from tools.environments.local import build_smart_home_runtime_env
         from tools.trusted_direct_runner import run_trusted_python_script
         trusted_env = build_smart_home_runtime_env()
-        trusted_secrets = {key: trusted_env.pop(key) for key in ("ZETTLAB_AGENT_ACTION_TOKEN", "ZETTLAB_HARDWARE_EXECUTION_TOKEN")}
+        trusted_secrets = {key: trusted_env.pop(key) for key in ("ZETTLAB_AGENT_ACTION_TOKEN",)}
         secret_values = list(trusted_secrets.values())
         run_cwd = cwd if cwd and os.path.isdir(cwd) else os.getcwd()
         completed = run_trusted_python_script(
@@ -4644,7 +4634,6 @@ def _run_plaud_runtime_command_if_allowed(
             key: trusted_env.pop(key)
             for key in (
                 "ZETTLAB_AGENT_ACTION_TOKEN",
-                "ZETTLAB_HARDWARE_EXECUTION_TOKEN",
             )
         }
         secret_values = list(trusted_secrets.values())
