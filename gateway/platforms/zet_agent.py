@@ -5459,7 +5459,7 @@ class ZetAgentAdapter(APIServerAdapter):
             )
 
         # zettlab-overlay(BT): route item/display frames through the adapter; upstream: none
-        _bt_reasoning, _bt_start, _bt_complete, _bt_finish = bind_item_callbacks(
+        _bt_reasoning, _bt_start, _bt_complete, _bt_finish, _bt_transform = bind_item_callbacks(
             stream_q=stream_q, turn_id=extension_turn_id,
             reasoning=_reasoning_cb, tool_start=tool_start_callback,
             tool_complete=tool_complete_callback,
@@ -5468,6 +5468,8 @@ class ZetAgentAdapter(APIServerAdapter):
             _bt_reasoning, _bt_start, _bt_complete
         )
         agent._bt_finish_items = _bt_finish
+        stream_q._zettlab_bt_transform = _bt_transform
+        stream_q._zettlab_bt_finish = _bt_finish
 
         # 2. Structured lifecycle status: late-bind so only the sniffed
         # chat-completions stream receives the App-specific extension event.

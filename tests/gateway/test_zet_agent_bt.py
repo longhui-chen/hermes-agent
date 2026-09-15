@@ -10,7 +10,7 @@ def _frames(queue):
 def test_callbacks_emit_item_lifecycle_and_display():
     queue = Queue()
     seen = []
-    reasoning, start, complete, finish = bind_item_callbacks(
+    reasoning, start, complete, finish, _ = bind_item_callbacks(
         stream_q=queue, turn_id="turn-1", reasoning=lambda text: seen.append(text),
         tool_start=lambda *args: seen.append(("start", args)),
         tool_complete=lambda *args: seen.append(("complete", args)),
@@ -31,7 +31,7 @@ def test_callbacks_emit_item_lifecycle_and_display():
 
 def test_finish_closes_reasoning_item():
     queue = Queue()
-    reasoning, _, _, finish = bind_item_callbacks(
+    reasoning, _, _, finish, _ = bind_item_callbacks(
         stream_q=queue, turn_id=None, reasoning=None, tool_start=None, tool_complete=None
     )
     reasoning("only answer")
@@ -41,7 +41,7 @@ def test_finish_closes_reasoning_item():
 
 def test_error_result_is_error_and_redacts_authorization_key():
     queue = Queue()
-    _, _, complete, _ = bind_item_callbacks(
+    _, _, complete, _, _ = bind_item_callbacks(
         stream_q=queue, turn_id=None, reasoning=None, tool_start=None, tool_complete=None
     )
     complete("c", "tool", {}, {"status": "error", "authorization": "Bearer secret"})
@@ -53,7 +53,7 @@ def test_error_result_is_error_and_redacts_authorization_key():
 def test_callbacks_preserve_legacy_callbacks():
     queue = Queue()
     calls = []
-    _, start, complete, _ = bind_item_callbacks(
+    _, start, complete, _, _ = bind_item_callbacks(
         stream_q=queue, turn_id=None, reasoning=None,
         tool_start=lambda *args: calls.append(("start", args)),
         tool_complete=lambda *args: calls.append(("complete", args)),

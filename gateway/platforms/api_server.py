@@ -6586,6 +6586,12 @@ class APIServerAdapter(BasePlatformAdapter):
                 # completion via agent_task.done() instead.
                 if delta is not None:
                     for safe_delta in media_delta_filter.feed(delta):
+                        # zettlab-overlay(BT): adapter transforms text chunks; upstream: none
+                        bt_transform = getattr(_stream_q, "_zettlab_bt_transform", None)
+                        if callable(bt_transform):
+                            for bt_item in bt_transform(safe_delta):
+                                _stream_q.put(bt_item)
+                            continue
                         if prestream_timing is not None:
                             prestream_timing.observe_queued_semantic("content")
                         _stream_q.put(safe_delta)
@@ -6737,6 +6743,10 @@ class APIServerAdapter(BasePlatformAdapter):
             # Ensure SSE drain loops can terminate without relying on polling
             # agent_task.done(), which can race with queue timeout checks.
             def _finish_chat_stream(_fut):
+                # zettlab-overlay(BT): close adapter items before sentinel; upstream: none
+                bt_finish = getattr(_stream_q, "_zettlab_bt_finish", None)
+                if callable(bt_finish):
+                    bt_finish()
                 for safe_delta in media_delta_filter.finish():
                     _stream_q.put(safe_delta)
                 # Terminal interaction frames must be queued while the SSE

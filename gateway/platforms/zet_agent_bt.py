@@ -20,6 +20,12 @@ def bind_item_callbacks(
             if isinstance(item, dict):
                 stream_q.put(("__tool_progress__", item))
 
+    def transform(delta: Any) -> list[Any]:
+        if delta is None:
+            return []
+        frames = sequencer.process(delta)
+        return [delta] + [("__tool_progress__", frame) for frame in frames if isinstance(frame, dict)]
+
     def on_reasoning(text: Any) -> None:
         if text:
             emit({"type": "reasoning.delta", "text": text})
@@ -48,4 +54,4 @@ def bind_item_callbacks(
             for frame in sequencer._close(kind):
                 stream_q.put(("__tool_progress__", frame))
 
-    return on_reasoning, on_start, on_complete, finish
+    return on_reasoning, on_start, on_complete, finish, transform
