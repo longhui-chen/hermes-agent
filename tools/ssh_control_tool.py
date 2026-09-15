@@ -11,7 +11,8 @@ from urllib.parse import urlsplit, urlunsplit
 import requests
 
 from agent.secret_scope import get_secret
-from gateway.session_context import get_session_env  # zettlab-overlay(ac1015-bearer): remove bearer context import; upstream: none
+# zettlab-overlay(ac1015-bearer): remove bearer context import; upstream: none
+from gateway.session_context import get_session_env
 from tools.registry import registry
 
 _MAX_RESPONSE_BYTES = 1 << 20
@@ -107,6 +108,7 @@ def _runtime_context() -> tuple[str, str, str]:
 def _check_ssh_control() -> bool:
     # zettlab-overlay(ac1015-bearer): SSH authorization no longer uses bearer; upstream: none
     # zettlab-overlay(ac1015-bearer): enforce outer identity fields; upstream: none
+    # zettlab-overlay(ac1015-bearer): omit legacy bearer from SSH request; upstream: none
     action_token, session_id, turn_id = _runtime_context()
     # Discovery establishes that a trusted Chat turn can ask for SSH work; it
     # must not consume the separate execution capability that authorizes an
