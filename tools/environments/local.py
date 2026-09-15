@@ -2144,6 +2144,7 @@ AGENT_CREATOR_RUNTIME_ENV_KEYS: frozenset[str] = frozenset({
     "ZETTLAB_AGENT_ACTION_TOKEN",
 })
 HARDWARE_RUNTIME_ENV_KEYS: frozenset[str] = frozenset({
+    # zettlab-overlay(ac1015-bearer): retain only camera execution identifiers; upstream: none
     "ZETTLAB_CAMERA_JOB_ID",
     "ZETTLAB_CAMERA_EXECUTION_ID",
 })
@@ -2549,6 +2550,7 @@ def build_camera_semantic_runtime_env() -> dict[str, str]:
 def build_camera_runtime_env() -> dict[str, str]:
     """Build the exact request-scoped env for the trusted camera helper.
 
+    # zettlab-overlay(ac1015-bearer): remove hardware bearer from helper env; upstream: none
     The helper receives the profile action token and turn/session correlation.
     Generic subprocesses
     continue to have all of these values stripped by
@@ -2571,6 +2573,7 @@ def build_camera_runtime_env() -> dict[str, str]:
         # Keep the legacy alias for already deployed camsnap v0.1.x helpers.
         "HERMES_SESSION_KEY": session_id,
     }
+    # zettlab-overlay(ac1015-bearer): pass authenticated owner context; upstream: none
     user_id = str(frozen_receipt.get("ZETTLAB_USER_ID", "") or "").strip()
     if user_id:
         env["ZETTLAB_USER_ID"] = user_id
@@ -2594,6 +2597,7 @@ def build_camera_runtime_env() -> dict[str, str]:
 
 def build_printer3d_runtime_env() -> dict[str, str]:
     """Reuse the request-scoped receipt without exposing it to terminal."""
+    # zettlab-overlay(ac1015-bearer): printer env excludes legacy bearer; upstream: none
     try:
         from agent.zet_agent_response_mode import trusted_printer3d_runtime_receipt
 
@@ -2622,6 +2626,7 @@ def build_printer3d_runtime_env() -> dict[str, str]:
 
 def build_smart_home_runtime_env() -> dict[str, str]:
     """Build the request-scoped receipt for the smart-home light helper."""
+    # zettlab-overlay(ac1015-bearer): smart-home env excludes legacy bearer; upstream: none
     try:
         from agent.zet_agent_response_mode import trusted_smart_home_runtime_receipt
 
@@ -2644,6 +2649,7 @@ def build_smart_home_runtime_env() -> dict[str, str]:
 
 def build_plaud_runtime_env() -> dict[str, str]:
     """Build the exact request-scoped env for the trusted PLAUD helper."""
+    # zettlab-overlay(ac1015-bearer): PLAUD env excludes legacy bearer; upstream: none
     try:
         from agent.zet_agent_response_mode import trusted_plaud_runtime_receipt
 

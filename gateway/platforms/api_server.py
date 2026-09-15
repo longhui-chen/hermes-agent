@@ -836,6 +836,7 @@ def _is_video_edit_skill_slug(skill_slug: str) -> bool:
 
 
 def _extract_hardware_execution_token(request: Any) -> str:
+    # zettlab-overlay(ac1015-bearer): reject legacy hardware bearer at gateway; upstream: none
     """Legacy compatibility hook; hardware bearers are no longer accepted."""
     return ""
 

@@ -11,7 +11,7 @@ from urllib.parse import urlsplit, urlunsplit
 import requests
 
 from agent.secret_scope import get_secret
-from gateway.session_context import get_session_env
+from gateway.session_context import get_session_env  # zettlab-overlay(ac1015-bearer): remove bearer context import; upstream: none
 from tools.registry import registry
 
 _MAX_RESPONSE_BYTES = 1 << 20
@@ -97,6 +97,7 @@ def _session_value(name: str) -> str:
 
 
 def _runtime_context() -> tuple[str, str, str]:
+    # zettlab-overlay(ac1015-bearer): bind action/session context only; upstream: none
     action_token = str(get_secret("ZETTLAB_AGENT_ACTION_TOKEN", "") or "").strip()
     session_id = _session_value("HERMES_SESSION_ID") or _session_value("HERMES_SESSION_KEY")
     turn_id = _session_value("HERMES_TURN_ID")
@@ -104,6 +105,8 @@ def _runtime_context() -> tuple[str, str, str]:
 
 
 def _check_ssh_control() -> bool:
+    # zettlab-overlay(ac1015-bearer): SSH authorization no longer uses bearer; upstream: none
+    # zettlab-overlay(ac1015-bearer): enforce outer identity fields; upstream: none
     action_token, session_id, turn_id = _runtime_context()
     # Discovery establishes that a trusted Chat turn can ask for SSH work; it
     # must not consume the separate execution capability that authorizes an
@@ -158,6 +161,7 @@ def ssh_control_tool(args: dict[str, Any], **_: Any) -> str:
             client.trust_env = False
             response = client.post(
                 _endpoint(),
+                # zettlab-overlay(ac1015-bearer): omit legacy hardware header; upstream: none
                 headers={
                     "Content-Type": "application/json",
                     "X-Zettlab-Agent-Action-Token": action_token,

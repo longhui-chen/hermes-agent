@@ -332,6 +332,7 @@ class _SkillDirectTaskContext:
 
 @dataclass(frozen=True)
 class _TrustedExecutionReceipt:
+    # zettlab-overlay(ac1015-bearer): remove per-turn hardware bearer; upstream: none
     agent_id: str = field(repr=False)
     action_token: str = field(repr=False)
     turn_id: str
@@ -546,6 +547,7 @@ def _capture_trusted_execution_receipt(
         _SMART_HOME_SKILL_PATH,
     }:
         return None
+    # zettlab-overlay(ac1015-bearer): resolve owner from authenticated context; upstream: none
     try:
         from agent.secret_scope import current_secret_scope, is_multiplex_active
 
@@ -573,6 +575,7 @@ def _capture_trusted_execution_receipt(
             "HERMES_SESSION_KEY"
         )
         session_id = get_session_env("HERMES_SESSION_ID")
+        # zettlab-overlay(ac1015-bearer): preserve owner/session context without bearer; upstream: none
         if not session_id:
             session_id = gateway_session_key
         user_id = zettlab_auth_principal() or get_session_env("HERMES_SESSION_USER_ID")
@@ -582,6 +585,7 @@ def _capture_trusted_execution_receipt(
         gateway_session_key = ""
         user_id = ""
 
+    # zettlab-overlay(ac1015-bearer): construct bearer-free receipt; upstream: none
     receipt = _TrustedExecutionReceipt(
         agent_id=_profile_value("ZET_AGENT_ID"),
         action_token=_profile_value("ZETTLAB_AGENT_ACTION_TOKEN"),
@@ -591,6 +595,7 @@ def _capture_trusted_execution_receipt(
         gateway_session_key=str(gateway_session_key or "").strip(),
         execution_policy=str(bound_execution_policy or "").strip().lower(),
     )
+    # zettlab-overlay(ac1015-bearer): require outer action/session identity only; upstream: none
     present = {
         "agent_id": bool(receipt.agent_id),
         "turn_id": bool(receipt.turn_id),
@@ -607,6 +612,7 @@ def _capture_trusted_execution_receipt(
             present,
         )
         return None
+    # zettlab-overlay(ac1015-bearer): remove hardware token format validation; upstream: none
     if (
         not _is_opaque_action_token(receipt.action_token)
     ):
@@ -639,6 +645,7 @@ def _trusted_skill_path_for_slug(skill_slug: str) -> str:
 
 
 def _trusted_runtime_receipt() -> Mapping[str, str]:
+    # zettlab-overlay(ac1015-bearer): expose connector context without bearer; upstream: none
     """Return the private one-operation receipt for the camsnap helper."""
     receipt = _TRUSTED_HARDWARE_RUNTIME_RECEIPT.get()
     if (
@@ -647,6 +654,7 @@ def _trusted_runtime_receipt() -> Mapping[str, str]:
         or not receipt.session_id
     ):
         return {}
+    # zettlab-overlay(ac1015-bearer): add authenticated owner context; upstream: none
     values = {
         "ZET_AGENT_ID": receipt.agent_id,
         "ZETTLAB_AGENT_ACTION_TOKEN": receipt.action_token,
@@ -658,21 +666,25 @@ def _trusted_runtime_receipt() -> Mapping[str, str]:
 
 
 def trusted_camera_runtime_receipt() -> Mapping[str, str]:
+    # zettlab-overlay(ac1015-bearer): camera helper uses owner context; upstream: none
     """Return camera context; the hardware execution bearer is optional."""
     return _trusted_runtime_receipt()
 
 
 def trusted_printer3d_runtime_receipt() -> Mapping[str, str]:
+    # zettlab-overlay(ac1015-bearer): printer helper uses owner context; upstream: none
     """Return the private one-operation receipt for signed printer helpers."""
     return _trusted_runtime_receipt()
 
 
 def trusted_plaud_runtime_receipt() -> Mapping[str, str]:
+    # zettlab-overlay(ac1015-bearer): PLAUD helper uses owner context; upstream: none
     """Return the private one-operation receipt for the PLAUD helper."""
     return _trusted_runtime_receipt()
 
 
 def trusted_smart_home_runtime_receipt() -> Mapping[str, str]:
+    # zettlab-overlay(ac1015-bearer): smart-home helper uses owner context; upstream: none
     """Return the private one-operation receipt for the light helper."""
     return _trusted_runtime_receipt()
 
