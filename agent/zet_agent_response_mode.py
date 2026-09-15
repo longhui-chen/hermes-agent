@@ -676,17 +676,17 @@ def trusted_camera_runtime_receipt() -> Mapping[str, str]:
 
 def trusted_printer3d_runtime_receipt() -> Mapping[str, str]:
     """Return the private one-operation receipt for signed printer helpers."""
-    return _trusted_runtime_receipt(require_hardware_token=True)
+    return _trusted_runtime_receipt(require_hardware_token=False)
 
 
 def trusted_plaud_runtime_receipt() -> Mapping[str, str]:
     """Return the private one-operation receipt for the PLAUD helper."""
-    return _trusted_runtime_receipt(require_hardware_token=True)
+    return _trusted_runtime_receipt(require_hardware_token=False)
 
 
 def trusted_smart_home_runtime_receipt() -> Mapping[str, str]:
     """Return the private one-operation receipt for the light helper."""
-    return _trusted_runtime_receipt(require_hardware_token=True)
+    return _trusted_runtime_receipt(require_hardware_token=False)
 
 
 def _stat_fingerprint(value: os.stat_result) -> tuple[int, ...]:

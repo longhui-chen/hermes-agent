@@ -4386,6 +4386,7 @@ def _run_camera_runtime_command_if_allowed(
         secret_keys = (
             (
                 "ZETTLAB_AGENT_ACTION_TOKEN",
+                "ZETTLAB_HARDWARE_EXECUTION_TOKEN",
                 "ZETTLAB_CAMERA_JOB_ID",
                 "ZETTLAB_CAMERA_EXECUTION_ID",
             )

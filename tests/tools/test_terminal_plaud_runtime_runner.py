@@ -168,7 +168,7 @@ def test_plaud_runtime_direct_runner_uses_private_fds(monkeypatch, tmp_path):
     payload = json.loads(result["output"])
     assert payload["argv"] == ["list", "--page", "1", "--page-size", "20"]
     assert payload["action"] == "[REDACTED]"
-    assert payload["hardware"] == "[REDACTED]"
+    assert payload["hardware"] == ""
     assert payload["action_plain"] == ""
     assert payload["hardware_plain"] == ""
 

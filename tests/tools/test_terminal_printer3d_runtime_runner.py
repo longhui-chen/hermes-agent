@@ -144,7 +144,7 @@ def test_printer3d_runtime_direct_runner_uses_private_fds(monkeypatch, tmp_path)
     assert ACTION_TOKEN not in result["output"] and HARDWARE_TOKEN not in result["output"]
     payload = json.loads(result["output"])
     assert payload["argv"] == ["pause", "--printer-id", "printer-1", "--idempotency-key", "idem-1"]
-    assert payload["action"] == "[REDACTED]" and payload["hardware"] == "[REDACTED]"
+    assert payload["action"] == "[REDACTED]" and payload["hardware"] == ""
     assert payload["action_plain"] == "" and payload["hardware_plain"] == ""
 
 
