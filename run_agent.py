@@ -3425,6 +3425,7 @@ class AIAgent:
             if getattr(self, "_interrupt_requested", False):
                 return False
             existing = getattr(self, "_pending_steer", None)
+            # zettlab-overlay(U2d): list slot replaces the upstream string concat; upstream: none
             if existing is None:
                 return False
             existing.append((None, cleaned))
