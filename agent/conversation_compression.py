@@ -71,7 +71,8 @@ from agent.context_engine import (
     automatic_compaction_status_message,
     sanitize_memory_context,
 )
-from agent.model_metadata import estimate_request_tokens_rough
+# zettlab-overlay(context-budget): use provider replay projection for checkpoint accounting; upstream: none
+from agent.model_metadata import estimate_request_tokens_rough, project_messages_for_token_estimate
 from agent.session_activity import ActivityProvenance, normalize_activity_provenance
 
 logger = logging.getLogger(__name__)
@@ -1349,6 +1350,8 @@ def _supported_compression_kwargs(
     focus_topic: Optional[str],
     force: bool,
     memory_context: str,
+    # zettlab-overlay(context-budget): optional capability preserves older context engines; upstream: none
+    token_estimator=None,
 ) -> dict:
     """Return only compression kwargs accepted by an engine callable.
 
@@ -1364,6 +1367,9 @@ def _supported_compression_kwargs(
     }
     if memory_context:
         candidates["memory_context"] = memory_context
+    # zettlab-overlay(context-budget): only offer an estimator when provided; upstream: none
+    if token_estimator is not None:
+        candidates["token_estimator"] = token_estimator
     try:
         parameters = inspect.signature(compress_fn).parameters
     except (TypeError, ValueError):
@@ -2765,6 +2771,12 @@ def compress_context(
             except Exception:
                 pass
 
+        # zettlab-overlay(context-budget): candidate savings must exclude display-only traces; upstream: none
+        def estimate_replayed_messages(items):
+            return estimate_request_tokens_rough(project_messages_for_token_estimate(
+                items, getattr(agent, "_copy_reasoning_content_for_api", None),
+            ))
+
         compress_fn = agent.context_compressor.compress
         compress_kwargs = _supported_compression_kwargs(
             compress_fn,
@@ -2772,6 +2784,8 @@ def compress_context(
             focus_topic=focus_topic,
             force=force,
             memory_context=memory_context,
+            # zettlab-overlay(context-budget): pass replay estimator when supported; upstream: none
+            token_estimator=estimate_replayed_messages,
         )
         if memory_context.strip() and "memory_context" not in compress_kwargs:
             engine_name = getattr(
@@ -3481,8 +3495,11 @@ def compress_context(
         # Keep the post-compression rough estimate for diagnostics, but do not
         # treat it as provider-reported prompt usage. Schema-heavy rough estimates
         # can remain above threshold even after the next real API request fits.
+        # zettlab-overlay(context-budget): keep post-commit baseline on the same replay basis; upstream: none
         _compressed_est = estimate_request_tokens_rough(
-            compressed,
+            project_messages_for_token_estimate(
+                compressed, getattr(agent, "_copy_reasoning_content_for_api", None),
+            ),
             system_prompt=new_system_prompt or "",
             tools=agent.tools or None,
         )

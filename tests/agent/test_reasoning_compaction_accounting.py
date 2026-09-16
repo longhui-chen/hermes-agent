@@ -61,7 +61,7 @@ def test_successful_usage_calibrates_without_compaction_and_checks_do_not_drift(
     import random
 
     with patch('agent.context_compressor.get_model_context_length', return_value=200000):
-        comp = ContextCompressor(model='test/model', quiet_mode=True)
+        comp = ContextCompressor(model='test/model', threshold_percent=0.5, quiet_mode=True)
     comp.context_length = 200000
     assert comp.threshold_tokens == 150000
     rng = random.Random(17)
@@ -78,3 +78,72 @@ def test_successful_usage_calibrates_without_compaction_and_checks_do_not_drift(
     # A provider reading above the trigger overrides an earlier fitting anchor.
     comp.update_from_response({'prompt_tokens': 150001, 'request_estimated_tokens': 200000})
     assert not comp.should_defer_rough_estimate_to_real_usage(200000)
+
+
+@pytest.mark.parametrize('window', [256000, 1000000])
+def test_default_budget_uses_most_of_input_window_and_reserves_output(window):
+    from hermes_cli.config import DEFAULT_CONFIG
+
+    comp = ContextCompressor(model='test/model', config_context_length=window,
+                             max_tokens=8192, quiet_mode=True)
+    ratio = DEFAULT_CONFIG['compression']['threshold']
+    assert 0.8 <= ratio < 1
+    assert comp.threshold_percent == ratio
+    assert comp.threshold_tokens == int((window - 8192) * ratio)
+    assert comp.threshold_tokens < window - 8192
+
+
+def test_explicit_legacy_ratio_and_absolute_cap_remain_compatible():
+    comp = ContextCompressor(model='test/model', config_context_length=256000,
+                             threshold_percent=0.5, threshold_tokens_cap=180000,
+                             quiet_mode=True)
+    assert comp.threshold_tokens == 180000
+    assert comp.threshold_percent == 0.75
+
+
+def test_summary_serializes_observations_not_reasoning_fields():
+    comp = ContextCompressor(model='test/model', config_context_length=256000,
+                             quiet_mode=True)
+    messages = [
+        {'role': 'user', 'content': 'Preserve GOAL-480; do not write files.'},
+        {'role': 'assistant', 'content': '<think>INLINE_SPECULATION</think>Checking.',
+         'reasoning': 'PRIVATE_SPECULATION' * 2000,
+         'reasoning_content': 'PRIVATE_SPECULATION' * 2000,
+         'tool_calls': [{'id': 'c1', 'type': 'function', 'function': {
+             'name': 'inspect_fixture', 'arguments': '{"step":1}'}}]},
+        {'role': 'tool', 'tool_call_id': 'c1', 'content': 'OBSERVED_STEP_1'}]
+    serialized = comp._serialize_for_summary(messages)
+    assert 'SPECULATION' not in serialized
+    assert 'GOAL-480' in serialized
+    assert 'OBSERVED_STEP_1' in serialized
+    assert 'inspect_fixture' in serialized
+
+
+def test_display_only_reasoning_cannot_disguise_an_expanding_checkpoint():
+    comp = ContextCompressor(model='test/model', config_context_length=256000,
+                             protect_first_n=0, protect_last_n=1, quiet_mode=True)
+    comp.tail_token_budget = 10
+    messages = [{'role': 'user', 'content': 'Continue GOAL-480.'}]
+    for i in range(12):
+        messages.append({'role': 'assistant', 'content': f'observation {i}',
+                         'reasoning_content': 'scratch work ' * 2000})
+    messages.append({'role': 'user', 'content': 'Continue.'})
+    before = deepcopy(messages)
+    policy = partial(apply_reasoning_content_policy, needs_thinking_pad=False)
+    def replay_size(items):
+        return estimate_messages_tokens_rough(project_messages_for_token_estimate(items, policy))
+    with patch.object(comp, '_generate_summary', return_value='expanded checkpoint ' * 100):
+        result = comp.compress(messages, current_tokens=160000, token_estimator=replay_size)
+    assert result == before
+    assert comp.compression_count == 0
+    assert not comp._last_compression_made_progress
+
+
+def test_estimator_capability_keeps_legacy_compression_plugins_working():
+    from agent.conversation_compression import _supported_compression_kwargs
+
+    def legacy(messages, current_tokens=None):
+        return messages
+    kwargs = _supported_compression_kwargs(legacy, current_tokens=123,
+              focus_topic=None, force=False, memory_context='', token_estimator=len)
+    assert kwargs == {'current_tokens': 123}

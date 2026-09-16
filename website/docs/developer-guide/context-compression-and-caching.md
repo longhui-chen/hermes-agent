@@ -46,7 +46,7 @@ Hermes has two separate compression layers that operate independently:
                                    │
                                    ▼
                      ┌──────────────────────────┐
-                     │   Agent ContextCompressor │  Fires at 50% of context (default)
+                     │   Agent ContextCompressor │  Fires at 85% of input budget (default)
                      │   (in-loop, real tokens)  │  Normal context management
                      └──────────────────────────┘
 ```
@@ -67,7 +67,7 @@ The gateway hygiene threshold is intentionally higher than the agent's compresso
 Setting it at 50% (same as the agent) caused premature compression on every turn
 in long gateway sessions.
 
-### 2. Agent ContextCompressor (50% threshold, configurable)
+### 2. Agent ContextCompressor (85% threshold, configurable)
 
 Located in `agent/context_compressor.py`. This is the **primary compression
 system** that runs inside the agent's tool loop with access to accurate,
@@ -81,7 +81,7 @@ All compression settings are read from `config.yaml` under the `compression` key
 ```yaml
 compression:
   enabled: true              # Enable/disable compression (default: true)
-  threshold: 0.50            # Fraction of context window (default: 0.50 = 50%)
+  threshold: 0.85            # Fraction of input budget after output reservation
   # model_thresholds:        # Per-model threshold overrides (substring match,
   #   "glm-5.2": 0.40        # longest key wins). See "Per-model threshold
   #   "claude-sonnet": 0.35  # overrides" below.
@@ -105,7 +105,7 @@ auxiliary:
 
 | Parameter | Default | Range | Description |
 |-----------|---------|-------|-------------|
-| `threshold` | `0.50` | 0.0-1.0 | Compression triggers when prompt tokens ≥ `threshold × context_length` |
+| `threshold` | `0.85` | 0.0-1.0 | Ratio of context window minus configured output reservation; see legacy floor and optional absolute cap |
 | `model_thresholds` | `{}` | map | Per-model overrides of `threshold`. Keys are substring-matched against the model name (longest match wins). The small-context floor still applies on top (see below) |
 | `target_ratio` | `0.20` | 0.10-0.80 | Controls tail protection token budget: `threshold_tokens × target_ratio` |
 | `protect_last_n` | `20` | ≥1 | Minimum number of recent messages always preserved |
@@ -165,7 +165,7 @@ map.
 
 The ChatGPT Codex OAuth backend hard-caps gpt-5.5 at a **272K** context window
 (the same slug exposes 1.05M on OpenAI's direct API and OpenRouter, and 400K on
-GitHub Copilot). At the default 50% trigger, compaction would fire at ~136K —
+GitHub Copilot). At the previous 50% default, compaction would fire at ~136K —
 half the window the model can actually use. When the active route is Codex
 OAuth (`provider: openai-codex`) and the model is gpt-5.5, Hermes raises the
 trigger to **85%** (~231K) and shows a notice with the opt-out command. The
@@ -208,26 +208,46 @@ Hermes' local transcript is never rewritten on this runtime — state.db records
 the compaction boundary while the visible transcript stays intact. All other
 routes (including Codex OAuth chat sessions) keep Hermes' summary compressor.
 
-### Computed Values (for a 200K context model at defaults)
+### Window, output reservation and trigger are separate
 
+For a route configured with a 256,000-token window and 8,192-token output limit:
+
+```text
+context_length       = 256,000
+input_budget         = 256,000 - 8,192 = 247,808
+threshold_tokens     = floor(247,808 × 0.85) = 210,636
+tail_token_budget    = floor(210,636 × 0.20) = 42,127
 ```
-context_length       = 200,000
-threshold_tokens     = 200,000 × 0.50 = 100,000
-tail_token_budget    = 100,000 × 0.20 = 20,000
-max_summary_tokens   = min(200,000 × 0.05, 12,000) = 10,000
+
+There is no universal 200k ceiling. `model.context_length` and supported
+per-provider model overrides configure the window; otherwise endpoint metadata,
+cached discoveries and the model catalog resolve it, with a 256k unknown-model
+fallback. An advertised model name does not prove a proxy accepts its full window.
+Use a route's verified capacity; do not force all aliases to 1M.
+
+New configurations default to 0.85 across setup, CLI and direct agent creation.
+Existing explicit ratios remain unchanged: the legacy sub-512k floor raises a
+configured 0.50 to 0.75, while `compression.threshold_tokens` can impose a lower
+absolute trigger. Initialization logs show configured ratio, effective ratio,
+window, output reservation and absolute cap. An unset output limit is reported
+as unknown (`None`), not claimed to be a zero-output provider contract.
+
+For a verified 1M route, an operator can choose a 300k rolling budget without
+misrepresenting the model's full window:
+
+```yaml
+model:
+  context_length: 1000000  # Use only with a route verified to support this.
+compression:
+  threshold: 0.85
+  threshold_tokens: 300000
 ```
 
-:::note Threshold is derived from the MAIN model's context window
-`threshold_tokens` is always `threshold × context_length`, where `context_length`
-is the **main agent model's** context window — never the auxiliary/summary
-model's. On a 262,144-token model at the default `0.50`, the threshold is
-`262,144 × 0.50 = 131,072`. That number being close to a common "128K context"
-is a coincidence of the percentage, not a sign that the auxiliary model's window
-is the trigger. The auxiliary model's context window is a separate concern — see
-the "Summary model context length" warning below for how it affects whether a
-summary can be produced, not when compression fires.
-:::
-
+Existing explicit device YAML is not silently rewritten. Device deployment must
+set the reviewed ratio/window in the owning packaging repository's
+`zpk/config/<repo>.yaml`, then verify the effective startup budget. Auxiliary
+model capacity can further constrain a session's threshold in the existing
+compatibility path; inspect the final effective threshold, not just YAML.
 
 ## Compression Algorithm
 
@@ -472,7 +492,7 @@ The CLI shows caching status at startup:
 
 ## Context Pressure Warnings
 
-Intermediate context-pressure warnings have been removed (see the iteration-budget block in `run_agent.py`, which notes: "No intermediate pressure warnings — they caused models to 'give up' prematurely on complex tasks"). Compression fires when prompt tokens reach the configured `compression.threshold` (default 50%) with no prior warning step; gateway session hygiene fires as the secondary safety net at 85% of the model's context window.
+Intermediate context-pressure warnings have been removed (see the iteration-budget block in `run_agent.py`, which notes: "No intermediate pressure warnings — they caused models to 'give up' prematurely on complex tasks"). Compression fires when prompt tokens reach the configured `compression.threshold` (default 85% of the available input budget) with no prior warning step; gateway session hygiene fires as the secondary safety net at 85% of the model's context window.
 
 ### Reasoning accounting and task continuity
 
@@ -505,24 +525,35 @@ bounded by the existing growth allowance and stops when observed input plus
 estimated growth reaches the threshold. This is not an exact tokenizer and does
 not claim that an unknown model alias has a specific tokenizer or context limit.
 
-Rollout checklist for the Memo investigation (2026-09-15):
+Validation on the isolated local runtime uses the real configured cloud API,
+not an AC owner's device. The API returned model `gpt-5.6-sol`; this is response
+metadata, not independent verification of the provider's backend weights.
 
-- [x] Remove duplicate reasoning aliases from budgets and apply the existing
-  provider replay policy at raw-history pressure checks.
-- [x] Calibrate the existing guard from successful ordinary requests; random
-  operation-sequence tests ensure checks cannot move the anchor.
-- [x] Reject automatic checkpoint expansion without rewriting the session.
-- [x] Preserve unfinished authorized work while respecting later cancellation.
-- [ ] Resolve the actual route's window and output reservation. Historical device
-  logs show a 200k window and 150k effective trigger. Current 35.28 YAML has no
-  explicit context_length, has default alias lite, and still sets threshold 0.5;
-  neither that alias nor historical logs establish today's per-request capacity.
-- [ ] Reconcile system prompt (user-reported exact count about 11k), skills, tool
-  results, replay reasoning and schemas against the same request's provider usage
-  and a tokenizer only where the real model is known. No measured 10x system-only
-  overestimate has yet been established.
-- [ ] Verify cold start, resumed history and the complete reasoning lifecycle on
-  the device; do not infer a cloud route supports 1M merely from a model name.
+| Check | Result |
+|---|---|
+| Three sequential synthetic observation tools | Steps 1/2/3 completed; original GOAL-480 and no-write constraint retained |
+| First request count | Provider input 11,326; rough input 14,790 (about 31% high) |
+| False-pressure boundary | After the first observed usage, a test-only 14k trigger was installed; following estimates 14,886–15,078 exceeded it while input stayed 11,379–11,484; no compaction |
+| Real auxiliary compaction then continuation | Estimated history 38,112 → 4,145; only unfinished steps 2/3 executed; original goal retained |
+
+These are synthetic read-only tool fixtures with real model and summarizer
+responses. They prove the local agent loop, not the Memo UI or device release.
+They do not substantiate a tenfold system-prompt overestimate. No new exact
+model tokenizer is claimed for unknown cloud aliases: successful provider input
+usage calibrates the existing bounded guard, while cold starts retain estimates.
+
+Native reasoning fields and inline think blocks are excluded from summary input
+by the existing serializer (now explicitly regression-tested). Required replay
+fields survive normal API calls; non-required fields are omitted by the existing
+provider policy. Tail selection is still conservative for protocol-required
+reasoning; this PR does not globally erase persisted thinking or opaque provider
+state. All automatic savings comparisons use the host's replay-aware estimator
+when supplied; older context engines remain compatible through optional kwargs.
+
+Release checks, separate from the code-review gate: confirm the intended cloud
+route's capacity/output defaults and the packaged YAML, then use a dedicated AC
+for ARM/RSS/restart and Memo UI acceptance. 32.98 and 35.28 belong to other users
+and were not modified or used for this live inference validation.
 
 Engineering constraints: no new process, dependency, permanent payload cache or
 business state; projection uses O(message count) transient shallow dictionaries.

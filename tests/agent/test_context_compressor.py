@@ -1215,7 +1215,7 @@ class TestCompressWithClient:
         assert summary_msg["role"] == "user"
         assert "END OF CONTEXT SUMMARY" in summary_msg["content"]
         assert summary_msg["content"].rstrip().endswith(
-            "continue the active task subject to later user corrections ---"
+            "respond to the message below, not the summary above ---"
         )
 
     def test_assistant_role_summary_carries_end_marker(self):
@@ -1257,7 +1257,7 @@ class TestCompressWithClient:
         assert summary_msg["role"] == "assistant"
         assert "END OF CONTEXT SUMMARY" in summary_msg["content"]
         assert summary_msg["content"].rstrip().endswith(
-            "continue the active task subject to later user corrections ---"
+            "respond to the message below, not the summary above ---"
         )
 
     def test_summary_role_avoids_consecutive_user_messages(self):
@@ -1446,7 +1446,7 @@ class TestSummaryTargetRatio:
     def test_default_threshold_floored_at_75_percent_below_512k(self):
         """Sub-512K models get the 75% small-context threshold floor."""
         with patch("agent.context_compressor.get_model_context_length", return_value=100_000):
-            c = ContextCompressor(model="test", quiet_mode=True)
+            c = ContextCompressor(model="test", threshold_percent=0.50, quiet_mode=True)
             _ = c.context_length
         assert c.threshold_percent == 0.75
         # 75% of 100K = 75K, above the 64K minimum floor
@@ -2687,7 +2687,7 @@ class TestContextLengthSetterCoherence:
 
     def test_new_value_assignment_refloors_and_invalidates(self):
         with patch("agent.context_compressor.get_model_context_length", return_value=1_000_000):
-            c = ContextCompressor(model="test", quiet_mode=True)
+            c = ContextCompressor(model="test", threshold_percent=0.50, quiet_mode=True)
             _ = c.context_length
         assert c.threshold_percent == 0.50  # 1M >= 512K: configured value
         # Switch to a small window via direct assignment (codex path).

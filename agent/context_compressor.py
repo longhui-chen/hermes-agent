@@ -253,7 +253,7 @@ def _strip_persistence_markers(messages: List[Dict[str, Any]]) -> None:
 # zettlab-overlay(context-budget): align compaction with actual request and preserve task state; upstream: none
 _SUMMARY_END_MARKER = (
     "--- END OF CONTEXT SUMMARY — "
-    "continue the active task subject to later user corrections ---"
+    "respond to the message below, not the summary above ---"
 )
 
 # When the summary must be merged into the first tail message (the alternation
@@ -1514,11 +1514,14 @@ class ContextCompressor(ContextEngine):
         logger.info(
             "Context compressor initialized: model=%s context_length=%d "
             "threshold=%d (%.0f%%) target_ratio=%.0f%% tail_budget=%d "
-            "provider=%s base_url=%s",
+            # zettlab-overlay(context-budget): expose configured and effective budget separately; upstream: none
+            "provider=%s base_url=%s configured_ratio=%.2f output_reservation=%s absolute_cap=%s",
             self.model, self._resolved_context_length, self.threshold_tokens,
             self.threshold_percent * 100, self.summary_target_ratio * 100,
             self.tail_token_budget,
             self.provider or "none", self.base_url or "none",
+            # zettlab-overlay(context-budget): log effective budget inputs; upstream: none
+            self._base_threshold_percent, self.max_tokens, self.threshold_tokens_cap,
         )
 
     def _resolve_context_length(self) -> int:
@@ -2239,7 +2242,8 @@ class ContextCompressor(ContextEngine):
     def __init__(
         self,
         model: str,
-        threshold_percent: float = 0.50,
+        # zettlab-overlay(context-budget): match CLI and direct gateway initialization; upstream: none
+        threshold_percent: float = 0.85,
         protect_first_n: int = 3,
         protect_last_n: int = 20,
         summary_target_ratio: float = 0.20,
@@ -5981,6 +5985,8 @@ This compaction should PRIORITISE preserving all information related to the focu
         focus_topic: Optional[str] = None,
         force: bool = False,
         memory_context: str = "",
+        # zettlab-overlay(context-budget): compare candidates with the host replay policy; upstream: none
+        token_estimator=None,
     ) -> List[Dict[str, Any]]:
         """Compress conversation messages by summarizing middle turns.
 
@@ -6076,7 +6082,8 @@ This compaction should PRIORITISE preserving all information related to the focu
         # zettlab-overlay(context-budget): align compaction with actual request and preserve task state; upstream: none
         # Keep the original until a candidate actually reduces context pressure.
         original_messages = messages
-        original_estimate = estimate_messages_tokens_rough(messages)
+        estimate_budget = token_estimator or estimate_messages_tokens_rough
+        original_estimate = estimate_budget(messages)
 
         # Phase 1: Prune old tool results (cheap, no LLM call)
         messages, pruned_count = self._prune_old_tool_results(
@@ -6739,7 +6746,7 @@ This compaction should PRIORITISE preserving all information related to the focu
         # Port of Kilo-Org/kilocode#9434.
         compressed = _strip_historical_media(compressed)
 
-        new_estimate = estimate_messages_tokens_rough(compressed)
+        new_estimate = estimate_budget(compressed)
         # zettlab-overlay(context-budget): align compaction with actual request and preserve task state; upstream: none
         if current_tokens and not force and new_estimate >= original_estimate:
             # An expanded checkpoint is not a successful automatic compaction.
@@ -6767,7 +6774,8 @@ This compaction should PRIORITISE preserving all information related to the focu
         # counter below resets every pass and the anti-thrashing guard is dead
         # code. Compaction can only shrink messages, so score it against the
         # messages it was given.
-        pre_estimate = estimate_messages_tokens_rough(messages)
+        # zettlab-overlay(context-budget): diagnostics use the same replay projection; upstream: none
+        pre_estimate = estimate_budget(messages)
         saved_estimate = pre_estimate - new_estimate
         savings_pct = (saved_estimate / pre_estimate * 100) if pre_estimate > 0 else 0
         self._last_compression_savings_pct = savings_pct

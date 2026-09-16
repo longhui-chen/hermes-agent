@@ -8012,7 +8012,8 @@ def run_conversation(
                     _rough_tokens = estimate_request_tokens_rough(
                         project_messages_for_token_estimate(
                             messages, getattr(agent, "_copy_reasoning_content_for_api", None),
-                        ), tools=agent.tools or None
+                        ), system_prompt=agent._cached_system_prompt or "",
+                        tools=agent.tools or None
                     )
                     _real_tokens = _rough_tokens
                     if _compressor.last_prompt_tokens > 0:

@@ -454,6 +454,7 @@ class TestPreflightCompression:
             focus_topic=None,
             force=False,
             memory_context="",
+            token_estimator=None,
         ):
             events.append(("compress", "started"))
             return [{"role": "user", "content": f"{SUMMARY_PREFIX}\nPrevious conversation"}]
@@ -1189,6 +1190,9 @@ class TestToolResultPreflightCompression:
 
         with (
             patch("run_agent.handle_function_call", return_value="ok"),
+            patch("agent.turn_context.estimate_request_tokens_rough", return_value=113_000),
+            patch("agent.conversation_loop.estimate_messages_tokens_rough", return_value=113_000),
+            patch("agent.conversation_loop._estimate_tools_tokens_rough", return_value=0),
             patch("agent.conversation_loop.estimate_request_tokens_rough", return_value=114_000),
             patch.object(agent, "_compress_context") as mock_compress,
             patch.object(agent, "_persist_session"),
@@ -1200,7 +1204,7 @@ class TestToolResultPreflightCompression:
         mock_compress.assert_not_called()
         assert result["completed"] is True
         assert result["final_response"] == "Continued without rotation"
-        assert agent.context_compressor.last_rough_tokens_when_real_prompt_fit == 114_000
+        assert agent.context_compressor.last_rough_tokens_when_real_prompt_fit == 113_000
 
     def test_anthropic_prompt_too_long_safety_net(self, agent):
         """Anthropic 'prompt is too long' triggers compression as a safety net."""
