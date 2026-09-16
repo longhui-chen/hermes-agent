@@ -18044,7 +18044,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 get_model_context_length_async,
             )
 
-            # zettlab-overlay(context-budget): agent owns compaction; hygiene is only a safety check; upstream: none
+            # zettlab-overlay(context-budget): agent owns compaction and hygiene is only a safety check; upstream: none
             _hyg_model = "anthropic/claude-sonnet-4.6"
             # zettlab-overlay(context-budget): never pre-empt the Codex-style 90% agent threshold; upstream: none
             _hyg_threshold_pct = 0.90
