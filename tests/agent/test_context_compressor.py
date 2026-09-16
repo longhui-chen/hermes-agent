@@ -1126,7 +1126,10 @@ class TestAbortOnSummaryFailure:
         c = self._make_compressor()
         c.bind_session_state(db, "s1")
         c._summary_failure_cooldown_until = 0.0
+        c.tail_token_budget = 32
         msgs = self._make_msgs()
+        for msg in msgs:
+            msg["content"] *= 2000  # A successful summary must actually shrink input.
 
         with patch("agent.context_compressor.call_llm", return_value=mock_response) as mock_llm:
             result = c.compress(msgs, current_tokens=999999)
@@ -1212,7 +1215,7 @@ class TestCompressWithClient:
         assert summary_msg["role"] == "user"
         assert "END OF CONTEXT SUMMARY" in summary_msg["content"]
         assert summary_msg["content"].rstrip().endswith(
-            "respond to the message below, not the summary above ---"
+            "continue the active task subject to later user corrections ---"
         )
 
     def test_assistant_role_summary_carries_end_marker(self):
@@ -1254,7 +1257,7 @@ class TestCompressWithClient:
         assert summary_msg["role"] == "assistant"
         assert "END OF CONTEXT SUMMARY" in summary_msg["content"]
         assert summary_msg["content"].rstrip().endswith(
-            "respond to the message below, not the summary above ---"
+            "continue the active task subject to later user corrections ---"
         )
 
     def test_summary_role_avoids_consecutive_user_messages(self):
@@ -1588,7 +1591,7 @@ class TestTokenBudgetTailProtection:
         messages = []
         for i in range(9):
             role = "user" if i % 2 == 0 else "assistant"
-            messages.append({"role": role, "content": f"Message {i}"})
+            messages.append({"role": role, "content": f"Message {i} " * 200})
 
         # Should not early-return (needs > protect_first_n + 3 + 1 = 6)
         # Mock the summary generation to avoid real API call

@@ -473,3 +473,61 @@ The CLI shows caching status at startup:
 ## Context Pressure Warnings
 
 Intermediate context-pressure warnings have been removed (see the iteration-budget block in `run_agent.py`, which notes: "No intermediate pressure warnings — they caused models to 'give up' prematurely on complex tasks"). Compression fires when prompt tokens reach the configured `compression.threshold` (default 50%) with no prior warning step; gateway session hygiene fires as the secondary safety net at 85% of the model's context window.
+
+### Reasoning accounting and task continuity
+
+Raw storage may contain both `reasoning` (display/trajectory) and
+`reasoning_content` (provider replay). Identical traces count once in the shared
+estimator and tail budget. Turn-start and post-tool pressure checks project
+reasoning through the same replay policy as request construction: display-only
+traces do not trigger compaction, while required provider traces are preserved.
+This projection does not modify the stored transcript, change provider policy,
+or disable thinking. Other transport-specific envelopes remain conservative
+estimates; this is not a universal tokenizer or full wire serialization.
+
+Automatic batch compaction with a supplied pressure reading rejects candidates
+whose estimated message size is no smaller than the original. It restores the
+prior summary state and uses the existing ineffective-compaction breaker rather
+than adding another retry loop. Explicit forced compaction can still rebuild a
+checkpoint. The provider-overflow recovery path remains available.
+
+A checkpoint must retain the original goal, constraints, evidence of completed
+work, and unfinished work. Compaction itself neither completes nor cancels a
+task. Later user cancellations and corrections take precedence; speculation
+and unverified assistant claims must not become verified accomplishments.
+
+### Provider usage calibration and remaining rollout checks
+
+Successful ordinary requests now attach their preflight estimate to canonical usage.
+The existing deferral guard uses that provider-confirmed anchor even before the
+first compaction. Pressure checks never advance the anchor. Deferral remains
+bounded by the existing growth allowance and stops when observed input plus
+estimated growth reaches the threshold. This is not an exact tokenizer and does
+not claim that an unknown model alias has a specific tokenizer or context limit.
+
+Rollout checklist for the Memo investigation (2026-09-15):
+
+- [x] Remove duplicate reasoning aliases from budgets and apply the existing
+  provider replay policy at raw-history pressure checks.
+- [x] Calibrate the existing guard from successful ordinary requests; random
+  operation-sequence tests ensure checks cannot move the anchor.
+- [x] Reject automatic checkpoint expansion without rewriting the session.
+- [x] Preserve unfinished authorized work while respecting later cancellation.
+- [ ] Resolve the actual route's window and output reservation. Historical device
+  logs show a 200k window and 150k effective trigger. Current 35.28 YAML has no
+  explicit context_length, has default alias lite, and still sets threshold 0.5;
+  neither that alias nor historical logs establish today's per-request capacity.
+- [ ] Reconcile system prompt (user-reported exact count about 11k), skills, tool
+  results, replay reasoning and schemas against the same request's provider usage
+  and a tokenizer only where the real model is known. No measured 10x system-only
+  overestimate has yet been established.
+- [ ] Verify cold start, resumed history and the complete reasoning lifecycle on
+  the device; do not infer a cloud route supports 1M merely from a model name.
+
+Engineering constraints: no new process, dependency, permanent payload cache or
+business state; projection uses O(message count) transient shallow dictionaries.
+No tool permissions, external message contracts or device YAML sources change.
+Failure retains the original transcript and existing recovery/cooldown machinery.
+Reliability takes precedence over reducing compaction count. The core overlay is
+explicitly marked; its size exception requires PR review rather than modifying
+the overlay gate. Microsoft/Azure dependency freeze is unaffected.

@@ -70,6 +70,8 @@ from agent.model_metadata import (
     _estimate_tools_tokens_rough,
     estimate_messages_tokens_rough,
     estimate_request_tokens_rough,
+    # zettlab-overlay(context-budget): align compaction with actual request and preserve task state; upstream: none
+    project_messages_for_token_estimate,
     get_context_length_from_provider_error,
     is_output_cap_error,
     parse_available_output_tokens_from_error,
@@ -4572,6 +4574,8 @@ def run_conversation(
                         "cache_read_tokens": canonical_usage.cache_read_tokens,
                         "cache_write_tokens": canonical_usage.cache_write_tokens,
                         "reasoning_tokens": canonical_usage.reasoning_tokens,
+                        # zettlab-overlay(context-budget): pair usage with this request estimate; upstream: none
+                        "request_estimated_tokens": request_pressure_tokens if _moa_prepared_request is None else 0,
                     }
                     agent.context_compressor.update_from_response(usage_dict)
 
@@ -8004,8 +8008,11 @@ def run_conversation(
                     # these add 20-30K tokens the messages-only
                     # estimate misses, which can skip compression
                     # past the configured threshold (#14695).
+                    # zettlab-overlay(context-budget): align compaction with actual request and preserve task state; upstream: none
                     _rough_tokens = estimate_request_tokens_rough(
-                        messages, tools=agent.tools or None
+                        project_messages_for_token_estimate(
+                            messages, getattr(agent, "_copy_reasoning_content_for_api", None),
+                        ), tools=agent.tools or None
                     )
                     _real_tokens = _rough_tokens
                     if _compressor.last_prompt_tokens > 0:

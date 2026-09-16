@@ -46,6 +46,8 @@ from agent.memory_provider import is_trivial_prompt
 from agent.model_metadata import (
     estimate_messages_tokens_rough,
     estimate_request_tokens_rough,
+    # zettlab-overlay(context-budget): align compaction with actual request and preserve task state; upstream: none
+    project_messages_for_token_estimate,
 )
 from agent.response_format import response_format_requires_structured_output
 
@@ -734,8 +736,11 @@ def build_turn_context(
         _idle_gap = time.time() - getattr(agent, "_last_activity_ts", time.time())
         if _idle_gap >= _idle_after:
             _compressor = agent.context_compressor
+            # zettlab-overlay(context-budget): align compaction with actual request and preserve task state; upstream: none
             _idle_tokens = estimate_request_tokens_rough(
-                messages,
+                project_messages_for_token_estimate(
+                    messages, getattr(agent, "_copy_reasoning_content_for_api", None),
+                ),
                 system_prompt=active_system_prompt or "",
                 tools=agent.tools or None,
             )
@@ -813,8 +818,11 @@ def build_turn_context(
         agent.context_compressor.protect_last_n,
         agent.context_compressor.threshold_tokens,
     ):
+        # zettlab-overlay(context-budget): align compaction with actual request and preserve task state; upstream: none
         _preflight_tokens = estimate_request_tokens_rough(
-            messages,
+            project_messages_for_token_estimate(
+                messages, getattr(agent, "_copy_reasoning_content_for_api", None),
+            ),
             system_prompt=active_system_prompt or "",
             tools=agent.tools or None,
         )
@@ -983,8 +991,11 @@ def build_turn_context(
                 # lower token count — e.g. summarising tool outputs) is
                 # recognised as progress instead of being misread as
                 # "Cannot compress further". Fixes #39548.
+                # zettlab-overlay(context-budget): align compaction with actual request and preserve task state; upstream: none
                 _preflight_tokens = estimate_request_tokens_rough(
-                    messages,
+                    project_messages_for_token_estimate(
+                        messages, getattr(agent, "_copy_reasoning_content_for_api", None),
+                    ),
                     system_prompt=active_system_prompt or "",
                     tools=agent.tools or None,
                 )
