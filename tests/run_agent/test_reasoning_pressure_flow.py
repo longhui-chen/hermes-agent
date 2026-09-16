@@ -58,3 +58,28 @@ def test_long_think_short_tool_does_not_cause_false_compaction(agent, echo, with
         assert compressor.last_real_prompt_tokens == 1000
         assert compressor.last_rough_tokens_when_real_prompt_fit > 0
         assert compressor.compression_count == 0
+
+
+@pytest.mark.parametrize('runtime_window', [None, 272000])
+def test_explicit_runtime_window_survives_a_different_configured_route(runtime_window):
+    """A session override must not be discarded with the default model's config."""
+    from run_agent import AIAgent
+
+    cfg = {'model': {'default': 'gpt-5.6-sol', 'provider': 'custom',
+                     'base_url': 'https://old.invalid/v1', 'context_length': 128000},
+           'compression': {}, 'agent': {}}
+    with (
+        patch('hermes_cli.config.load_config', return_value=cfg),
+        patch('hermes_cli.config.load_config_readonly', return_value=cfg),
+        patch('run_agent.OpenAI'),
+        patch('agent.context_compressor.get_model_context_length',
+              side_effect=lambda *args, **kw: kw.get('config_context_length') or 1050000),
+    ):
+        instance = AIAgent(model='gpt-5.6-sol', provider='custom',
+                           base_url='https://active.invalid/v1', api_key='test-only-key',
+                           config_context_length=runtime_window,
+                           skip_tool_loading=True, skip_context_files=True,
+                           skip_memory=True, quiet_mode=True)
+        assert instance._config_context_length == runtime_window
+        assert instance.context_compressor.context_length == (runtime_window or 1050000)
+        assert instance.context_compressor.threshold_tokens == 244800

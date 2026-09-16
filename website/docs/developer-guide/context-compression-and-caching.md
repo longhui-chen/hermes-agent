@@ -40,34 +40,32 @@ Hermes has two separate compression layers that operate independently:
 
 ```
                      ┌──────────────────────────┐
-  Incoming message   │   Gateway Session Hygiene │  Fires at 85% of context
-  ─────────────────► │   (pre-agent, rough est.) │  Safety net for large sessions
+  Incoming message   │   Gateway Session Hygiene │  Safety check at 90% of context
+  ─────────────────► │   (pre-agent, API usage) │  Safety net for large sessions
                      └─────────────┬────────────┘
                                    │
                                    ▼
                      ┌──────────────────────────┐
-                     │   Agent ContextCompressor │  Fires at 85% of input budget (default)
+                     │   Agent ContextCompressor │  90% of window, capped at 244,800 (default)
                      │   (in-loop, real tokens)  │  Normal context management
                      └──────────────────────────┘
 ```
 
-### 1. Gateway Session Hygiene (85% threshold)
+### 1. Gateway Session Hygiene (90% safety check)
 
 Located in `gateway/run.py` (search for `Session hygiene: auto-compress`). This is a **safety net** that
 runs before the agent processes a message. It prevents API failures when sessions
 grow too large between turns (e.g., overnight accumulation in Telegram/Discord).
 
-- **Threshold**: Fixed at 85% of model context length
-- **Token source**: Prefers actual API-reported tokens from last turn; falls back
-  to rough character-based estimate (`estimate_messages_tokens_rough`)
+- **Threshold**: 90% of model context length, using provider-reported usage only. Without usage, ordinary pressure is deferred to the agent replay estimator; the existing extreme-message-count guard remains.
+- **Token source**: Actual API-reported tokens from the last turn. Rough stored-history estimates are diagnostic only; the agent checks projected request pressure.
 - **Fires**: Only when `len(history) >= 4` and compression is enabled
 - **Purpose**: Catch sessions that escaped the agent's own compressor
 
-The gateway hygiene threshold is intentionally higher than the agent's compressor.
-Setting it at 50% (same as the agent) caused premature compression on every turn
-in long gateway sessions.
+The gateway safety threshold cannot precede the default agent trigger. Raw stored
+reasoning is not a valid reason to summarize before request projection.
 
-### 2. Agent ContextCompressor (85% threshold, configurable)
+### 2. Agent ContextCompressor (Codex-style standard budget)
 
 Located in `agent/context_compressor.py`. This is the **primary compression
 system** that runs inside the agent's tool loop with access to accurate,
@@ -81,7 +79,8 @@ All compression settings are read from `config.yaml` under the `compression` key
 ```yaml
 compression:
   enabled: true              # Enable/disable compression (default: true)
-  threshold: 0.85            # Fraction of input budget after output reservation
+  threshold: 0.90            # Fraction of route window, capped at 90%
+  threshold_tokens: 244800   # Standard working budget: 272000 * 90%
   # model_thresholds:        # Per-model threshold overrides (substring match,
   #   "glm-5.2": 0.40        # longest key wins). See "Per-model threshold
   #   "claude-sonnet": 0.35  # overrides" below.
@@ -105,8 +104,9 @@ auxiliary:
 
 | Parameter | Default | Range | Description |
 |-----------|---------|-------|-------------|
-| `threshold` | `0.85` | 0.0-1.0 | Ratio of context window minus configured output reservation; see legacy floor and optional absolute cap |
-| `model_thresholds` | `{}` | map | Per-model overrides of `threshold`. Keys are substring-matched against the model name (longest match wins). The small-context floor still applies on top (see below) |
+| `threshold` | `0.90` | >0, effective maximum 0.90 | Ratio of route window; no hidden 75% or 64k lower bound |
+| `threshold_tokens` | `244800` | positive integer or null | Absolute working-context trigger cap; explicit null disables this cap for a verified larger route |
+| `model_thresholds` | `{}` | map | Per-model overrides of `threshold`. Keys are substring-matched against the model name (longest match wins). The 90% ceiling and absolute cap apply on top |
 | `target_ratio` | `0.20` | 0.10-0.80 | Controls tail protection token budget: `threshold_tokens × target_ratio` |
 | `protect_last_n` | `20` | ≥1 | Minimum number of recent messages always preserved |
 | `min_tail_user_messages` | `1` | ≥1 | Minimum number of REAL (actionable) user messages guaranteed to survive in the uncompressed tail. `1` = the existing single last-user anchor (behavior-preserving default). Raise to e.g. `3` to keep the last 3 real user turns verbatim even when bulky tool outputs fill the tail token budget. Blank platform echoes, compaction handoffs, and synthetic continuation rows never count toward N. The guarantee wins over the tail token budget — the tail may exceed the budget when the anchor pulls the cut back |
@@ -151,10 +151,7 @@ Resolution rules:
 - When no key matches (or the map is empty), the global `threshold` applies.
 - The override is re-resolved on every `/model` switch; switching to a model
   with no matching key falls back to the global `threshold`.
-- The **small-context floor still applies on top** of overrides (raise-only):
-  models with context windows below 512K are floored at `0.75`, so an
-  override below the floor is raised to `0.75`, while an override above it
-  (e.g. `0.80`) wins.
+- Lower explicit ratios are honored; the 90% ceiling and absolute cap still apply.
 
 Plugin context engines can reuse the same resolution logic via
 `from agent.context_compressor import resolve_model_threshold`; engines that
@@ -208,46 +205,75 @@ Hermes' local transcript is never rewritten on this runtime — state.db records
 the compaction boundary while the visible transcript stays intact. All other
 routes (including Codex OAuth chat sessions) keep Hermes' summary compressor.
 
-### Window, output reservation and trigger are separate
+### Codex reference and standard working budget
 
-For a route configured with a 256,000-token window and 8,192-token output limit:
+Reference: OpenAI Codex 0.153.4, `codex-rs/protocol/src/openai_models.rs`,
+`ModelInfo::auto_compact_token_limit` and the test
+`model_context_window_limits_preserve_their_distinct_meanings`.
+That test distinguishes a 272,000 window, 258,400 usable context (95%), and
+244,800 auto-compaction limit (90%). The usable-context number is NOT a second
+compaction trigger. No 95% UI scaling is added to Hermes in this patch.
+
+Hermes reuses its existing absolute-cap setting, rather than adding another
+mode/state machine:
 
 ```text
-context_length       = 256,000
-input_budget         = 256,000 - 8,192 = 247,808
-threshold_tokens     = floor(247,808 × 0.85) = 210,636
-tail_token_budget    = floor(210,636 × 0.20) = 42,127
+route window 272,000 -> 90% = 244,800 -> standard cap 244,800
+route window 1,050,000 -> 90% = 945,000 -> standard cap 244,800
+route window 128,000 -> 90% = 115,200 -> standard cap does not enlarge it
 ```
 
-There is no universal 200k ceiling. `model.context_length` and supported
-per-provider model overrides configure the window; otherwise endpoint metadata,
-cached discoveries and the model catalog resolve it, with a 256k unknown-model
-fallback. An advertised model name does not prove a proxy accepts its full window.
-Use a route's verified capacity; do not force all aliases to 1M.
+The standard budget is a client policy, NOT proof that a cloud alias supports
+272k or 1M. Route metadata/explicit overrides remain the source of capacity;
+the existing unknown-model fallback is still an unverified estimate. A caller's
+explicit session window now survives a different default route in config.
 
-New configurations default to 0.85 across setup, CLI and direct agent creation.
-Existing explicit ratios remain unchanged: the legacy sub-512k floor raises a
-configured 0.50 to 0.75, while `compression.threshold_tokens` can impose a lower
-absolute trigger. Initialization logs show configured ratio, effective ratio,
-window, output reservation and absolute cap. An unset output limit is reported
-as unknown (`None`), not claimed to be a zero-output provider contract.
+An explicit chat-provider `max_tokens` remains a separate hard input safety
+bound: `min(window * ratio, window - max_tokens, threshold_tokens)`. Unlike the
+previous formula, output space is not subtracted before applying the ratio.
+This provider adaptation is not claimed to be Codex's formula. Unspecified
+output capacity remains unknown; no fabricated 128k or other output reserve.
+There is no automatic 64k trigger floor or 75% ratio uplift.
 
-For a verified 1M route, an operator can choose a 300k rolling budget without
-misrepresenting the model's full window:
+Standard configuration (with route capacity configured separately):
+
+```yaml
+compression:
+  threshold: 0.90
+  threshold_tokens: 244800
+```
+
+Explicit long-context configuration, only for a verified route:
 
 ```yaml
 model:
-  context_length: 1000000  # Use only with a route verified to support this.
+  context_length: 1000000
 compression:
-  threshold: 0.85
-  threshold_tokens: 300000
+  threshold: 0.90
+  threshold_tokens: 900000
 ```
 
-Existing explicit device YAML is not silently rewritten. Device deployment must
-set the reviewed ratio/window in the owning packaging repository's
-`zpk/config/<repo>.yaml`, then verify the effective startup budget. Auxiliary
-model capacity can further constrain a session's threshold in the existing
-compatibility path; inspect the final effective threshold, not just YAML.
+Existing explicit YAML is not silently rewritten. A deployed old `threshold: 0.5`
+now really means 50%; it must be migrated to the standard configuration above
+when deploying this fix. An old explicit `threshold_tokens: null` opts out of the
+standard cap and must also be reviewed. Device config remains owned by the
+packaging repository's `zpk/config/<repo>.yaml`. No shared device was changed.
+
+### Which fixes come from Codex, and which remain Hermes adaptations
+
+- **Thresholds:** port the 90% upper bound and separate explicit compaction cap;
+  do not confuse full capacity, usable context and the trigger.
+- **Accounting:** Codex `context_manager/history.rs::get_total_token_usage` uses
+  the latest provider usage plus subsequent items, and avoids counting reasoning
+  twice when already included by the server. Hermes uses successful input usage
+  plus projected growth with its existing bounded noisy-estimate guard; this is
+  an adaptation to Chat Completions, not a claim of identical Responses semantics.
+- **Reasoning:** preserve provider-required protocol state. Display summaries are
+  not generic conversation content. No blanket deletion of encrypted/native state.
+- **Compaction continuity:** preserve active user intent and continuation. Hermes'
+  textual auxiliary summaries differ from Codex remote encrypted compaction.
+- **No-gain rejection:** retain Hermes' existing failure protection and reject an
+  expanded automatic candidate. This is a Hermes safety fix, not attributed to Codex.
 
 ## Compression Algorithm
 
@@ -492,7 +518,7 @@ The CLI shows caching status at startup:
 
 ## Context Pressure Warnings
 
-Intermediate context-pressure warnings have been removed (see the iteration-budget block in `run_agent.py`, which notes: "No intermediate pressure warnings — they caused models to 'give up' prematurely on complex tasks"). Compression fires when prompt tokens reach the configured `compression.threshold` (default 85% of the available input budget) with no prior warning step; gateway session hygiene fires as the secondary safety net at 85% of the model's context window.
+Intermediate context-pressure warnings have been removed (see the iteration-budget block in `run_agent.py`, which notes: "No intermediate pressure warnings — they caused models to 'give up' prematurely on complex tasks"). Compression fires when prompt tokens reach the configured `compression.threshold` (default 90% of the window, capped at 244,800 tokens) with no prior warning step; gateway session hygiene fires as the secondary safety net at 90% of the model's context window using reported usage.
 
 ### Reasoning accounting and task continuity
 
@@ -562,3 +588,16 @@ Failure retains the original transcript and existing recovery/cooldown machinery
 Reliability takes precedence over reducing compaction count. The core overlay is
 explicitly marked; its size exception requires PR review rather than modifying
 the overlay gate. Microsoft/Azure dependency freeze is unaffected.
+
+### Latest standard-budget validation
+
+The Codex-aligned follow-up passes 515 tests across 53 files, including the
+272k/244800 boundary, explicit runtime pin, model switching, 1000 randomized
+window/output/cap transitions, and the gateway no-usage path. Five unrelated
+failures reproduce on unchanged main (telemetry: 2; context selection: 3).
+
+The latest live attempt reports window=272000 and threshold=244800, fixing
+the earlier discarded 256k pin. Its model calls failed with cloud overload;
+a separate minimal hello request timed out. No latest live tool-flow success
+is claimed. Earlier live evidence above belongs to the previous budget revision.
+Cloud validation is deferred at the user's direction; no shared AC was modified.

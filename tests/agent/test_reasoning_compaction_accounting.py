@@ -61,7 +61,7 @@ def test_successful_usage_calibrates_without_compaction_and_checks_do_not_drift(
     import random
 
     with patch('agent.context_compressor.get_model_context_length', return_value=200000):
-        comp = ContextCompressor(model='test/model', threshold_percent=0.5, quiet_mode=True)
+        comp = ContextCompressor(model='test/model', threshold_percent=0.75, quiet_mode=True)
     comp.context_length = 200000
     assert comp.threshold_tokens == 150000
     rng = random.Random(17)
@@ -80,8 +80,8 @@ def test_successful_usage_calibrates_without_compaction_and_checks_do_not_drift(
     assert not comp.should_defer_rough_estimate_to_real_usage(200000)
 
 
-@pytest.mark.parametrize('window', [256000, 1000000])
-def test_default_budget_uses_most_of_input_window_and_reserves_output(window):
+@pytest.mark.parametrize('window', [64000, 256000, 272000, 1000000])
+def test_standard_budget_matches_codex_and_respects_smaller_routes(window):
     from hermes_cli.config import DEFAULT_CONFIG
 
     comp = ContextCompressor(model='test/model', config_context_length=window,
@@ -89,16 +89,16 @@ def test_default_budget_uses_most_of_input_window_and_reserves_output(window):
     ratio = DEFAULT_CONFIG['compression']['threshold']
     assert 0.8 <= ratio < 1
     assert comp.threshold_percent == ratio
-    assert comp.threshold_tokens == int((window - 8192) * ratio)
-    assert comp.threshold_tokens < window - 8192
+    assert comp.threshold_tokens == min(int(window * ratio), 244800, window - 8192)
+    assert comp.threshold_tokens <= window - 8192
 
 
-def test_explicit_legacy_ratio_and_absolute_cap_remain_compatible():
+def test_explicit_lower_ratio_is_not_silently_raised():
     comp = ContextCompressor(model='test/model', config_context_length=256000,
                              threshold_percent=0.5, threshold_tokens_cap=180000,
                              quiet_mode=True)
-    assert comp.threshold_tokens == 180000
-    assert comp.threshold_percent == 0.75
+    assert comp.threshold_tokens == 128000
+    assert comp.threshold_percent == 0.5
 
 
 def test_summary_serializes_observations_not_reasoning_fields():
@@ -147,3 +147,32 @@ def test_estimator_capability_keeps_legacy_compression_plugins_working():
     kwargs = _supported_compression_kwargs(legacy, current_tokens=123,
               focus_topic=None, force=False, memory_context='', token_estimator=len)
     assert kwargs == {'current_tokens': 123}
+
+
+def test_codex_reference_limits_and_explicit_long_context():
+    # Codex 0.153.4 openai_models.rs::model_context_window_limits_preserve_their_distinct_meanings.
+    standard = ContextCompressor(model='gpt-5.6-sol', config_context_length=272000,
+                                 max_tokens=8192, quiet_mode=True)
+    assert standard.threshold_tokens == 244800
+    assert not standard.should_compress(244799)
+    assert standard.should_compress(244800)
+    assert standard.threshold_tokens < 258400  # 95% usable window is NOT the trigger.
+    expanded = ContextCompressor(model='gpt-5.6-sol', config_context_length=1000000,
+                                 threshold_tokens_cap=900000, quiet_mode=True)
+    assert expanded.threshold_tokens == 900000
+    expanded.update_model('smaller-route', context_length=128000)
+    assert expanded.threshold_tokens == 115200
+
+
+def test_randomized_codex_budget_never_exceeds_window_or_explicit_cap():
+    import random
+    rng = random.Random(480)
+    c = ContextCompressor(model='test', config_context_length=272000, quiet_mode=True)
+    for _ in range(1000):
+        window = rng.randint(8192, 1050000)
+        cap = rng.choice([None, 244800, 900000])
+        reserve = rng.randint(1, window - 1)
+        c.threshold_tokens_cap = cap
+        c.update_model('test', context_length=window, max_tokens=reserve)
+        assert c.threshold_tokens == max(1, min(int(window * .9), window - reserve,
+                                                cap if cap else window))

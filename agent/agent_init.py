@@ -1906,7 +1906,7 @@ def init_agent(
     if not isinstance(_compression_cfg, dict):
         _compression_cfg = {}
     # zettlab-overlay(context-budget): keep useful headroom without halving the window; upstream: none
-    compression_threshold = float(_compression_cfg.get("threshold", 0.85))
+    compression_threshold = float(_compression_cfg.get("threshold", 0.90))
     # Per-model/route compaction-threshold override. Codex gpt-5.4 / gpt-5.5
     # raise to 85% (the Codex backend caps both families at 272K, so the
     # default 50% would compact at ~136K — half the usable context). Gated by
@@ -2064,7 +2064,8 @@ def init_agent(
     # the ratio-based threshold and this absolute count. Clamped to the
     # model's context length at apply-time so a cap above the window is
     # a no-op (ratio-based threshold wins).
-    compression_threshold_tokens = _compression_cfg.get("threshold_tokens")
+    # zettlab-overlay(context-budget): same standard budget for direct gateway and CLI; upstream: none
+    compression_threshold_tokens = _compression_cfg.get("threshold_tokens", 244_800)
     if compression_threshold_tokens is not None:
         try:
             compression_threshold_tokens = int(compression_threshold_tokens)
@@ -2218,7 +2219,8 @@ def init_agent(
     # live switch/fallback paths already clear this override; keep direct-start
     # overrides consistent with them and let provider metadata resolve the
     # active model's window instead.
-    if _config_context_length is not None and isinstance(_model_cfg, dict):
+    # zettlab-overlay(context-budget): explicit runtime window is not the stale default-model config; upstream: none
+    if config_context_length is None and _config_context_length is not None and isinstance(_model_cfg, dict):
         _configured_default_model = str(_model_cfg.get("default") or "").strip()
         _configured_default_runtime_model = _configured_default_model
         _active_runtime_model = agent.model

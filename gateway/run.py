@@ -18044,16 +18044,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 get_model_context_length_async,
             )
 
-            # Read model + compression config from config.yaml.
-            # NOTE: hygiene threshold is intentionally HIGHER than the agent's
-            # own compressor (0.85 vs 0.50).  Hygiene is a safety net for
-            # sessions that grew too large between turns — it fires pre-agent
-            # to prevent API failures.  The agent's own compressor handles
-            # normal context management during its tool loop with accurate
-            # real token counts.  Having hygiene at 0.50 caused premature
-            # compression on every turn in long gateway sessions.
+            # zettlab-overlay(context-budget): agent owns compaction; hygiene is only a safety check; upstream: none
             _hyg_model = "anthropic/claude-sonnet-4.6"
-            _hyg_threshold_pct = 0.85
+            # zettlab-overlay(context-budget): never pre-empt the Codex-style 90% agent threshold; upstream: none
+            _hyg_threshold_pct = 0.90
             _hyg_compression_enabled = True
             _hyg_hard_msg_limit = 5000
             _hyg_timeout_seconds = 30.0
@@ -18217,13 +18211,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 else:
                     _approx_tokens = estimate_messages_tokens_rough(history)
                     _token_source = "estimated"
-                    # Note: rough estimates overestimate by 30-50% for code/JSON-heavy
-                    # sessions, but that just means hygiene fires a bit early — which
-                    # is safe and harmless.  The 85% threshold already provides ample
-                    # headroom (agent's own compressor runs at 50%).  A previous 1.4x
-                    # multiplier tried to compensate by inflating the threshold, but
-                    # 85% * 1.4 = 119% of context — which exceeds the model's limit
-                    # and prevented hygiene from ever firing for ~200K models (GLM-5).
+                    # zettlab-overlay(context-budget): estimate is diagnostic until agent projects actual replay; upstream: none
 
                 # Hard safety valve: force compression if message count is
                 # extreme, regardless of token estimates.  This breaks the
@@ -18239,7 +18227,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # (#2153)
                 _HARD_MSG_LIMIT = _hyg_hard_msg_limit
                 _needs_compress = (
-                    _approx_tokens >= _compress_token_threshold
+                    # zettlab-overlay(context-budget): raw stored think cannot trigger pre-agent compaction; upstream: none
+                    (_token_source == "actual" and _approx_tokens >= _compress_token_threshold)
                     or _msg_count >= _HARD_MSG_LIMIT
                 )
 

@@ -569,15 +569,9 @@ DEFAULT_CONFIG = {
                                       # surfaces (server-side logging only). Failure
                                       # notices and manual /compress feedback are
                                       # always visible regardless of this setting.
-        "threshold": 0.85,            # compress when context usage exceeds this ratio.
-                                      # Models with context windows below 512K are
-                                      # floored at 0.75 (raise-only) so compaction
-                                      # doesn't fire with half the window still free;
-                                      # set this above 0.75 to override the floor.
-        "threshold_tokens": None,     # absolute token cap — when set, compression
-                                      # triggers at the lower of the ratio-based
-                                      # threshold and this token count. Clamped to
-                                      # the model's context length at apply-time.
+        "threshold": 0.90,            # Codex-style maximum: 90% of route context window.
+        "threshold_tokens": 244_800,  # Standard 272k working budget * 90%; set a verified
+                                      # larger limit (or null) for long-context operation.
         "target_ratio": 0.20,         # fraction of threshold to preserve as recent tail
         "protect_last_n": 20,         # minimum recent messages to keep uncompressed
         "min_tail_user_messages": 1,  # REAL (actionable) user messages guaranteed to

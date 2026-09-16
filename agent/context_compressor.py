@@ -34,7 +34,6 @@ from agent.auxiliary_client import (
 from agent.context_engine import ContextEngine, sanitize_memory_context
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.model_metadata import (
-    MINIMUM_CONTEXT_LENGTH,
     get_model_context_length,
     estimate_messages_tokens_rough,
     estimate_tokens_rough,
@@ -671,17 +670,6 @@ _FEASIBILITY_SKIP_MIDDLE_FRACTION = 0.10
 # protected region — but always keep this many trailing messages verbatim so
 # the active user ask / latest tool pair remain readable.  Issue #61932.
 _PRESSURE_KEEP_RECENT_MESSAGES = 3
-
-# Models with context windows below this get their compression threshold
-# floored at ``_SMALL_CTX_THRESHOLD_PERCENT`` (raise-only — an explicitly
-# higher user/model threshold always wins).  At the default 50% trigger a
-# 128K-262K model compacts with only ~64-131K consumed; the incompressible
-# floor (system prompt + tool schemas + protected tail + rolling summary)
-# eats most of the reclaimed headroom, so compaction re-fires every 1-2
-# turns and the session spends most of its wall-clock summarizing.
-_SMALL_CTX_WINDOW_LIMIT = 512_000
-_SMALL_CTX_THRESHOLD_PERCENT = 0.75
-
 
 _PATH_MENTION_RE = re.compile(r"(?:/|~/?|[A-Za-z]:\\)[^\s`'\")\]}<>]+")
 
@@ -1534,13 +1522,6 @@ class ContextCompressor(ContextEngine):
                 config_context_length=self._config_context_length,
                 provider=self.provider,
             )
-            # Small-context threshold floor: models under 512K trigger at
-            # >=75% so compaction doesn't fire with half the window still
-            # free. Raise-only; must run AFTER context_length is resolved
-            # and BEFORE threshold_tokens is derived (deferred here from
-            # __init__ along with the resolution itself, #32221).
-            # _base_threshold_percent already has the per-model override
-            # applied, so the floor stacks on top of it.
             self.threshold_percent = self._effective_threshold_percent(
                 self._resolved_context_length, self._base_threshold_percent,
             )
@@ -1562,11 +1543,6 @@ class ContextCompressor(ContextEngine):
         if value == getattr(self, "_resolved_context_length", None):
             return
         self._resolved_context_length = value
-        # Re-apply the small-context floor (raise-only) for the genuinely new
-        # window so the invalidated budgets below recompute coherently —
-        # percent and tokens must derive from the same window. Skipped on
-        # bare test instances built via object.__new__ that never ran
-        # __init__ (no _base_threshold_percent).
         _base = getattr(self, "_base_threshold_percent", None)
         if _base is not None:
             self.threshold_percent = self._effective_threshold_percent(
@@ -1580,13 +1556,7 @@ class ContextCompressor(ContextEngine):
     @property
     def threshold_tokens(self) -> int:
         if self._threshold_tokens is None:
-            # Resolve the window FIRST (may apply the small-context floor to
-            # threshold_percent as a side effect) so the percent read below
-            # is the floored value regardless of argument evaluation order.
             _ctx = self.context_length
-            # Floor: never compress below MINIMUM_CONTEXT_LENGTH tokens even
-            # if the percentage would suggest a lower value (#14690 handles
-            # the degenerate small-window case inside the helper).
             self._threshold_tokens = self._compute_threshold_tokens(
                 _ctx, self.threshold_percent, self.max_tokens,
             )
@@ -2049,10 +2019,6 @@ class ContextCompressor(ContextEngine):
         self.provider = provider
         self.api_mode = api_mode
         self.context_length = context_length
-        # Re-resolve per-model threshold for the NEW model, then re-apply the
-        # small-context threshold floor. Starting from _config_threshold_percent
-        # (the raw config value) so a switch from a model with an override to
-        # one without correctly falls back to the global threshold.
         _config_pct = getattr(
             self, "_config_threshold_percent", self.threshold_percent,
         )
@@ -2118,13 +2084,6 @@ class ContextCompressor(ContextEngine):
         self._verify_compaction_cleared_threshold = False
         self._last_compression_made_progress = False
 
-    # When the MINIMUM_CONTEXT_LENGTH floor meets/exceeds a small context
-    # window, compacting at the percentage (50% → 32K of a 64K window) wastes
-    # half the usable context. Trigger near the top of the window instead so a
-    # minimum-context model uses most of its budget before compacting — same
-    # rationale as the gpt-5.5/Codex 85% autoraise.
-    _MIN_CTX_TRIGGER_RATIO = 0.85
-
     # Anti-thrash recovery window (#14694): once the ineffective/fallback
     # breaker trips, automatic compaction stays blocked for this long, then
     # ONE probe attempt is allowed (counters drop to 1 strike, so another
@@ -2182,68 +2141,28 @@ class ContextCompressor(ContextEngine):
                 self.threshold_tokens = _effective_cap
 
     @staticmethod
-    def _effective_threshold_percent(
-        context_length: int, threshold_percent: float,
-    ) -> float:
-        """Apply the small-context threshold floor (raise-only).
-
-        Models under ``_SMALL_CTX_WINDOW_LIMIT`` (512K) trigger at no less
-        than ``_SMALL_CTX_THRESHOLD_PERCENT`` (75%) of the window.  An
-        explicitly higher threshold (user config or per-model autoraise,
-        e.g. Codex gpt-5.5's 85%) always wins; only lower values are raised.
-        Large-context models keep the configured value — at 512K+ the default
-        50% trigger already leaves ample post-compaction headroom.
-        """
-        if context_length and context_length < _SMALL_CTX_WINDOW_LIMIT:
-            return max(threshold_percent, _SMALL_CTX_THRESHOLD_PERCENT)
-        return threshold_percent
+    def _effective_threshold_percent(context_length: int, threshold_percent: float) -> float:
+        # zettlab-overlay(context-budget): Codex caps auto-compaction at 90% of the window; upstream: none
+        return min(threshold_percent, 0.90)
 
     @staticmethod
     def _compute_threshold_tokens(
         context_length: int, threshold_percent: float, max_tokens: int | None = None,
     ) -> int:
-        """Compute the compaction trigger threshold in tokens.
+        # zettlab-overlay(context-budget): mirror Codex raw-window threshold, with provider output safety; upstream: none
+        # Codex 0.153.4 ModelInfo::auto_compact_token_limit: min(config, window * 9/10).
+        # Explicit chat-provider output reservations are a separate hard bound;
+        # do not multiply them by the compaction ratio or invent one when unknown.
+        trigger = int(context_length * min(threshold_percent, 0.90))
+        if max_tokens is not None and 0 < max_tokens < context_length:
+            trigger = min(trigger, context_length - max_tokens)
+        return max(1, trigger)
 
-        The base value is ``effective_input_budget * threshold_percent``, floored
-        at ``MINIMUM_CONTEXT_LENGTH`` so large-context models don't compress
-        prematurely at 50%. BUT that floor degenerates at small windows: for a
-        model whose ``context_length`` is at/below the minimum (e.g. a 64K
-        local model), ``max(0.5*64000, 64000) == 64000`` makes the threshold
-        equal the ENTIRE window — auto-compression can never fire because the
-        provider rejects the request before usage reaches 100% (#14690).
-
-        When the floor would meet or exceed the context window, trigger at
-        ``_MIN_CTX_TRIGGER_RATIO`` (85%) of the window — high enough that a
-        small model uses most of its context before compacting, but below
-        100% so compaction fires before the provider rejects the request.
-
-        The provider reserves ``max_tokens`` of output space out of the same
-        window, so the usable INPUT budget is ``context_length - max_tokens``.
-        With a large ``max_tokens`` (e.g. 65536 on a custom provider) the input
-        budget is materially smaller than the raw window, and a threshold based
-        on the full window lets the session hit a provider 400 before compaction
-        fires (#43547). The percentage and the degenerate-window check below both
-        operate on the effective input budget. ``max_tokens=None`` (provider
-        default) conservatively assumes no reservation (full window).
-        """
-        effective_window = context_length - (max_tokens or 0)
-        if effective_window <= 0:
-            effective_window = context_length
-        pct_value = int(effective_window * threshold_percent)
-        floored = max(pct_value, MINIMUM_CONTEXT_LENGTH)
-        # If flooring pushed the threshold to/over the effective window it can
-        # never be reached. Trigger at 85% of the effective input budget so a
-        # minimum-context model rides most of its budget before compacting
-        # instead of wasting half.
-        if effective_window > 0 and floored >= effective_window:
-            return max(1, min(int(effective_window * ContextCompressor._MIN_CTX_TRIGGER_RATIO),
-                              effective_window - 1))
-        return floored
     def __init__(
         self,
         model: str,
         # zettlab-overlay(context-budget): match CLI and direct gateway initialization; upstream: none
-        threshold_percent: float = 0.85,
+        threshold_percent: float = 0.90,
         protect_first_n: int = 3,
         protect_last_n: int = 20,
         summary_target_ratio: float = 0.20,
@@ -2257,7 +2176,8 @@ class ContextCompressor(ContextEngine):
         abort_on_summary_failure: bool = False,
         max_tokens: int | None = None,
         model_thresholds: dict[str, float] | None = None,
-        threshold_tokens_cap: Any = None,
+        # zettlab-overlay(context-budget): standard working budget is 272000 * 90%; upstream: none
+        threshold_tokens_cap: Any = 244_800,
         proactive_prune_tokens: int = 0,
         proactive_prune_min_result_chars: int = 8000,
         proactive_prune_min_reclaim_tokens: int = 4096,
@@ -2268,15 +2188,8 @@ class ContextCompressor(ContextEngine):
         self.api_key = api_key
         self.provider = provider
         self.api_mode = api_mode
-        # Per-model threshold overrides (longest substring match wins).
-        # Stored as a plain dict; resolved in _resolve_threshold(), then the
-        # small-context floor is applied on top.
         self.model_thresholds = model_thresholds or {}
-        # _config_threshold_percent is the raw config value (before per-model
-        # override or small-context floor). Used as the fallback when switching
-        # to a model with no matching override.
         self._config_threshold_percent = threshold_percent
-        # Resolve per-model override first, then apply the small-context floor.
         self._base_threshold_percent = resolve_model_threshold(
             model, self.model_thresholds, threshold_percent,
         )
