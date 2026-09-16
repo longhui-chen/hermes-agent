@@ -1,3 +1,3 @@
 """Pinned root Chat UI contract snapshot for cross-repo drift checks."""
 
-CHAT_UI_GOLDEN_SNAPSHOT_SHA256 = "6a4b78a64ae4c87c472c31cd382f78b86308b2e74db6e0f6eb6fe3884a345a6a"
+CHAT_UI_GOLDEN_SNAPSHOT_SHA256 = "8fe578c799e411178ea1a461a202db34cb8af3e477e9134bbb65e23c44090e68"

@@ -7066,8 +7066,8 @@ class APIServerAdapter(BasePlatformAdapter):
             await response.write(f"data: {json.dumps(role_chunk)}\n\n".encode())
             last_activity = time.monotonic()
 
-            # Helper — route a queue item to the correct SSE event.
-            async def _emit(item):
+            # zettlab-overlay(BT): route consumed items through the adapter hook; upstream: https://github.com/longhui-chen/hermes-agent/pull/1
+            async def _emit(item, _projected=False):
                 """Write a single queue item to the SSE stream.
 
                 Plain strings are sent as normal ``delta.content`` chunks.
@@ -7078,6 +7078,13 @@ class APIServerAdapter(BasePlatformAdapter):
                 #16588 for the ``toolCallId``/``status`` lifecycle fields.
                 """
                 semantic_event = None
+                # zettlab-overlay(BT): project after streamed_text_parts append; upstream: https://github.com/longhui-chen/hermes-agent/pull/1
+                if not _projected and (isinstance(item, str) or isinstance(item, tuple)):
+                    if isinstance(item, str):
+                        streamed_text_parts.append(item)
+                    for projected in getattr(self, "_project_stream_item", lambda value: (value,))(item):
+                        await _emit(projected, True)
+                    return time.monotonic()
                 if isinstance(item, tuple) and len(item) == 2 and item[0] == "__tool_progress__":
                     # Keep browserState's wire representation identical to its
                     # UTF-8 byte-budget calculation.  ASCII escaping can triple
@@ -7116,7 +7123,6 @@ class APIServerAdapter(BasePlatformAdapter):
                     )
                 else:
                     if isinstance(item, str):
-                        streamed_text_parts.append(item)
                         if semantic_event is None:
                             if prestream_timing is not None:
                                 prestream_timing.observe_queued_semantic("content")
@@ -7129,6 +7135,8 @@ class APIServerAdapter(BasePlatformAdapter):
                         "id": completion_id, "object": "chat.completion.chunk",
                         "created": created, "model": model,
                         "choices": [{"index": 0, "delta": {"content": item}, "finish_reason": None}],
+                        # zettlab-overlay(BT): carry adapter-owned optional chunk fields; upstream: https://github.com/longhui-chen/hermes-agent/pull/1
+                        **getattr(item, "wire_fields", {}),
                     }
                     await response.write(f"data: {json.dumps(content_chunk)}\n\n".encode())
                 if prestream_timing is not None:
@@ -7245,6 +7253,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 # once before the terminal chunk.
                 await _emit(final_response)
 
+            # zettlab-overlay(BT): pre-finish frames share the B1 terminal seam; upstream: https://github.com/longhui-chen/hermes-agent/pull/1
+            for projected in getattr(self, "_pre_finish_frames", lambda result: ())(result_dict):
+                await _emit(projected, True)
             # Finish chunk
             finish_chunk = {
                 "id": completion_id, "object": "chat.completion.chunk",

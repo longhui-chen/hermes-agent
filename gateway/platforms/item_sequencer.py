@@ -69,15 +69,9 @@ generate_uuid7 = uuid7
 new_uuid7 = uuid7
 
 
-def _utf8_size(value: str) -> int:
-    if len(value) > MAX_SNAPSHOT_BYTES:
-        return MAX_SNAPSHOT_BYTES + 1
-    return len(value.encode("utf-8"))
-
-
 def _frame_data(frame: Mapping[str, Any]) -> MutableMapping[str, Any]:
     data = frame.get("data")
-    if isinstance(data, MutableMapping):
+    if isinstance(data, Mapping):
         return dict(data)
     return dict(frame)
 
@@ -151,30 +145,18 @@ class ItemSequencer:
     def _reject(self, reason: str) -> None:
         raise AdmissionError(reason)
 
-    def _validate_text(self, value: Any) -> str:
+    def _text_size(self, value: Any) -> int:
         if not isinstance(value, str):
             self._reject("text_invalid")
         if len(value) > self.max_snapshot_bytes:
             self._reject("text_oversize")
         try:
-            encoded = value.encode("utf-8")
+            size = len(value.encode("utf-8", "strict"))
         except UnicodeError:
             self._reject("text_invalid")
-        if len(encoded) > self.max_snapshot_bytes:
+        if size > self.max_snapshot_bytes:
             self._reject("text_oversize")
-        return value
-
-    def _validate_canonical(self, value: Any) -> str:
-        if not isinstance(value, str):
-            self._reject("text_invalid")
-        if len(value) > self.max_snapshot_bytes:
-            return value
-        try:
-            if len(value.encode("utf-8")) > self.max_snapshot_bytes:
-                return value
-        except UnicodeError:
-            self._reject("text_invalid")
-        return value
+        return size
 
     def _identity_ok(self, identity: str) -> None:
         if len(identity) > MAX_IDENTITY_BYTES:
@@ -182,7 +164,7 @@ class ItemSequencer:
         try:
             size = len(identity.encode("utf-8"))
         except UnicodeError:
-            self._reject("identity_missing")
+            self._reject("text_invalid")
         if size > MAX_IDENTITY_BYTES:
             self._reject("identity_oversize")
 
@@ -192,24 +174,12 @@ class ItemSequencer:
             self._reject("capacity")
 
     def _new(self, kind: str, identity: str) -> _Item:
-        if len(identity.encode("utf-8")) > MAX_IDENTITY_BYTES:
-            self._reject("identity_oversize")
-        if self.next_index >= self.max_items:
-            self._reject("capacity")
         item = _Item(uuid7(), self.next_index, kind, identity)
         self.next_index += 1
         self.items[identity] = item
-        self.kind_counts[kind] = self.kind_counts.get(kind, 0) + 1
+        if kind in ("text", "reasoning"):
+            self.kind_counts[kind] = self.kind_counts.get(kind, 0) + 1
         return item
-
-    def _ensure(self, kind: str, identity: str) -> tuple[_Item, bool]:
-        item = self.items.get(identity)
-        if item is not None:
-            if item.kind != kind:
-                self._count("item_identity_collision")
-                raise ValueError("item identity reused for another kind")
-            return item, False
-        return self._new(kind, identity), True
 
     def _lifecycle(self, kind: str, item: _Item, completed: bool = False, **extra: Any) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -243,10 +213,6 @@ class ItemSequencer:
             return []
         value = snapshot if snapshot is not None else item.text
         omitted = item.snapshot_omitted if snapshot is None else False
-        if value is not None and (len(value) > self.max_snapshot_bytes or len(value.encode("utf-8")) > self.max_snapshot_bytes):
-            value = None
-            omitted = True
-            item.snapshot_omitted = True
         payload: dict[str, Any] = self._lifecycle(
             kind,
             item,
@@ -263,19 +229,6 @@ class ItemSequencer:
         item.chunks = []
         item.bytes_total = 0
         return [payload]
-
-    def _switch(self, kind: str) -> list[dict[str, Any]]:
-        other = "reasoning" if kind == "text" else "text"
-        if kind not in self.open_items and self.next_index >= self.max_items:
-            self._reject("capacity")
-        out = self._close(other)
-        if kind not in self.open_items:
-            identity = f"{kind}:{self.kind_counts.get(kind, 0)}"
-            item, created = self._ensure(kind, identity)
-            self.open_items[kind] = item
-            if created:
-                out.append(self._lifecycle(kind, item))
-        return out
 
     def _attach(self, frame: Mapping[str, Any], item: _Item, *, version: int | None = None) -> dict[str, Any]:
         data = _frame_data(frame)
@@ -298,11 +251,7 @@ class ItemSequencer:
             value = value.get(part)
         if not isinstance(value, str) or not value:
             return None
-        try:
-            if len(value) > MAX_IDENTITY_BYTES or len(value.encode("utf-8")) > MAX_IDENTITY_BYTES:
-                self._reject("identity_oversize")
-        except UnicodeError:
-            self._reject("identity_missing")
+        self._identity_ok(value)
         # The path is the identity namespace. This intentionally lets
         # steer_accepted and steer_dropped share one row when they carry the
         # same steer_id, while unrelated fields cannot collide.
@@ -326,29 +275,37 @@ class ItemSequencer:
                 identity = f"{kind}:{self.kind_counts.get(kind, 0)}"
             self._identity_ok(identity)
             self._capacity([identity])
-            self._validate_text(value)
+            text_bytes = self._text_size(value)
             normalized = _put_frame_data(frame, {**data, "text": value}) if not isinstance(data.get("text"), str) else frame
-            return Admission(normalized, kind, identity, identity not in self.items, value, len(value.encode("utf-8")))
-        if frame_type in ("tool.start", "tool.result") or "toolCallId" in data or "tool_call_id" in data:
+            return Admission(normalized, kind, identity, identity not in self.items, value, text_bytes)
+        if frame_type in ("tool.start", "tool.result"):
             tool_id = data.get("toolCallId") or data.get("tool_call_id") or data.get("call_id")
             if not isinstance(tool_id, str) or not tool_id:
                 self._reject("identity_missing")
+            self._identity_ok(tool_id)
             identity = f"tool:{tool_id}"
             self._identity_ok(identity)
             self._capacity([identity])
             return Admission(frame, "tool", identity, identity not in self.items)
         if frame_type in ("hermes.todo", "todo.update"):
             self._capacity(["todo:turn"])
-            return Admission(frame, "todo", "todo:turn", "todo:turn" not in self.items, version_next=(self._todo.version + 1 if self._todo else 1))
+            version = self._todo.version + 1 if self._todo else 1
+            if version >= MAX_VERSION:
+                self._reject("capacity")
+            return Admission(frame, "todo", "todo:turn", "todo:turn" not in self.items, version_next=version)
         if frame_type in ("hermes.delegation.progress", "delegation.status"):
             child = data.get("subagent_id")
             if not isinstance(child, str) or not child:
                 self._reject("identity_missing")
+            self._identity_ok(child)
             identity = f"subagent:{child}"
             self._identity_ok(identity)
             self._capacity([identity])
-            return Admission(frame, "subagent", identity, identity not in self.items, version_next=(self.items.get(identity).version + 1 if identity in self.items else 1))
-        identity = self._extension_identity(str(frame_type), data)
+            version = self.items[identity].version + 1 if identity in self.items else 1
+            if version >= MAX_VERSION:
+                self._reject("capacity")
+            return Admission(frame, "subagent", identity, identity not in self.items, version_next=version)
+        identity = self._extension_identity(frame_type, data)
         if identity is None and frame_type in self.identity_fields:
             self._reject("identity_missing")
         if identity is None:
@@ -380,8 +337,6 @@ class ItemSequencer:
             if frame.get("type") == "tool.start" or data.get("status") == "running":
                 out.extend(self._close("reasoning"))
                 out.extend(self._close("text"))
-                self.open_items[kind] = item
-                out.append(self._lifecycle(kind, item))
         if admission.version_next is not None:
             item.version = admission.version_next
             if kind == "todo":
@@ -392,8 +347,6 @@ class ItemSequencer:
             out.append(_put_frame_data(frame, {**_frame_data(frame), "index": item.index}))
         else:
             out.append(self._attach(frame, item, version=admission.version_next))
-        if kind == "tool" and frame.get("type") == "tool.result":
-            out.extend(self._close(kind))
         return out
 
     def process(self, frame: Any) -> list[Any]:
@@ -413,12 +366,9 @@ class ItemSequencer:
     sequence = process
     feed = process
 
-    def open_item(self, kind: str, identity: str) -> dict[str, Any]:
-        item, _ = self._ensure(kind, identity)
-        self.open_items[kind] = item
-        return self._lifecycle(kind, item)
-
     def close_item(self, kind: str, *, snapshot: str | None = None) -> dict[str, Any] | None:
+        if snapshot is not None:
+            self._text_size(snapshot)
         frames = self._close(kind, snapshot=snapshot)
         return frames[0] if frames else None
 
