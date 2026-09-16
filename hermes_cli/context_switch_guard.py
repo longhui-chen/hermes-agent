@@ -34,32 +34,10 @@ def _estimate_tokens(agent: Any, messages: Optional[List[dict]]) -> Optional[int
     if cc is None:
         return None
 
-    if messages is not None:
-        protect = int(getattr(cc, "protect_first_n", 3)) + int(
-            getattr(cc, "protect_last_n", 20)
-        ) + 1
-        if len(messages) <= protect:
-            return None
-        try:
-            from agent.model_metadata import estimate_request_tokens_rough
-
-            system_prompt = getattr(agent, "_cached_system_prompt", None) or ""
-            tools = getattr(agent, "tools", None)
-            return int(
-                estimate_request_tokens_rough(
-                    messages,
-                    system_prompt=system_prompt,
-                    tools=tools or None,
-                )
-            )
-        except Exception:
-            pass
-
-    last = int(getattr(cc, "last_prompt_tokens", 0) or 0)
-    if last > 0:
-        return last
-    session_prompt = int(getattr(agent, "session_prompt_tokens", 0) or 0)
-    return session_prompt if session_prompt > 0 else None
+    if getattr(cc, "awaiting_real_usage_after_compression", False) is True:
+        return None
+    last = getattr(cc, "last_real_prompt_tokens", 0)
+    return last if isinstance(last, int) and last > 0 else None
 
 
 def merge_preflight_compression_warning(
@@ -136,10 +114,10 @@ def merge_preflight_compression_warning(
             f"Context window shrinks ({old_ctx:,} → {new_ctx:,}). "
         )
     parts.append(
-        f"Session is ~{estimate:,} tokens; "
+        f"Previous route measured {estimate:,} input tokens; "
         f"{result.new_model} allows {new_ctx:,} "
         f"(auto-compress at ~{new_threshold:,}). "
-        f"Your next message will run preflight compression before the model replies."
+        f"The new route must measure its own input before deciding on compression."
     )
     _append_warning(result, "".join(parts))
 

@@ -454,7 +454,7 @@ class TestPreflightCompression:
             focus_topic=None,
             force=False,
             memory_context="",
-            token_estimator=None,
+            token_estimator=None, payload_size=None,
         ):
             events.append(("compress", "started"))
             return [{"role": "user", "content": f"{SUMMARY_PREFIX}\nPrevious conversation"}]

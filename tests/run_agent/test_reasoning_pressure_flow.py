@@ -56,7 +56,6 @@ def test_long_think_short_tool_does_not_cause_false_compaction(agent, echo, with
 
     if with_usage:
         assert compressor.last_real_prompt_tokens == 1000
-        assert compressor.last_rough_tokens_when_real_prompt_fit > 0
         assert compressor.compression_count == 0
 
 
@@ -102,6 +101,8 @@ def test_large_tool_growth_never_promotes_characters_to_tokens(agent, usage):
         return result
     agent.client.chat.completions.create.side_effect = respond
     with (
+        patch('agent.conversation_loop.estimate_messages_tokens_rough', side_effect=AssertionError('no history tokenization')),
+        patch('agent.conversation_loop.estimate_request_tokens_rough', side_effect=AssertionError('no request tokenization')),
         patch.object(agent, '_compress_context', side_effect=AssertionError('false compaction')),
         patch.object(agent, '_persist_session'), patch.object(agent, '_save_trajectory'),
         patch.object(agent, '_cleanup_task_resources'),

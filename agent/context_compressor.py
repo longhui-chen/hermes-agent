@@ -1377,8 +1377,6 @@ class ContextCompressor(ContextEngine):
         self._last_summary_error = None
         self._last_compress_aborted = False
         self.last_real_prompt_tokens = 0
-        self.last_compression_rough_tokens = 0
-        self.last_rough_tokens_when_real_prompt_fit = 0
         self.awaiting_real_usage_after_compression = False
         self._last_compression_telemetry = None
         self._active_compression_telemetry = None
@@ -1632,8 +1630,6 @@ class ContextCompressor(ContextEngine):
         self._context_probed = False
         self._context_probe_persistable = False
         self.last_real_prompt_tokens = 0
-        self.last_compression_rough_tokens = 0
-        self.last_rough_tokens_when_real_prompt_fit = 0
         self.awaiting_real_usage_after_compression = False
         self._last_compression_telemetry = None
         self._active_compression_telemetry = None
@@ -2067,8 +2063,6 @@ class ContextCompressor(ContextEngine):
         self.last_completion_tokens = 0
         self.last_total_tokens = 0
         self.last_real_prompt_tokens = 0
-        self.last_rough_tokens_when_real_prompt_fit = 0
-        self.last_compression_rough_tokens = 0
         self.awaiting_real_usage_after_compression = False
         # Strikes were judged against the PREVIOUS threshold; a recomputed
         # trigger invalidates them. Keep the durable copy in sync so a
@@ -2297,8 +2291,6 @@ class ContextCompressor(ContextEngine):
         self.last_prompt_tokens = 0
         self.last_completion_tokens = 0
         self.last_real_prompt_tokens = 0
-        self.last_compression_rough_tokens = 0
-        self.last_rough_tokens_when_real_prompt_fit = 0
         self.awaiting_real_usage_after_compression = False
 
         self.summary_model = summary_model_override or ""
@@ -2385,21 +2377,14 @@ class ContextCompressor(ContextEngine):
         # zettlab-overlay(context-budget): missing usage invalidates the preceding request measurement; upstream: none
         self.last_real_prompt_tokens = self.last_prompt_tokens
         if self.last_prompt_tokens > 0:
-            # zettlab-overlay(context-budget): calibrate only from successful requests; upstream: none
-            request_estimate = usage.get("request_estimated_tokens", 0)
-            if isinstance(request_estimate, int) and request_estimate > 0:
-                self.last_rough_tokens_when_real_prompt_fit = request_estimate
+            # zettlab-overlay(context-budget): remove obsolete character-calibration state; upstream: none
             if self.last_prompt_tokens < self.threshold_tokens:
-                if not request_estimate and self.awaiting_real_usage_after_compression and self.last_compression_rough_tokens > 0:
-                    self.last_rough_tokens_when_real_prompt_fit = self.last_compression_rough_tokens
                 # Any real provider reading below the trigger proves the prompt
                 # fits again. Clear the real-usage effectiveness latch even
                 # when this response was not immediately after compaction. The
                 # independent fallback streak is boundary-scoped and survives
                 # ordinary fitting responses during context regrowth.
                 self._record_ineffective_compression_verdict(0)
-            else:
-                self.last_rough_tokens_when_real_prompt_fit = 0
 
             # Anti-thrashing verdict, judged HERE because this is the only place
             # that sees the provider's real prompt count for the just-compacted
@@ -4963,6 +4948,8 @@ This compaction should PRIORITISE preserving all information related to the focu
     def _find_tail_cut_by_tokens(
         self, messages: List[Dict[str, Any]], head_end: int,
         token_budget: int | None = None,
+        # zettlab-overlay(context-budget): optional literal size measure keeps legacy callers compatible; upstream: none
+        size_measure=None,
     ) -> int:
         """Walk backward from the end of messages, accumulating tokens until
         the budget is reached. Returns the index where the tail starts.
@@ -5003,7 +4990,8 @@ This compaction should PRIORITISE preserving all information related to the focu
 
         for i in range(n - 1, head_end - 1, -1):
             msg = messages[i]
-            msg_tokens = _estimate_msg_budget_tokens(msg)
+            # zettlab-overlay(context-budget): keep literal payload size separate from provider token capacity; upstream: none
+            msg_tokens = size_measure(msg) if size_measure else _estimate_msg_budget_tokens(msg)
             # Stop once we exceed the soft ceiling (unless we haven't hit min_tail yet)
             if accumulated + msg_tokens > soft_ceiling and (n - i) >= min_tail:
                 break
@@ -5029,7 +5017,8 @@ This compaction should PRIORITISE preserving all information related to the focu
             raw_accumulated = 0
             for j in range(n - 1, head_end - 1, -1):
                 raw_msg = messages[j]
-                raw_tok = _estimate_msg_budget_tokens(raw_msg)
+                # zettlab-overlay(context-budget): keep literal payload size separate from provider token capacity; upstream: none
+                raw_tok = size_measure(raw_msg) if size_measure else _estimate_msg_budget_tokens(raw_msg)
                 if raw_accumulated + raw_tok > raw_budget and (n - j) >= min_tail:
                     cut_idx = j
                     break
@@ -5877,6 +5866,7 @@ This compaction should PRIORITISE preserving all information related to the focu
         memory_context: str = "",
         # zettlab-overlay(context-budget): compare candidates with the host replay policy; upstream: none
         token_estimator=None,
+        payload_size=None,
     ) -> List[Dict[str, Any]]:
         """Compress conversation messages by summarizing middle turns.
 
@@ -5967,18 +5957,20 @@ This compaction should PRIORITISE preserving all information related to the focu
                 )
             return messages
 
-        display_tokens = current_tokens if current_tokens else self.last_prompt_tokens or estimate_messages_tokens_rough(messages)
+        display_tokens = current_tokens or max(0, self.last_prompt_tokens)
 
         # zettlab-overlay(context-budget): align compaction with actual request and preserve task state; upstream: none
         # Keep the original until a candidate actually reduces context pressure.
         original_messages = messages
-        estimate_budget = token_estimator or estimate_messages_tokens_rough
+        estimate_budget = payload_size or token_estimator or estimate_messages_tokens_rough
+        size_unit = "bytes" if payload_size else "estimated tokens"
         original_estimate = estimate_budget(messages)
 
         # Phase 1: Prune old tool results (cheap, no LLM call)
         messages, pruned_count = self._prune_old_tool_results(
             messages, protect_tail_count=self.protect_last_n,
-            protect_tail_tokens=self.tail_token_budget,
+            # zettlab-overlay(context-budget): keep literal payload size separate from provider token capacity; upstream: none
+            protect_tail_tokens=None if payload_size else self.tail_token_budget,
         )
         if pruned_count and not self.quiet_mode:
             logger.info("Pre-compression: pruned %d old tool result(s)", pruned_count)
@@ -6001,7 +5993,15 @@ This compaction should PRIORITISE preserving all information related to the focu
         compress_start = self._align_boundary_forward(messages, compress_start)
 
         # Use token-budget tail protection instead of fixed message count
-        compress_end = self._find_tail_cut_by_tokens(messages, compress_start)
+        # zettlab-overlay(context-budget): partition bytes by the existing tail ratio, not window tokens; upstream: none
+        if payload_size:
+            compress_end = self._find_tail_cut_by_tokens(
+                messages, compress_start,
+                token_budget=max(1, int(original_estimate * self.summary_target_ratio)),
+                size_measure=lambda message: payload_size([message]),
+            )
+        else:
+            compress_end = self._find_tail_cut_by_tokens(messages, compress_start)
 
         # A double role collision can merge the summary into the first tail
         # row. Keep an actionable user event out of that position by retaining
@@ -6229,7 +6229,8 @@ This compaction should PRIORITISE preserving all information related to the focu
         # Skipped when ``force=True`` (manual /compress) so auth/error
         # handling paths are always exercised on explicit user request.
         feasibility_skip = False
-        if not force and self._ineffective_compression_count >= 1:
+        # zettlab-overlay(context-budget): measured path never drops history based on estimated token feasibility; upstream: none
+        if payload_size is None and not force and self._ineffective_compression_count >= 1:
             # _record_compression_regions already estimated this exact window
             # into the telemetry dict above; reuse it so the log line and
             # telemetry can never disagree. The regions helper no-ops when the
@@ -6638,7 +6639,7 @@ This compaction should PRIORITISE preserving all information related to the focu
 
         new_estimate = estimate_budget(compressed)
         # zettlab-overlay(context-budget): align compaction with actual request and preserve task state; upstream: none
-        if current_tokens and not force and new_estimate >= original_estimate:
+        if (payload_size or current_tokens) and not force and new_estimate >= original_estimate:
             # An expanded checkpoint is not a successful automatic compaction.
             # Reuse the existing breaker; no second cooldown or retry loop.
             self.compression_count -= 1
@@ -6650,8 +6651,8 @@ This compaction should PRIORITISE preserving all information related to the focu
             )
             telemetry["failure_class"] = "no_token_savings"
             logger.warning(
-                "Discarding ineffective compaction: ~%s -> ~%s tokens",
-                original_estimate, new_estimate,
+                "Discarding ineffective compaction: %s -> %s %s",
+                original_estimate, new_estimate, size_unit,
             )
             return original_messages
 
@@ -6678,10 +6679,13 @@ This compaction should PRIORITISE preserving all information related to the focu
 
         if not self.quiet_mode:
             logger.info(
-                "Compressed: %d -> %d messages (~%d tokens saved, %.0f%%)",
+                # zettlab-overlay(context-budget): keep literal payload size separate from provider token capacity; upstream: none
+                "Compressed: %d -> %d messages (%d %s saved, %.0f%%)",
                 n_messages,
                 len(compressed),
                 saved_estimate,
+                # zettlab-overlay(context-budget): keep literal payload size separate from provider token capacity; upstream: none
+                size_unit,
                 savings_pct,
             )
             logger.info("Compression #%d complete", self.compression_count)

@@ -620,8 +620,9 @@ is billing information, not an extra input charge. No local tokenizer is added.
 This intentionally differs from Codex's estimated-new-items accounting. A sudden
 large tool result can cause one rejected request before bounded recovery. It does
 not justify repeatedly summarizing fitting contexts. Missing usage must not become
-a fabricated precise count. Character estimates remain available for diagnostics
-and summary partitioning, never as automatic trigger evidence. Manual `/compress`
+a fabricated precise count. Legacy estimates remain only in upstream diagnostics, auxiliary summary output
+budget sizing and optional plugin/micro-compaction paths, never as automatic
+capacity evidence in the built-in batch-compaction path. Manual `/compress`
 and optional plugin engines retain their existing contracts.
 
 The runtime keeps only existing scalar usage state (no additional resident cache,
@@ -629,3 +630,33 @@ model, or tokenizer). Protocol, auth scope, device YAML ownership and dependenci
 are unchanged. Reliability tradeoff: bounded explicit-overflow recovery instead of
 proactive destructive guesses. Randomized state transitions and a real agent loop
 with the provider boundary mocked must validate these invariants.
+
+### Removal of character-derived capacity decisions
+
+Operating envelope: only provider usage measures model input occupancy. Missing
+usage remains unknown; byte counts measure payload size, not model capacity.
+
+| Consumer | Allowed signal | Unknown / overflow behavior |
+|---|---|---|
+| Active and optional idle compaction | Latest provider input usage | Wait for usage, bounded explicit-overflow recovery |
+| Reference-model advisory request | Original advisory transcript | Provider rejection becomes failed advice, never guessed history removal |
+| File/reference injection | Explicit UTF-8 payload byte cap | Reject oversize attachment with path preserved, independent of route window |
+| Capacity display | Provider usage | Explicit unmeasured status; component sizes in bytes |
+| Model-switch warning | Previous route's measured input | State that the new route must measure again, no guaranteed compaction claim |
+
+The attachment byte envelope is 1 MiB total and at most 16 references per message.
+These are device resource limits, not inferred token limits. Expansion is sequential
+and stops at the total envelope; file reads are bounded before decoding. Existing
+owner/path/credential restrictions and tool-output resource limits remain intact.
+The change adds no tokenizer, resident model, network count call, or new history.
+Old optional token-attribution fields stay zero/unknown for wire compatibility.
+
+Built-in batch compaction compares the replay-projected UTF-8 size before/after,
+including same-message-count overflow recovery. Recent-tail partitioning uses the
+existing summary target ratio of that payload size, preserving tool-pair and latest
+user-message boundaries. It does not compare bytes with the model token window.
+The old estimated-token feasibility shortcut cannot skip summarization and drop
+history on this path. Final compaction effectiveness still awaits provider usage.
+Upstream auxiliary summary output-budget sizing and experimental micro compaction
+are separate policies; this change does not claim to remove every estimator from
+the repository. Old calibration fields and normal-request/post-tool scans are gone.

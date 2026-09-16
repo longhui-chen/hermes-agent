@@ -2345,6 +2345,7 @@ export const ja = defineLocale({
           system_prompt: 'システムプロンプト',
           tool_definitions: 'ツール定義'
         },
+        unmeasured: 'まだ計測されていません',
         empty: 'コンテキストデータはまだありません',
         loading: '内訳を読み込み中…',
         percentFull: percent => `${percent}% 使用中`,

@@ -11,13 +11,16 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Awaitable, Callable
 
-from agent.model_metadata import estimate_tokens_rough
 from hermes_cli._subprocess_compat import IS_WINDOWS, windows_hide_flags
 
 _QUOTED_REFERENCE_VALUE = r'(?:`[^`\n]+`|"[^"\n]+"|\'[^\'\n]+\')'
 REFERENCE_PATTERN = re.compile(
     rf"(?<![\w/])@(?:(?P<simple>diff|staged)\b|(?P<kind>file|folder|git|url):(?P<value>{_QUOTED_REFERENCE_VALUE}(?::\d+(?:-\d+)?)?|\S+))"
 )
+# zettlab-overlay(context-budget): explicit attachment resource envelope, unrelated to token capacity; upstream: none
+MAX_REFERENCE_BYTES = 1024 * 1024
+MAX_CONTEXT_REFERENCES = 16
+
 TRAILING_PUNCTUATION = ",.;!?"
 _NEEDS_QUOTING = re.compile(r"""[\s()\[\]{}<>"'`]""")
 _SENSITIVE_HOME_DIRS = (".ssh", ".aws", ".gnupg", ".kube", ".docker", ".azure", ".config/gh")
@@ -56,7 +59,9 @@ class ContextReferenceResult:
     original_message: str
     references: list[ContextReference] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
-    injected_tokens: int = 0
+    injected_tokens: int = 0  # Deprecated: unmeasured, never guessed.
+    # zettlab-overlay(context-budget): report literal attachment size without changing legacy fields; upstream: none
+    injected_bytes: int = 0
     expanded: bool = False
     blocked: bool = False
 
@@ -166,52 +171,31 @@ async def preprocess_context_references_async(
     )
     warnings: list[str] = []
     blocks: list[str] = []
-    injected_tokens = 0
-
-    # Expand all references concurrently. Each _expand_reference is independent
-    # (no shared state during expansion) — a message with several @url: refs
-    # would otherwise pay one full web_extract round-trip per ref in series.
-    # gather preserves positional order, so we reassemble warnings/blocks in the
-    # original ref order exactly as the prior serial loop did; the token-budget
-    # check below is unchanged (it runs once, after all refs are expanded).
-    expanded = await asyncio.gather(
-        *(
-            _expand_reference(
-                ref,
-                cwd_path,
-                url_fetcher=url_fetcher,
-                allowed_root=allowed_root_path,
-            )
-            for ref in refs
+    # zettlab-overlay(context-budget): bounded attachment expansion uses bytes, not model-window fractions; upstream: none
+    injected_bytes = 0
+    if len(refs) > MAX_CONTEXT_REFERENCES:
+        return ContextReferenceResult(
+            message=message, original_message=message, references=refs,
+            warnings=[f"At most {MAX_CONTEXT_REFERENCES} context references may be attached at once."],
+            blocked=True,
         )
-    )
-    for warning, block in expanded:
+    # Sequential expansion bounds retained payload and stops before more reads.
+    for ref in refs:
+        warning, block = await _expand_reference(
+            ref, cwd_path, url_fetcher=url_fetcher, allowed_root=allowed_root_path,
+        )
         if warning:
             warnings.append(warning)
         if block:
+            # zettlab-overlay(context-budget): keep literal payload size separate from provider token capacity; upstream: none
+            injected_bytes += len(block.encode("utf-8"))
+            if injected_bytes > MAX_REFERENCE_BYTES:
+                return ContextReferenceResult(
+                    message=message, original_message=message, references=refs,
+                    warnings=warnings + [f"Attachment payload exceeds the {MAX_REFERENCE_BYTES}-byte device resource limit; use file tools to read sections."],
+                    injected_bytes=injected_bytes, blocked=True,
+                )
             blocks.append(block)
-            injected_tokens += estimate_tokens_rough(block)
-
-    hard_limit = max(1, int(context_length * 0.50))
-    soft_limit = max(1, int(context_length * 0.25))
-    if injected_tokens > hard_limit:
-        warnings.append(
-            f"@ context injection refused: {injected_tokens} tokens exceeds the 50% hard limit ({hard_limit})."
-        )
-        return ContextReferenceResult(
-            message=message,
-            original_message=message,
-            references=refs,
-            warnings=warnings,
-            injected_tokens=injected_tokens,
-            expanded=False,
-            blocked=True,
-        )
-
-    if injected_tokens > soft_limit:
-        warnings.append(
-            f"@ context injection warning: {injected_tokens} tokens exceeds the 25% soft limit ({soft_limit})."
-        )
 
     # Leave the `@file:`/`@folder:` tokens where the user typed them. The token
     # IS the reference, not scaffolding around it: clients render each one as an
@@ -229,12 +213,14 @@ async def preprocess_context_references_async(
         original_message=message,
         references=refs,
         warnings=warnings,
-        injected_tokens=injected_tokens,
+        # zettlab-overlay(context-budget): keep literal payload size separate from provider token capacity; upstream: none
+        injected_bytes=injected_bytes,
         expanded=bool(blocks or warnings),
         blocked=False,
     )
 
 
+# zettlab-overlay(context-budget): attachment labels report bytes instead of guessed tokens; upstream: none
 async def _expand_reference(
     ref: ContextReference,
     cwd: Path,
@@ -258,13 +244,15 @@ async def _expand_reference(
             content = await _fetch_url_content(ref.target, url_fetcher=url_fetcher)
             if not content:
                 return f"{ref.raw}: no content extracted", None
-            return None, f"🌐 {ref.raw} ({estimate_tokens_rough(content)} tokens)\n{content}"
+            # zettlab-overlay(context-budget): keep literal payload size separate from provider token capacity; upstream: none
+            return None, f"🌐 {ref.raw} ({len(content.encode('utf-8'))} bytes)\n{content}"
     except Exception as exc:
         return f"{ref.raw}: {exc}", None
 
     return f"{ref.raw}: unsupported reference type", None
 
 
+# zettlab-overlay(context-budget): attachment labels report bytes instead of guessed tokens; upstream: none
 def _expand_file_reference(
     ref: ContextReference,
     cwd: Path,
@@ -287,7 +275,12 @@ def _expand_file_reference(
         # so it can read/convert/view the file itself.
         return None, _binary_reference_block(ref, path)
 
-    text = path.read_text(encoding="utf-8")
+    # zettlab-overlay(context-budget): cap local file reads before allocation and decoding; upstream: none
+    with path.open("rb") as stream:
+        raw = stream.read(MAX_REFERENCE_BYTES + 1)
+    if len(raw) > MAX_REFERENCE_BYTES:
+        return f"{ref.raw}: file exceeds {MAX_REFERENCE_BYTES} bytes; use file tools to read sections", None
+    text = raw.decode("utf-8")
     if ref.line_start is not None:
         lines = text.splitlines()
         start_idx = max(ref.line_start - 1, 0)
@@ -296,9 +289,11 @@ def _expand_file_reference(
 
     lang = _code_fence_language(path)
     label = ref.raw
-    return None, f"📄 {label} ({estimate_tokens_rough(text)} tokens)\n```{lang}\n{text}\n```"
+    # zettlab-overlay(context-budget): keep literal payload size separate from provider token capacity; upstream: none
+    return None, f"📄 {label} ({len(text.encode('utf-8'))} bytes)\n```{lang}\n{text}\n```"
 
 
+# zettlab-overlay(context-budget): attachment labels report bytes instead of guessed tokens; upstream: none
 def _expand_folder_reference(
     ref: ContextReference,
     cwd: Path,
@@ -313,9 +308,11 @@ def _expand_folder_reference(
         return f"{ref.raw}: path is not a folder", None
 
     listing = _build_folder_listing(path, cwd)
-    return None, f"📁 {ref.raw} ({estimate_tokens_rough(listing)} tokens)\n{listing}"
+    # zettlab-overlay(context-budget): keep literal payload size separate from provider token capacity; upstream: none
+    return None, f"📁 {ref.raw} ({len(listing.encode('utf-8'))} bytes)\n{listing}"
 
 
+# zettlab-overlay(context-budget): attachment labels report bytes instead of guessed tokens; upstream: none
 def _expand_git_reference(
     ref: ContextReference,
     cwd: Path,
@@ -341,7 +338,8 @@ def _expand_git_reference(
     content = result.stdout.strip()
     if not content:
         content = "(no output)"
-    return None, f"🧾 {label} ({estimate_tokens_rough(content)} tokens)\n```diff\n{content}\n```"
+    # zettlab-overlay(context-budget): keep literal payload size separate from provider token capacity; upstream: none
+    return None, f"🧾 {label} ({len(content.encode('utf-8'))} bytes)\n```diff\n{content}\n```"
 
 
 async def _fetch_url_content(
@@ -483,7 +481,9 @@ def _is_binary_file(path: Path) -> bool:
         path.name.endswith(ext) for ext in (".py", ".md", ".txt", ".json", ".yaml", ".yml", ".toml", ".js", ".ts")
     ):
         return True
-    chunk = path.read_bytes()[:4096]
+    # zettlab-overlay(context-budget): binary detection must not read the entire attachment; upstream: none
+    with path.open("rb") as stream:
+        chunk = stream.read(4096)
     return b"\x00" in chunk
 
 
@@ -579,7 +579,8 @@ def _binary_reference_block(ref: ContextReference, path: Path) -> str:
 
 
 def _file_metadata(path: Path) -> str:
-    if _is_binary_file(path):
+    # zettlab-overlay(context-budget): metadata must not read large files in full; upstream: none
+    if path.stat().st_size > MAX_REFERENCE_BYTES or _is_binary_file(path):
         return f"{path.stat().st_size} bytes"
     try:
         line_count = path.read_text(encoding="utf-8").count("\n") + 1

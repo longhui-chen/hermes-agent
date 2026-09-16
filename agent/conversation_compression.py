@@ -72,7 +72,7 @@ from agent.context_engine import (
     sanitize_memory_context,
 )
 # zettlab-overlay(context-budget): use provider replay projection for checkpoint accounting; upstream: none
-from agent.model_metadata import estimate_request_tokens_rough, project_messages_for_token_estimate
+from agent.model_metadata import project_messages_for_token_estimate
 from agent.session_activity import ActivityProvenance, normalize_activity_provenance
 
 logger = logging.getLogger(__name__)
@@ -1352,6 +1352,7 @@ def _supported_compression_kwargs(
     memory_context: str,
     # zettlab-overlay(context-budget): optional capability preserves older context engines; upstream: none
     token_estimator=None,
+    payload_size=None,
 ) -> dict:
     """Return only compression kwargs accepted by an engine callable.
 
@@ -1370,6 +1371,8 @@ def _supported_compression_kwargs(
     # zettlab-overlay(context-budget): only offer an estimator when provided; upstream: none
     if token_estimator is not None:
         candidates["token_estimator"] = token_estimator
+    if payload_size is not None:
+        candidates["payload_size"] = payload_size
     try:
         parameters = inspect.signature(compress_fn).parameters
     except (TypeError, ValueError):
@@ -2772,10 +2775,12 @@ def compress_context(
                 pass
 
         # zettlab-overlay(context-budget): candidate savings must exclude display-only traces; upstream: none
-        def estimate_replayed_messages(items):
-            return estimate_request_tokens_rough(project_messages_for_token_estimate(
+        def replayed_payload_bytes(items):
+            projected = project_messages_for_token_estimate(
                 items, getattr(agent, "_copy_reasoning_content_for_api", None),
-            ))
+            )
+            encoder = json.JSONEncoder(ensure_ascii=False, default=str)
+            return sum(len(part.encode("utf-8")) for part in encoder.iterencode(projected))
 
         compress_fn = agent.context_compressor.compress
         compress_kwargs = _supported_compression_kwargs(
@@ -2785,7 +2790,7 @@ def compress_context(
             force=force,
             memory_context=memory_context,
             # zettlab-overlay(context-budget): pass replay estimator when supported; upstream: none
-            token_estimator=estimate_replayed_messages,
+            payload_size=replayed_payload_bytes,
         )
         if memory_context.strip() and "memory_context" not in compress_kwargs:
             engine_name = getattr(
@@ -3492,18 +3497,7 @@ def compress_context(
         agent._last_compression_attempt_in_place = compacted_in_place
         agent._last_compaction_in_place = compacted_in_place
 
-        # Keep the post-compression rough estimate for diagnostics, but do not
-        # treat it as provider-reported prompt usage. Schema-heavy rough estimates
-        # can remain above threshold even after the next real API request fits.
-        # zettlab-overlay(context-budget): keep post-commit baseline on the same replay basis; upstream: none
-        _compressed_est = estimate_request_tokens_rough(
-            project_messages_for_token_estimate(
-                compressed, getattr(agent, "_copy_reasoning_content_for_api", None),
-            ),
-            system_prompt=new_system_prompt or "",
-            tools=agent.tools or None,
-        )
-        agent.context_compressor.last_compression_rough_tokens = _compressed_est
+        # zettlab-overlay(context-budget): invalidate usage without rescanning the compressed history; upstream: none
         agent.context_compressor.last_prompt_tokens = -1
         agent.context_compressor.last_completion_tokens = 0
         agent.context_compressor.awaiting_real_usage_after_compression = True
@@ -3543,9 +3537,9 @@ def compress_context(
             pass
 
         logger.info(
-            "context compression done: session=%s messages=%d->%d rough_tokens=~%s awaiting_real_usage=true",
+            # zettlab-overlay(context-budget): keep literal payload size separate from provider token capacity; upstream: none
+            "context compression done: session=%s messages=%d->%d awaiting_real_usage=true",
             agent.session_id or "none", _pre_msg_count, len(compressed),
-            f"{_compressed_est:,}",
         )
         agent._emit_structured_status(
             "context.compaction",
@@ -3557,7 +3551,9 @@ def compress_context(
                 "before_messages": _pre_msg_count,
                 "after_messages": len(compressed),
                 "before_tokens": approx_tokens,
-                "after_tokens": _compressed_est,
+                # zettlab-overlay(context-budget): keep literal payload size separate from provider token capacity; upstream: none
+                "after_tokens": None,
+                "context_measurement": "unknown",
             },
         )
         _commit_status = "committed" if split_status in {"not_applicable", "in_place_committed", "rotated_committed"} else "aborted"

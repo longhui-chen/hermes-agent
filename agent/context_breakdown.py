@@ -1,9 +1,8 @@
+# zettlab-overlay(context-budget): keep literal payload size separate from provider token capacity; upstream: none
 """Live session context-window breakdown for UI surfaces.
 
-Estimates how the next provider request is composed: system prompt tiers,
-tool schemas, and conversation history. Uses the same rough char/4 heuristic
-as ``agent.model_metadata.estimate_request_tokens_rough`` so numbers align
-with compression thresholds — not exact tokenizer counts.
+Reports provider-measured capacity separately from UTF-8 payload composition.
+Payload bytes are diagnostic only, never a substitute for model token usage.
 """
 
 from __future__ import annotations
@@ -26,18 +25,6 @@ _CATEGORY_COLORS = {
     "memory": "var(--context-usage-memory)",
     "conversation": "var(--context-usage-conversation)",
 }
-
-
-def _chars_to_tokens(text: str) -> int:
-    if not text:
-        return 0
-    return (len(text) + 3) // 4
-
-
-def _json_tokens(value: Any) -> int:
-    if not value:
-        return 0
-    return _chars_to_tokens(json.dumps(value, ensure_ascii=False))
 
 
 def _tool_name(tool: dict) -> str:
@@ -91,7 +78,8 @@ def compute_session_context_breakdown(
     messages: Optional[List[dict]] = None,
 ) -> Dict[str, Any]:
     """Return a Cursor-style context usage breakdown for one live agent."""
-    from agent.model_metadata import estimate_messages_tokens_rough
+    # zettlab-overlay(context-budget): keep literal payload size separate from provider token capacity; upstream: none
+    from agent.model_metadata import _wire_message_shadow
     from agent.system_prompt import build_system_prompt_parts
 
     parts = build_system_prompt_parts(agent)
@@ -112,16 +100,24 @@ def compute_session_context_breakdown(
     tools = list(getattr(agent, "tools", None) or [])
     builtin_tools, mcp_tools, subagent_tools = _split_tools(tools)
 
-    conversation_tokens = estimate_messages_tokens_rough(messages or [])
+    # zettlab-overlay(context-budget): category attribution is literal UTF-8 size, never token occupancy; upstream: none
+    def text_bytes(text):
+        return len(text.encode("utf-8"))
+
+    def json_bytes(value):
+        return sum(text_bytes(chunk) for chunk in json.JSONEncoder(ensure_ascii=False, default=str).iterencode(value))
+
+    conversation_tokens = sum(json_bytes(_wire_message_shadow(m)) for m in messages or [])
 
     categories = [
-        ("system_prompt", "System prompt", _chars_to_tokens(system_prompt_text)),
-        ("tool_definitions", "Tool definitions", _json_tokens(builtin_tools)),
-        ("rules", "Rules", _chars_to_tokens(context)),
-        ("skills", "Skills", _chars_to_tokens(skills_index)),
-        ("mcp", "MCP", _json_tokens(mcp_tools)),
-        ("subagent_definitions", "Subagent definitions", _json_tokens(subagent_tools)),
-        ("memory", "Memory", _chars_to_tokens(memory_text)),
+        # zettlab-overlay(context-budget): keep literal payload size separate from provider token capacity; upstream: none
+        ("system_prompt", "System prompt", text_bytes(system_prompt_text)),
+        ("tool_definitions", "Tool definitions", json_bytes(builtin_tools)),
+        ("rules", "Rules", text_bytes(context)),
+        ("skills", "Skills", text_bytes(skills_index)),
+        ("mcp", "MCP", json_bytes(mcp_tools)),
+        ("subagent_definitions", "Subagent definitions", json_bytes(subagent_tools)),
+        ("memory", "Memory", text_bytes(memory_text)),
         ("conversation", "Conversation", conversation_tokens),
     ]
 
@@ -130,7 +126,10 @@ def compute_session_context_breakdown(
     comp = getattr(agent, "context_compressor", None)
     context_max = int(getattr(comp, "context_length", 0) or 0) if comp else 0
     measured_used = int(getattr(comp, "last_prompt_tokens", 0) or 0) if comp else 0
-    context_used = measured_used if measured_used > 0 else estimated_total
+    # zettlab-overlay(context-budget): missing usage is unknown, not the category byte total; upstream: none
+    context_used = max(0, measured_used)
+    if comp and getattr(comp, "awaiting_real_usage_after_compression", False) is True:
+        context_used = 0
     context_percent = (
         max(0, min(100, round(context_used / context_max * 100)))
         if context_max
@@ -143,7 +142,9 @@ def compute_session_context_breakdown(
                 "color": _CATEGORY_COLORS.get(category_id, "var(--ui-text-tertiary)"),
                 "id": category_id,
                 "label": label,
-                "tokens": tokens,
+                # zettlab-overlay(context-budget): keep literal payload size separate from provider token capacity; upstream: none
+                "tokens": 0,  # Legacy field: category tokens are not measured.
+                "bytes": tokens,
             }
             for category_id, label, tokens in categories
             if tokens > 0
@@ -151,7 +152,11 @@ def compute_session_context_breakdown(
         "context_max": context_max,
         "context_percent": context_percent,
         "context_used": context_used,
-        "estimated_total": estimated_total,
+        # zettlab-overlay(context-budget): keep literal payload size separate from provider token capacity; upstream: none
+        "estimated_total": 0,
+        "total_bytes": estimated_total,
+        "size_unit": "bytes",
+        "context_measurement": "provider" if context_used > 0 else "unknown",
         "model": getattr(agent, "model", "") or "",
     }
 
@@ -181,12 +186,6 @@ _GRID_ROWS = 5  # 100 cells → 1 cell per percent of the context window
 _DETAILS_TABLE_LIMIT = 15
 
 
-def _bytes_to_tokens(size: Optional[int]) -> Optional[int]:
-    if size is None:
-        return None
-    return (int(size) + 3) // 4
-
-
 def compute_context_details(agent: Any) -> Dict[str, Any]:
     """Expanded per-skill / per-toolset cost listing for ``/context all``.
 
@@ -212,8 +211,11 @@ def compute_context_details(agent: Any) -> Dict[str, Any]:
         for entry in _compute_skills_breakdown(skills_block):
             skills.append({
                 "name": entry.get("name", ""),
-                "index_tokens": _bytes_to_tokens(entry.get("index_line_bytes")) or 0,
-                "skill_md_tokens": _bytes_to_tokens(entry.get("skill_md_bytes")),
+                # zettlab-overlay(context-budget): keep literal payload size separate from provider token capacity; upstream: none
+                "index_tokens": 0,
+                "index_bytes": entry.get("index_line_bytes") or 0,
+                "skill_md_tokens": None,
+                "skill_md_bytes": entry.get("skill_md_bytes"),
             })
 
     toolsets: List[Dict[str, Any]] = []
@@ -223,10 +225,13 @@ def compute_context_details(agent: Any) -> Dict[str, Any]:
             toolsets.append({
                 "toolset": group.get("toolset", ""),
                 "tool_count": int(group.get("tool_count", 0) or 0),
-                "schema_tokens": _bytes_to_tokens(group.get("json_bytes")) or 0,
+                # zettlab-overlay(context-budget): keep literal payload size separate from provider token capacity; upstream: none
+                "schema_tokens": 0,
+                "schema_bytes": group.get("json_bytes") or 0,
             })
 
-    return {"skills": skills, "toolsets": toolsets}
+    # zettlab-overlay(context-budget): detail attribution retains byte units; upstream: none
+    return {"skills": skills, "toolsets": toolsets, "size_unit": "bytes"}
 
 
 def render_context_grid(payload: Dict[str, Any]) -> List[str]:
@@ -235,6 +240,13 @@ def render_context_grid(payload: Dict[str, Any]) -> List[str]:
     100 cells (5×20), each one percent of the model context window. Categories
     fill in declaration order; the remainder renders as free space.
     """
+    # zettlab-overlay(context-budget): occupancy grid must not map payload bytes onto model tokens; upstream: none
+    if payload.get("context_measurement") == "unknown":
+        return ["Context usage: not measured"]
+    if payload.get("size_unit") == "bytes":
+        used = min(100, max(0, int(payload.get("context_percent") or 0)))
+        cells = ["▨"] * used + [_FREE_GLYPH] * (100 - used)
+        return [" ".join(cells[i:i + _GRID_COLUMNS]) for i in range(0, 100, _GRID_COLUMNS)]
     context_max = int(payload.get("context_max") or 0)
     categories = payload.get("categories") or []
     total_cells = _GRID_COLUMNS * _GRID_ROWS
@@ -259,6 +271,12 @@ def render_context_grid(payload: Dict[str, Any]) -> List[str]:
 
 def render_context_category_lines(payload: Dict[str, Any]) -> List[str]:
     """Render the 'Estimated usage by category' table as plain-text lines."""
+    # zettlab-overlay(context-budget): byte composition is not a token-capacity percentage; upstream: none
+    if payload.get("size_unit") == "bytes":
+        return ["Payload size by category (bytes, not token occupancy)"] + [
+            f"  {cat['label']}: {cat.get('bytes', 0):,} bytes"
+            for cat in payload.get("categories", [])
+        ]
     categories = payload.get("categories") or []
     context_max = int(payload.get("context_max") or 0)
     estimated_total = int(payload.get("estimated_total") or 0)
@@ -286,6 +304,14 @@ def render_context_category_lines(payload: Dict[str, Any]) -> List[str]:
 
 def render_context_details_lines(details: Dict[str, Any]) -> List[str]:
     """Render the expanded ``/context all`` per-skill / per-toolset tables."""
+    # zettlab-overlay(context-budget): report source file and schema bytes without conversion; upstream: none
+    if details.get("size_unit") == "bytes":
+        lines = ["Source sizes (bytes)"]
+        for group in details.get("toolsets", [])[:_DETAILS_TABLE_LIMIT]:
+            lines.append(f"  {group['toolset']}: {group.get('schema_bytes', 0):,} bytes")
+        for item in details.get("skills", [])[:_DETAILS_TABLE_LIMIT]:
+            lines.append(f"  {item['name']}: index {item.get('index_bytes', 0)} bytes, SKILL.md {item.get('skill_md_bytes', 'unknown')} bytes")
+        return lines
     lines: List[str] = []
 
     toolsets = details.get("toolsets") or []
@@ -340,6 +366,12 @@ def render_context_breakdown_lines(
         lines.append("")
     lines.extend(render_context_category_lines(payload))
 
+    # zettlab-overlay(context-budget): expose unmeasured capacity explicitly; upstream: none
+    if payload.get("context_measurement") == "unknown":
+        lines.append("Context window usage: not measured; waiting for provider usage.")
+        if details is not None:
+            lines.extend(render_context_details_lines(details))
+        return lines
     context_max = int(payload.get("context_max") or 0)
     context_used = int(payload.get("context_used") or 0)
     if context_max > 0:

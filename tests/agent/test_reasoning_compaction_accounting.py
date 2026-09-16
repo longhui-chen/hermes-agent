@@ -74,7 +74,6 @@ def test_successful_usage_calibrates_without_compaction_and_checks_do_not_drift(
             growth = rng.randrange(0, 2000000)
             expected = True
             assert comp.should_defer_rough_estimate_to_real_usage(rough + growth) == expected
-            assert comp.last_rough_tokens_when_real_prompt_fit == rough
     # A provider reading above the trigger overrides an earlier fitting anchor.
     comp.update_from_response({'prompt_tokens': 150001, 'request_estimated_tokens': 200000})
     assert not comp.should_defer_rough_estimate_to_real_usage(200000)
@@ -131,9 +130,9 @@ def test_display_only_reasoning_cannot_disguise_an_expanding_checkpoint():
     before = deepcopy(messages)
     policy = partial(apply_reasoning_content_policy, needs_thinking_pad=False)
     def replay_size(items):
-        return estimate_messages_tokens_rough(project_messages_for_token_estimate(items, policy))
+        return len(str(project_messages_for_token_estimate(items, policy)).encode("utf-8"))
     with patch.object(comp, '_generate_summary', return_value='expanded checkpoint ' * 100):
-        result = comp.compress(messages, current_tokens=160000, token_estimator=replay_size)
+        result = comp.compress(messages, current_tokens=160000, payload_size=replay_size)
     assert result == before
     assert comp.compression_count == 0
     assert not comp._last_compression_made_progress

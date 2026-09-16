@@ -737,13 +737,16 @@ def build_turn_context(
         if _idle_gap >= _idle_after:
             _compressor = agent.context_compressor
             # zettlab-overlay(context-budget): align compaction with actual request and preserve task state; upstream: none
-            _idle_tokens = estimate_request_tokens_rough(
-                project_messages_for_token_estimate(
-                    messages, getattr(agent, "_copy_reasoning_content_for_api", None),
-                ),
-                system_prompt=active_system_prompt or "",
-                tools=agent.tools or None,
-            )
+            if hasattr(type(_compressor), "automatic_compaction_tokens"):
+                _idle_tokens = _compressor.automatic_compaction_tokens
+            else:
+                _idle_tokens = estimate_request_tokens_rough(
+                    project_messages_for_token_estimate(
+                        messages, getattr(agent, "_copy_reasoning_content_for_api", None),
+                    ),
+                    system_prompt=active_system_prompt or "",
+                    tools=agent.tools or None,
+                )
             # Post-compression target size: don't summarise a thread already
             # below what compaction would reduce it to.
             _idle_floor = int(
@@ -812,19 +815,19 @@ def build_turn_context(
     _preflight_compression_blocked = False
     agent._turn_received_provider_response = False
     agent._turn_preflight_display_snapshot = None
-    if agent.compression_enabled and _should_run_preflight_estimate(
-        messages,
-        agent.context_compressor.protect_first_n,
-        agent.context_compressor.protect_last_n,
-        agent.context_compressor.threshold_tokens,
+    # zettlab-overlay(context-budget): known input selects the built-in gate without scanning history; upstream: none
+    _measured_capacity = hasattr(type(agent.context_compressor), "automatic_compaction_tokens")
+    if agent.compression_enabled and (
+        agent.context_compressor.automatic_compaction_tokens >= agent.context_compressor.threshold_tokens
+        if _measured_capacity else _should_run_preflight_estimate(
+            messages, agent.context_compressor.protect_first_n,
+            agent.context_compressor.protect_last_n, agent.context_compressor.threshold_tokens,
+        )
     ):
-        # zettlab-overlay(context-budget): align compaction with actual request and preserve task state; upstream: none
-        _preflight_tokens = estimate_request_tokens_rough(
-            project_messages_for_token_estimate(
-                messages, getattr(agent, "_copy_reasoning_content_for_api", None),
-            ),
-            system_prompt=active_system_prompt or "",
-            tools=agent.tools or None,
+        # zettlab-overlay(context-budget): keep literal payload size separate from provider token capacity; upstream: none
+        _preflight_tokens = agent.context_compressor.automatic_compaction_tokens if _measured_capacity else estimate_request_tokens_rough(
+            project_messages_for_token_estimate(messages, getattr(agent, "_copy_reasoning_content_for_api", None)),
+            system_prompt=active_system_prompt or "", tools=agent.tools or None,
         )
         _compressor = agent.context_compressor
         # zettlab-overlay(context-budget): provider input replaces diagnostic rough pressure; upstream: none
@@ -995,16 +998,11 @@ def build_turn_context(
                 # recognised as progress instead of being misread as
                 # "Cannot compress further". Fixes #39548.
                 # zettlab-overlay(context-budget): align compaction with actual request and preserve task state; upstream: none
-                _preflight_tokens = estimate_request_tokens_rough(
-                    project_messages_for_token_estimate(
-                        messages, getattr(agent, "_copy_reasoning_content_for_api", None),
-                    ),
-                    system_prompt=active_system_prompt or "",
-                    tools=agent.tools or None,
+                # zettlab-overlay(context-budget): no post-compaction character recount on the built-in path; upstream: none
+                _preflight_tokens = _compressor.automatic_compaction_tokens if _measured_capacity else estimate_request_tokens_rough(
+                    project_messages_for_token_estimate(messages, getattr(agent, "_copy_reasoning_content_for_api", None)),
+                    system_prompt=active_system_prompt or "", tools=agent.tools or None,
                 )
-                # zettlab-overlay(context-budget): post-compaction rough size cannot authorize a second pass; upstream: none
-                if hasattr(type(_compressor), "automatic_compaction_tokens"):
-                    _preflight_tokens = _compressor.automatic_compaction_tokens
                 if not _compression_made_progress(
                     _orig_len, len(messages), _orig_tokens, _preflight_tokens
                 ):

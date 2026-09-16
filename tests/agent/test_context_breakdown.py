@@ -47,7 +47,9 @@ def test_breakdown_includes_major_categories():
     ids = {item["id"] for item in data["categories"]}
     assert {"system_prompt", "tool_definitions", "rules", "skills", "mcp", "subagent_definitions", "conversation"} <= ids
     assert data["context_max"] == 200_000
-    assert data["estimated_total"] > 0
+    assert data["estimated_total"] == 0
+    assert data["total_bytes"] > 0
+    assert data["context_measurement"] == "unknown"
 
 
 
@@ -126,3 +128,15 @@ def test_details_lines_caps_listing():
     assert any("… and 5 more" in line for line in lines)
 
 
+
+
+def test_payload_bytes_never_change_provider_capacity():
+    for measured in (0, 50000):
+        agent, parts = _make_agent(context_length=250000, last_prompt_tokens=measured)
+        with patch("agent.system_prompt.build_system_prompt_parts", return_value=parts):
+            result = compute_session_context_breakdown(agent, [{"role": "user", "content": "资料" * 125000}])
+        assert result["context_used"] == measured
+        assert result["context_percent"] == (20 if measured else 0)
+        assert result["context_measurement"] == ("provider" if measured else "unknown")
+        assert result["total_bytes"] >= 750000
+        assert all(category["tokens"] == 0 for category in result["categories"])

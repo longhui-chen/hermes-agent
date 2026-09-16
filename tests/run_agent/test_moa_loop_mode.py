@@ -1211,8 +1211,8 @@ def test_reference_trim_context_length_cache_hits_once(monkeypatch):
     msgs = _advisory_view(2)
     for _ in range(4):
         _trim(list(msgs), cache=cache, counting=stub, monkeypatch=monkeypatch)
-    assert stub.calls == 1
-    assert cache == {("openrouter", "small-window"): 10_000_000}
+    assert stub.calls == 0
+    assert cache == {}
 
 
 def test_reference_trim_caches_resolution_failures(monkeypatch):
@@ -1223,8 +1223,8 @@ def test_reference_trim_caches_resolution_failures(monkeypatch):
     for _ in range(3):
         out = _trim(list(msgs), cache=cache, counting=stub, monkeypatch=monkeypatch)
         assert out == msgs
-    assert stub.calls == 1
-    assert cache == {("openrouter", "small-window"): None}
+    assert stub.calls == 0
+    assert cache == {}
 
 
 
