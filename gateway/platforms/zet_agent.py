@@ -158,7 +158,7 @@ from gateway.platforms.zet_agent_metrics import (
     interaction_terminal as _metric_interaction_terminal,
 )
 # zettlab-overlay(BT): bind bounded item/display callbacks at the adapter seam; upstream: none
-from gateway.platforms.zet_agent_bt import bind_item_callbacks
+from gateway.platforms.zet_agent_bt import WriterProjection, projection_context, tool_callbacks
 # ZettClaw cron event hook — monkey-patches cron.scheduler at import time
 # so cron triggers POST a webhook to local-server. zero hermes main-line
 # changes; see zet_agent_cron.py docstring for the full rationale.
@@ -5447,6 +5447,7 @@ class ZetAgentAdapter(APIServerAdapter):
             try:
                 if prestream_timing is not None:
                     prestream_timing.observe_queued_semantic("reasoning")
+                _put_progress(stream_q, {"type": "reasoning.delta", "text": text})
             except Exception:
                 logger.debug("[zet_agent] reasoning_cb push failed", exc_info=True)
 
@@ -5458,18 +5459,7 @@ class ZetAgentAdapter(APIServerAdapter):
                 exc_info=True,
             )
 
-        # zettlab-overlay(BT): route item/display frames through the adapter; upstream: none
-        _bt_reasoning, _bt_start, _bt_complete, _bt_finish, _bt_transform = bind_item_callbacks(
-            stream_q=stream_q, turn_id=extension_turn_id,
-            reasoning=_reasoning_cb, tool_start=tool_start_callback,
-            tool_complete=tool_complete_callback,
-        )
-        agent.reasoning_callback, agent.tool_start_callback, agent.tool_complete_callback = (
-            _bt_reasoning, _bt_start, _bt_complete
-        )
-        agent._bt_finish_items = _bt_finish
-        stream_q._zettlab_bt_transform = _bt_transform
-        stream_q._zettlab_bt_finish = _bt_finish
+        agent.tool_start_callback, agent.tool_complete_callback = tool_callbacks(stream_q, prestream_timing)
 
         # 2. Structured lifecycle status: late-bind so only the sniffed
         # chat-completions stream receives the App-specific extension event.
@@ -6036,10 +6026,6 @@ class ZetAgentAdapter(APIServerAdapter):
                 and isinstance(result[0], dict)
                 else {}
             )
-            # zettlab-overlay(BT): close open reasoning/text items before SSE sentinel; upstream: none
-            _bt_finish = getattr(agent_ref[0] if agent_ref else None, "_bt_finish_items", None)
-            if callable(_bt_finish):
-                _bt_finish()
             runtime_agent = agent_ref[0] if agent_ref else None
             runtime_shell_reusable = bool(
                 runtime_agent is not None
@@ -6049,9 +6035,6 @@ class ZetAgentAdapter(APIServerAdapter):
             )
             return result
         finally:
-            _bt_finish = getattr(agent_ref[0] if agent_ref else None, "_bt_finish_items", None)
-            if callable(_bt_finish):
-                _bt_finish()
             if attachment_emitter_token is not None:
                 try:
                     from hermes_cli.plugins import reset_attachment_emitter
@@ -6260,6 +6243,12 @@ class ZetAgentAdapter(APIServerAdapter):
     # SSE writer override — track chat-completions turn by session_id
     # ------------------------------------------------------------------
 
+    def _project_stream_item(self, item):
+        return projection_context.get().project(item)
+
+    def _pre_finish_frames(self, result):
+        return projection_context.get().finish(result)
+
     async def _write_sse_chat_completion(
         self, request, completion_id: str, model: str, created: int,
         stream_q, agent_task, agent_ref=None, session_id: str = None,
@@ -6281,6 +6270,8 @@ class ZetAgentAdapter(APIServerAdapter):
             self._active_turn_key(session_id) if session_id else ""
         )
         self._register_active_session_turn(session_id, active_ref, agent_task)
+        projection = WriterProjection()
+        projection_token = projection_context.set(projection)
         try:
             return await super()._write_sse_chat_completion(
                 request,
@@ -6295,6 +6286,8 @@ class ZetAgentAdapter(APIServerAdapter):
                 prestream_timing=prestream_timing,
             )
         finally:
+            projection.count_stranded(stream_q.qsize())
+            projection_context.reset(projection_token)
             self._clear_active_session_turn(session_id, active_ref, agent_task)
             if scoped_session_key:
                 self._clear_approval_projections(scoped_session_key)

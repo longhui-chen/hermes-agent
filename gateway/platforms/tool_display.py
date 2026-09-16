@@ -1,8 +1,7 @@
 """Bounded, redacted tool-call display projections for BT-T1.
 
-This module is deliberately pure and unconnected. T2 will call it at the
-producer boundary; clients receive only these bounded summaries and never raw
-arguments/output.
+These pure helpers serve the producer boundary; clients receive bounded,
+redacted summaries instead of raw arguments/output.
 """
 from __future__ import annotations
 
@@ -11,6 +10,8 @@ import re
 from collections.abc import Mapping
 from itertools import islice
 from typing import Any
+
+from agent.redact import redact_sensitive_text
 
 ARGS_MAX_BYTES = 256
 SUMMARY_MAX_BYTES = 4 * 1024
@@ -26,105 +27,145 @@ _SECRET_PATTERNS = (
 
 
 def redact(text: str) -> str:
-    """Redact credentials and private local paths before persistence."""
+    """Redact bounded text using the IM policy plus display-only private paths."""
+    if len(text) > SUMMARY_MAX_BYTES:
+        return "[TRUNCATED]"
     try:
-        result = str(text)
-        result.encode("utf-8")
-    except UnicodeError:
+        text.encode("utf-8", "strict")
+        result = redact_sensitive_text(text, force=True)
+        for pattern, replacement in _SECRET_PATTERNS:
+            result = pattern.sub(replacement, result)
+        return result
+    except Exception:
+        # Display is optional; a failed sanitizer must never expose its input.
         return "[INVALID_TEXT]"
-    for pattern, replacement in _SECRET_PATTERNS:
-        result = pattern.sub(replacement, result)
-    return result
 
 
 _SECRET_KEYS = re.compile(r"(?i)(token|api[_-]?key|access[_-]?key|secret|password|cookie|authorization|credential|private[_-]?key|session[_-]?secret)")
 
 
-def _redact_value(value: Any, *, max_chars: int = SUMMARY_MAX_BYTES * 4, _seen: set[int] | None = None, _depth: int = 0) -> Any:
-    seen = _seen if _seen is not None else set()
-    if _depth > 16:
-        return "[DEPTH_LIMIT]"
-    if isinstance(value, Mapping):
-        if id(value) in seen:
-            return "[CYCLE]"
-        seen.add(id(value))
-        return {str(key): "[REDACTED]" if _SECRET_KEYS.search(str(key)) else _redact_value(item, max_chars=max_chars, _seen=seen, _depth=_depth + 1) for key, item in islice(value.items(), 256)}
-    if isinstance(value, (list, tuple)):
-        if id(value) in seen:
-            return "[CYCLE]"
-        seen.add(id(value))
-        return [_redact_value(item, max_chars=max_chars, _seen=seen, _depth=_depth + 1) for item in islice(value, 256)]
-    if isinstance(value, str):
-        return redact(value)[:max_chars]
-    return value
+def _safe_text(value: Any, limit: int) -> tuple[str, bool]:
+    """Bound the entire traversal, including keys, before serialization.
+
+    Limits are per projection, not per level: at most 256 nodes and `limit`
+    source characters are examined. Oversized atoms are omitted rather than
+    cut mid-secret before redaction. No state survives this call.
+    """
+    remaining_nodes = 256
+    remaining_chars = limit
+    cut = False
+    seen: set[int] = set()
+
+    def clean(item: Any, depth: int = 0) -> Any:
+        nonlocal remaining_nodes, remaining_chars, cut
+        if remaining_nodes <= 0 or depth > 16:
+            cut = True
+            return "[TRUNCATED]"
+        remaining_nodes -= 1
+        if isinstance(item, str):
+            if len(item) > remaining_chars:
+                cut = True
+                return "[TRUNCATED]"
+            remaining_chars -= len(item)
+            return redact(item)
+        if isinstance(item, (Mapping, list, tuple)):
+            if id(item) in seen:
+                cut = True
+                return "[CYCLE]"
+            seen.add(id(item))
+            result = {} if isinstance(item, Mapping) else []
+            entries = item.items() if isinstance(item, Mapping) else item
+            count = 0
+            for entry in islice(entries, 256):
+                count += 1
+                if remaining_nodes <= 0:
+                    cut = True
+                    break
+                if isinstance(item, Mapping):
+                    key, child = entry
+                    if not isinstance(key, str) or len(key) > remaining_chars:
+                        cut = True
+                        break
+                    remaining_chars -= len(key)
+                    safe_key = redact(key)
+                    if _SECRET_KEYS.search(key):
+                        remaining_nodes -= 1
+                        result[safe_key] = "[REDACTED]"
+                    else:
+                        result[safe_key] = clean(child, depth + 1)
+                else:
+                    result.append(clean(entry, depth + 1))
+            if count < len(item):
+                cut = True
+            seen.remove(id(item))
+            return result
+        if item is None or isinstance(item, (bool, float)):
+            return item
+        if isinstance(item, int) and item.bit_length() <= 64:
+            return item
+        cut = True
+        return "[UNSUPPORTED]"
+
+    try:
+        safe = clean(value)
+        if isinstance(safe, str):
+            return safe, cut
+        # All strings and containers are now bounded and redacted. JSON escaping
+        # can enlarge this bounded representation; final UTF-8 clipping follows.
+        return json.dumps(safe, ensure_ascii=False, separators=(",", ":"), allow_nan=False), cut
+    except Exception:
+        return "[INVALID_TEXT]", True
 
 
 def _truncate_utf8(text: str, limit: int) -> tuple[str, bool, int]:
-    source = text if len(text) <= limit * 4 else text[: limit * 4]
-    clean = redact(source)
-    try:
-        raw = clean.encode("utf-8")
-    except UnicodeError:
-        clean = "[INVALID_TEXT]"
-        raw = clean.encode("utf-8")
-    exact = len(raw)
-    if exact <= limit:
-        return clean, False, exact
-    # Binary search a character boundary without ever emitting a partial codepoint.
-    lo, hi = 0, len(clean)
-    while lo < hi:
-        mid = (lo + hi + 1) // 2
-        if len(clean[:mid].encode("utf-8")) <= limit:
-            lo = mid
-        else:
-            hi = mid - 1
-    return clean[:lo], True, len(clean[:lo].encode("utf-8"))
+    raw = text.encode("utf-8", "strict")
+    if len(raw) <= limit:
+        return text, False, len(raw)
+    result = raw[:limit].decode("utf-8", "ignore")
+    return result, True, len(result.encode("utf-8"))
 
 
-def _safe_json(value: Any, *, max_chars: int = SUMMARY_MAX_BYTES * 4) -> str:
-    value = _redact_value(value, max_chars=max_chars)
-    if isinstance(value, str):
-        return value
-    try:
-        return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))[:max_chars]
-    except (TypeError, ValueError):
-        return str(value)
+def _display_text(value: Any, limit: int) -> tuple[str, bool, int]:
+    safe, cut = _safe_text(value, limit)
+    text, clipped, size = _truncate_utf8(safe, limit)
+    return text, cut or clipped, size
 
 
 def source_from_registration(tool_id: str, registration: Mapping[str, Any] | None = None) -> dict[str, str]:
     """Project a registry entry into the bounded source object."""
     row = registration or {}
-    kind = str(row.get("kind") or "builtin")
-    if kind not in {"builtin", "mcp", "skill", "connector"}:
+    kind = row.get("kind") or "builtin"
+    if not isinstance(kind, str) or kind not in {"builtin", "mcp", "skill", "connector"}:
         kind = "builtin"
-    source_id = str(row.get("id") or row.get("server") or tool_id)
-    label = str(row.get("label") or row.get("server_label") or row.get("name") or source_id)
-    return {"kind": kind, "id": _truncate_utf8(source_id, SUMMARY_MAX_BYTES)[0], "label": _truncate_utf8(label, SUMMARY_MAX_BYTES)[0]}
+    # MCP grouping identity is the registered server, never the tool's id.
+    source_id = (row.get("server") or row.get("id") or tool_id) if kind == "mcp" else (row.get("id") or tool_id)
+    label = row.get("server_label") or row.get("label") or row.get("name") or source_id
+    return {"kind": kind, "id": _display_text(source_id, SUMMARY_MAX_BYTES)[0], "label": _display_text(label, SUMMARY_MAX_BYTES)[0]}
 
 
 def args_summary(arguments: Any) -> dict[str, Any]:
-    text, truncated, _ = _truncate_utf8(_safe_json(arguments, max_chars=ARGS_MAX_BYTES * 4), ARGS_MAX_BYTES)
+    text, truncated, _ = _display_text(arguments, ARGS_MAX_BYTES)
     return {"args_summary": text, "truncated": truncated}
 
 
 def result_display(output: Any = None, *, error: Any = None, content_type: str | None = None) -> dict[str, Any]:
-    is_error = error not in (None, "")
+    is_error = error is not None and not (isinstance(error, str) and error == "")
+    value = error if is_error else output
+    # Preserve scalar text conventions without invoking arbitrary __str__.
+    if value is None:
+        value = ""
+    elif isinstance(value, bool):
+        value = "True" if value else "False"
+    summary, truncated, size = _display_text(value, SUMMARY_MAX_BYTES)
     if is_error:
         kind = "error"
-        value = error
     elif content_type in {"text", "markdown", "json", "error"}:
         kind = content_type
-        value = _safe_json(output, max_chars=SUMMARY_MAX_BYTES * 4)
     elif isinstance(output, (Mapping, list, tuple)):
         kind = "json"
-        value = _safe_json(output)
     else:
-        value = "" if output is None else str(output)
-        kind = "markdown" if "```" in value else "text"
-    if not isinstance(value, str):
-        value = _safe_json(value, max_chars=SUMMARY_MAX_BYTES * 4)
-    summary, truncated, _ = _truncate_utf8(value, SUMMARY_MAX_BYTES)
-    return {"summary": summary, "content_type": "error" if is_error else kind, "truncated": truncated, "bytes": len(summary.encode("utf-8"))}
+        kind = "markdown" if "```" in summary else "text"
+    return {"summary": summary, "content_type": kind, "truncated": truncated, "bytes": size}
 
 
 def build_tool_start_display(tool_id: str, arguments: Any, registration: Mapping[str, Any] | None = None) -> dict[str, Any]:

@@ -1,77 +1,106 @@
+"""BT tests drive the actual inherited SSE writer, not a simulated emitter."""
+import asyncio
+import ast
+import inspect
+import json
 from queue import Queue
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
-from gateway.platforms.zet_agent_bt import bind_item_callbacks
+import pytest
+from gateway.platforms import api_server
+from gateway.platforms.zet_agent import ZetAgentAdapter
+from gateway.platforms.zet_agent_bt import WriterProjection, projection_context
 
 
-def _frames(queue):
-    return [value[1] for value in list(queue.queue)]
-
-
-def test_callbacks_emit_item_lifecycle_and_display():
+async def write_flow(monkeypatch, items, result):
+    response = SimpleNamespace(prepare=AsyncMock(), write=AsyncMock())
+    monkeypatch.setattr(api_server.web, 'StreamResponse', lambda **_: response)
+    adapter = object.__new__(ZetAgentAdapter)
     queue = Queue()
-    seen = []
-    reasoning, start, complete, finish, _ = bind_item_callbacks(
-        stream_q=queue, turn_id="turn-1", reasoning=lambda text: seen.append(text),
-        tool_start=lambda *args: seen.append(("start", args)),
-        tool_complete=lambda *args: seen.append(("complete", args)),
-    )
-    reasoning("hello")
-    start("call-1", "search", {"token": "secret", "q": "x"})
-    complete("call-1", "search", {}, "ok")
-    finish()
-    frames = _frames(queue)
-    assert frames[0]["type"] == "item.started"
-    assert any(frame.get("type") == "tool.start" for frame in frames)
-    assert any(frame.get("type") == "tool.result" for frame in frames)
-    assert [frame["type"] for frame in frames].count("item.started") >= 2
-    assert [frame["type"] for frame in frames].count("item.completed") >= 1
-    assert "[REDACTED]" in next(frame for frame in frames if frame.get("type") == "tool.start")["display"]["args_summary"]
-    assert seen[0] == "hello"
+    for item in items:
+        queue.put(item)
+    queue.put(None)
+    task = asyncio.get_running_loop().create_future()
+    task.set_result((result, {}))
+    token = projection_context.set(WriterProjection())
+    try:
+        await api_server.APIServerAdapter._write_sse_chat_completion(
+            adapter, SimpleNamespace(headers={}), 'completion', 'model', 100, queue, task)
+    finally:
+        projection_context.reset(token)
+    frames = []
+    for call in response.write.call_args_list:
+        raw = call.args[0].decode()
+        for line in raw.splitlines():
+            if line.startswith('data: ') and line != 'data: [DONE]':
+                frames.append(json.loads(line[6:]))
+    return frames
 
 
-def test_finish_closes_reasoning_item():
-    queue = Queue()
-    reasoning, _, _, finish, _ = bind_item_callbacks(
-        stream_q=queue, turn_id=None, reasoning=None, tool_start=None, tool_complete=None
-    )
-    reasoning("only answer")
-    finish()
-    assert any(frame.get("type") == "item.completed" for frame in _frames(queue))
+@pytest.mark.asyncio
+async def test_writer_suffix_and_delegation_share_ordered_projection_flow(monkeypatch):
+    frames = await write_flow(monkeypatch, [
+        'hello',
+        ('__tool_progress__', {'type':'hermes.delegation.progress','event':'start','subagent_id':'child','status':'running'}),
+        ' world',
+    ], {'completed':True,'response_transformed':True,'response_transform_suffix':'!','final_response':'hello world!'})
+    chunks = [f for f in frames if f.get('choices', [{}])[0].get('delta', {}).get('content')]
+    assert ''.join(f['choices'][0]['delta']['content'] for f in chunks) == 'hello world!'
+    assert len(chunks) == 3
+    assert [f['hermes']['index'] for f in chunks] == [0, 0, 0]
+    starts = [f for f in frames if f.get('type') == 'item.started']
+    completed = [f for f in frames if f.get('type') == 'item.completed']
+    assert len(starts) == len(completed) == 1
+    assert frames.index(starts[0]) < frames.index(chunks[0]) < frames.index(completed[0])
+    assert completed[-1]['text'] == 'hello world!'
+    child = next(f for f in frames if f.get('type') == 'hermes.delegation.progress')
+    assert child['index'] == 1 and child['v'] == 1
+    assert chunks[0]['hermes']['item_id'] == starts[0]['item_id'] == completed[0]['item_id']
 
 
-def test_error_result_is_error_and_redacts_authorization_key():
-    queue = Queue()
-    _, _, complete, _, _ = bind_item_callbacks(
-        stream_q=queue, turn_id=None, reasoning=None, tool_start=None, tool_complete=None
-    )
-    complete("c", "tool", {}, {"status": "error", "authorization": "Bearer secret"})
-    result = next(frame for frame in _frames(queue) if frame.get("type") == "tool.result")
-    assert result["display"]["content_type"] == "error"
-    assert "secret" not in result["display"]["summary"]
+@pytest.mark.asyncio
+async def test_writer_early_final_projects_once_flow(monkeypatch):
+    frames = await write_flow(monkeypatch, [], {'completed':True, 'final_response':'early answer'})
+    text = [f for f in frames if f.get('choices',[{}])[0].get('delta',{}).get('content')]
+    assert len(text) == 1
+    assert text[0]['hermes']['index'] == 0
+    assert any(f.get('type') == 'item.completed' for f in frames)
 
 
-def test_callbacks_preserve_legacy_callbacks():
-    queue = Queue()
-    calls = []
-    _, start, complete, _, _ = bind_item_callbacks(
-        stream_q=queue, turn_id=None, reasoning=None,
-        tool_start=lambda *args: calls.append(("start", args)),
-        tool_complete=lambda *args: calls.append(("complete", args)),
-    )
-    start("c", "tool", {})
-    complete("c", "tool", {}, {"ok": True})
-    assert [name for name, _ in calls] == ["start", "complete"]
+def test_writer_has_six_original_write_categories():
+    tree = ast.parse(inspect.getsource(api_server))
+    writer = next(n for n in ast.walk(tree) if isinstance(n, ast.AsyncFunctionDef) and n.name == '_write_sse_chat_completion')
+    writes = [n for n in ast.walk(writer) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == 'write' and isinstance(n.func.value, ast.Name) and n.func.value.id == 'response']
+    categories = set()
+    for call in writes:
+        value = ast.unparse(call.args[0])
+        if isinstance(call.args[0], ast.Constant):
+            assert call.args[0].value in {b': keepalive\n\n', b'data: [DONE]\n\n'}
+            if call.args[0].value.startswith(b'data:'):
+                categories.add('done')
+        elif 'role_chunk' in value:
+            categories.add('role')
+        elif 'content_chunk' in value:
+            categories.add('content')
+        elif 'finish_chunk' in value or 'error_chunk' in value:
+            categories.add('terminal')
+        elif 'event: hermes.tool.progress' in value:
+            categories.add('progress')
+        elif 'event: hermes.error' in value:
+            categories.add('error')
+        else:
+            pytest.fail(f'unregistered SSE write: {value}')
+    assert categories == {'role', 'content', 'terminal', 'progress', 'error', 'done'}
 
 
-def test_transform_attaches_item_identity_without_duplicate_text():
-    queue = Queue()
-    _, _, _, _, transform = bind_item_callbacks(
-        stream_q=queue, turn_id="turn-1", reasoning=None,
-        tool_start=None, tool_complete=None,
-    )
-    emitted = transform("hello")
-    assert len([item for item in emitted if isinstance(item, str)]) == 1
-    content = next(item for item in emitted if isinstance(item, str))
-    assert content == "hello"
-    assert isinstance(content.item_id, str)
-    assert isinstance(content.index, int)
+
+def test_projection_is_writer_ordered_not_queue_callback_order():
+    projection = WriterProjection()
+    tool_start = ('__tool_progress__',{'tool':'search','toolCallId':'call','status':'running'})
+    tool_result = ('__tool_progress__',{'tool':'search','toolCallId':'call','status':'completed'})
+    first = projection.project(tool_start)[0][1]
+    text = projection.project('answer')
+    last = projection.project(tool_result)[0][1]
+    assert first['index'] == last['index'] == 0
+    assert next(v for v in text if isinstance(v,str)).wire_fields['hermes']['index'] == 1

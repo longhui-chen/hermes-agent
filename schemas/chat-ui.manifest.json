@@ -64,7 +64,8 @@
         "keys": [
           "title",
           "type"
-        ]
+        ],
+        "identity_field": "fixed"
       },
       "hermes.approval": {
         "keys": [
@@ -78,13 +79,15 @@
           "pattern_key",
           "pattern_keys",
           "type"
-        ]
+        ],
+        "identity_field": "approval_id"
       },
       "hermes.attachment": {
         "keys": [
           "attachment",
           "type"
-        ]
+        ],
+        "identity_field": "attachment.id"
       },
       "hermes.clarify": {
         "keys": [
@@ -96,7 +99,8 @@
           "interaction_id",
           "question",
           "type"
-        ]
+        ],
+        "identity_field": "clarify_id"
       },
       "hermes.delegation.progress": {
         "keys": [
@@ -112,7 +116,8 @@
           "plan_id",
           "title",
           "type"
-        ]
+        ],
+        "identity_field": "fixed"
       },
       "hermes.todo": {
         "keys": [
@@ -133,7 +138,8 @@
           "text",
           "turn_id",
           "type"
-        ]
+        ],
+        "identity_field": "steer_id"
       },
       "steer_dropped": {
         "keys": [
@@ -142,7 +148,8 @@
           "text",
           "turn_id",
           "type"
-        ]
+        ],
+        "identity_field": "steer_id"
       },
       "item.started": {
         "keys": [
@@ -166,6 +173,10 @@
           "snapshot_omitted",
           "canonical"
         ]
+      },
+      "context.compaction": {
+        "keys": [],
+        "identity_field": "fixed"
       }
     },
     "frame_shapes_unknown": [

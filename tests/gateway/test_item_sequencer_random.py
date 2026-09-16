@@ -196,3 +196,119 @@ def test_invalid_text_alias_is_normalized_to_string_text_field():
     output = seq.process({"type": "text.delta", "text": None, "content": "alias"})
     delta = next(frame for frame in output if frame.get("type") == "text.delta")
     assert delta["text"] == "alias"
+
+
+def test_parallel_tools_have_pairs_without_tool_lifecycle():
+    seq = ItemSequencer()
+    starts = [seq.process({"type": "tool.start", "call_id": f"tool-{i}"})[-1] for i in range(8)]
+    for i in reversed(range(8)):
+        frames = seq.process({"type": "tool.result", "call_id": f"tool-{i}"})
+        assert len(frames) == 1
+        assert frames[0]["item_id"] == starts[i]["item_id"]
+        assert frames[0]["index"] == starts[i]["index"]
+    assert seq.open_items == {}
+    assert all(frame["type"] == "tool.start" for frame in starts)
+
+
+def test_unknown_type_cannot_masquerade_as_tool():
+    seq = ItemSequencer()
+    for frame_type in ([], {}, None, "unknown.tool"):
+        frame = {"type": frame_type, "toolCallId": "tool"}
+        assert seq.process(frame) == [frame]
+    assert seq.items == {}
+    assert seq.counters == {"item_frame_rejected{reason:unregistered}": 4}
+
+
+def test_random_rejections_preserve_complete_state_and_pending_completion():
+    import copy
+    for seed in range(60):
+        rng = random.Random(seed)
+        seq = ItemSequencer(max_items=1, identity_fields={"hermes.attachment": "attachment.id"})
+        seq.process({"type": "text.delta", "text": "kept"})
+        cases = [
+            ("capacity", {"type": "reasoning.delta", "text": "new"}),
+            ("identity_missing", {"type": "hermes.attachment", "attachment": {"id": 42}}),
+            ("identity_oversize", {"type": "tool.start", "call_id": "界" * rng.randint(513, 700)}),
+            ("text_invalid", {"type": "text.delta", "text": "\ud800"}),
+            ("text_oversize", {"type": "text.delta", "text": "x" * (MAX_SNAPSHOT_BYTES + 1)}),
+            ("unregistered", {"type": "unknown", "toolCallId": "x"}),
+        ]
+        rng.shuffle(cases)
+        for reason, frame in cases:
+            before = copy.deepcopy(seq.__dict__)
+            assert seq.process(frame)[0] is frame
+            after = copy.deepcopy(seq.__dict__)
+            counts = after.pop("counters")
+            old_counts = before.pop("counters")
+            assert after == before
+            assert counts[f"item_frame_rejected{{reason:{reason}}}"] == old_counts.get(f"item_frame_rejected{{reason:{reason}}}", 0) + 1
+        completion = seq.close_item("text")
+        assert completion["text"] == "kept"
+
+
+def test_i10_full_snapshot_encodes_each_delta_once_and_never_on_close():
+    class Counted(str):
+        encoded_chars = 0
+        def encode(self, *args, **kwargs):
+            type(self).encoded_chars += len(self)
+            return super().encode(*args, **kwargs)
+    seq = ItemSequencer()
+    for _ in range(MAX_SNAPSHOT_BYTES):
+        seq.process({"type": "text.delta", "text": Counted("x")})
+    assert Counted.encoded_chars == MAX_SNAPSHOT_BYTES
+    assert seq.open_items["text"].bytes_total == MAX_SNAPSHOT_BYTES
+    assert seq.close_item("text")["text"] == "x" * MAX_SNAPSHOT_BYTES
+    assert Counted.encoded_chars == MAX_SNAPSHOT_BYTES
+
+
+def test_huge_identity_and_text_short_circuit_before_encoding_or_formatting():
+    class Huge(str):
+        def encode(self, *args, **kwargs):
+            raise AssertionError("oversize value encoded")
+        def __format__(self, spec):
+            raise AssertionError("oversize identity formatted")
+    seq = ItemSequencer(identity_fields={"hermes.attachment": "attachment.id"})
+    for frame in (
+        {"type": "tool.start", "call_id": Huge("x" * 513)},
+        {"type": "hermes.delegation.progress", "subagent_id": Huge("x" * 513)},
+        {"type": "hermes.attachment", "attachment": {"id": Huge("x" * 513)}},
+        {"type": "text.delta", "text": Huge("x" * (MAX_SNAPSHOT_BYTES + 1))},
+    ):
+        assert seq.process(frame) == [frame]
+    assert seq.complete_canonical(Huge("x" * (MAX_SNAPSHOT_BYTES + 1))) == []
+    assert seq.next_index == 0
+
+
+def test_snapshot_overflow_forwards_delta_but_releases_buffer():
+    seq = ItemSequencer(max_snapshot_bytes=8)
+    seq.process({"type": "text.delta", "text": "🙂"})
+    seq.process({"type": "text.delta", "text": "🙂"})
+    assert seq.process({"type": "text.delta", "text": "x"})[-1]["text"] == "x"
+    assert seq.open_items["text"].chunks == []
+    assert seq.open_items["text"].snapshot_omitted
+    complete = seq.close_item("text")
+    assert complete["snapshot_omitted"] and "text" not in complete
+
+
+def test_canonical_overwrites_only_last_text_snapshot():
+    seq = ItemSequencer()
+    original = seq.process({"type": "text.delta", "text": "interim"})[0]
+    closed = seq.process({"type": "tool.start", "call_id": "tool"})[0]
+    assert closed["text"] == "interim"
+    final = seq.complete_canonical("authoritative")
+    assert final[-1]["text"] == "authoritative"
+    assert final[-1]["canonical"]
+    assert final[-1]["item_id"] != original["item_id"]
+
+
+def test_version_exhaustion_rejects_before_mutation():
+    import copy
+    from gateway.platforms.item_sequencer import MAX_VERSION
+    seq = ItemSequencer()
+    seq.process({"type": "hermes.todo", "todos": []})
+    seq._todo.version = MAX_VERSION - 1
+    before = copy.deepcopy(seq.items)
+    frame = {"type": "hermes.todo", "todos": ["late"]}
+    assert seq.process(frame) == [frame]
+    assert seq.items == before
+    assert seq.counters["item_frame_rejected{reason:capacity}"] == 1
