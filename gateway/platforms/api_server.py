@@ -65,6 +65,9 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
+# zettlab-overlay(BT): import only side-effect-free request helpers; upstream: https://github.com/longhui-chen/hermes-agent/pull/1
+from gateway.platforms.bt_request_helpers import MAX_CANONICAL_FINAL_TURN_ID_LEN, _CURRENT_TURN_IMAGE_MAX_BYTES, _CURRENT_TURN_IMAGE_MIMES, _HARDWARE_EXECUTION_TOKEN_HEADER, _extract_connector_policy_disabled_skills, _extract_connector_route_capability, _extract_creation_action_receipt_transport, _extract_current_turn_reference_image, _extract_hardware_execution_token, _extract_requested_execution_policy, _extract_skill_slug, _extract_turn_id, _is_video_edit_skill_slug, _trusted_skill_task_message
+
 # zettlab-overlay(H20-unowned): prestream 观测导入，收敛时 hook 化或迁出稳定层; upstream: none
 from agent.prestream_timing import PRESTREAM_TIMING_CONTEXT, PrestreamTiming
 
@@ -493,8 +496,6 @@ def _extract_response_mode(body: Dict[str, Any]) -> str:
 
 def _extract_plan_ack(body: Dict[str, Any]) -> Dict[str, Any]:
     """Extract the App's structured Plan Review action from metadata."""
-    # zettlab-overlay(BT): call fork-owned request helpers lazily to avoid adapter import cycle; upstream: https://github.com/longhui-chen/hermes-agent/pull/1
-    from gateway.platforms.zet_agent import _extract_turn_id
     metadata = body.get("metadata")
     if not isinstance(metadata, dict):
         return {}
@@ -764,8 +765,6 @@ _TEXT_PART_TYPES = frozenset({"text", "input_text", "output_text"})
 _IMAGE_PART_TYPES = frozenset({"image_url", "input_image"})
 _FILE_PART_TYPES = frozenset({"file", "input_file"})
 # zettlab-overlay(H16-unowned): API-MEDIA-INGRESS 探针与当前 turn 图片上限，诊断代码上游 PR 或删; upstream: none
-_CURRENT_TURN_IMAGE_MAX_BYTES = 5 * 1024 * 1024
-_CURRENT_TURN_IMAGE_MIMES = frozenset({"image/png", "image/jpeg", "image/webp"})
 _API_MEDIA_PROBE_MAX_DATA_HEADER = 128
 _API_MEDIA_PROBE_MAX_IMAGE_SAMPLES = 8
 
@@ -1223,12 +1222,16 @@ def _tool_completion_payload(
     tool_call_id: str,
     function_name: str,
     function_result: Any,
+    # zettlab-overlay(BT): accept optional producer identity only; upstream: https://github.com/longhui-chen/hermes-agent/pull/1
+    *, item_id: Optional[str] = None, index: Optional[int] = None,
 ) -> Dict[str, Any]:
     payload: Dict[str, Any] = {
         "tool": function_name,
         "toolCallId": tool_call_id,
         "status": "completed",
         "outcome": "success",
+        # zettlab-overlay(BT): absent identity preserves the legacy payload; upstream: https://github.com/longhui-chen/hermes-agent/pull/1
+        **{key: value for key, value in (("item_id", item_id), ("index", index)) if value is not None},
     }
     decoded = function_result if isinstance(function_result, dict) else None
     if decoded is None and isinstance(function_result, str):
@@ -5929,8 +5932,6 @@ class APIServerAdapter(BasePlatformAdapter):
     async def _handle_canonical_final_chat_completions(
         self, request: "web.Request"
     ) -> "web.Response":
-        # zettlab-overlay(BT): call fork-owned request helpers lazily to avoid adapter import cycle; upstream: https://github.com/longhui-chen/hermes-agent/pull/1
-        from gateway.platforms.zet_agent import MAX_CANONICAL_FINAL_TURN_ID_LEN, _extract_creation_action_receipt_transport, _extract_turn_id
         auth_err = self._check_auth(request)
         if auth_err:
             return auth_err
@@ -5999,8 +6000,6 @@ class APIServerAdapter(BasePlatformAdapter):
     @_admit_api_agent_request
     async def _handle_chat_completions(self, request: "web.Request") -> "web.Response":
         """POST /v1/chat/completions — OpenAI Chat Completions format."""
-        # zettlab-overlay(BT): call fork-owned request helpers lazily to avoid adapter import cycle; upstream: https://github.com/longhui-chen/hermes-agent/pull/1
-        from gateway.platforms.zet_agent import _extract_connector_policy_disabled_skills, _extract_connector_route_capability, _extract_creation_action_receipt_transport, _extract_current_turn_reference_image, _extract_hardware_execution_token, _extract_requested_execution_policy, _extract_skill_slug, _extract_turn_id, _is_video_edit_skill_slug, _trusted_skill_task_message
         # zettlab-overlay(H20-unowned): prestream 入口时间戳，收敛时 hook 化或迁出稳定层; upstream: none
         prestream_ingress_at = time.monotonic()
         # Bound total in-flight agent runs (configurable; #7483).
