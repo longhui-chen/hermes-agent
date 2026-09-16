@@ -4383,16 +4383,21 @@ def _run_camera_runtime_command_if_allowed(
             parsed.argv[2:] if semantic else [], timeout, FOREGROUND_MAX_TIMEOUT, _CAMERA_RUNTIME_MAX_TIMEOUT_SECONDS,
         )
         trusted_env = build_camera_semantic_runtime_env() if semantic else build_camera_runtime_env()
-        trusted_secrets = {
-            key: trusted_env.pop(key)
-            for key in ((
+        # zettlab-overlay(ac1015-bearer): inject action and evidence secrets only; upstream: none
+        secret_keys = (
+            (
                 "ZETTLAB_AGENT_ACTION_TOKEN",
                 "ZETTLAB_CAMERA_JOB_ID",
                 "ZETTLAB_CAMERA_EXECUTION_ID",
-            ) if semantic else (
-                "ZETTLAB_AGENT_ACTION_TOKEN",
-                "ZETTLAB_HARDWARE_EXECUTION_TOKEN",
-            ))
+            )
+            if semantic
+            else ("ZETTLAB_AGENT_ACTION_TOKEN",)
+        )
+        # zettlab-overlay(ac1015-bearer): preserve bounded secret extraction; upstream: none
+        trusted_secrets = {
+            key: trusted_env.pop(key)
+            for key in secret_keys
+            if key in trusted_env
         }
         secret_values = list(trusted_secrets.values())
         run_cwd = cwd if cwd and os.path.isdir(cwd) else os.getcwd()
@@ -4484,11 +4489,11 @@ def _run_printer3d_runtime_command_if_allowed(
         from tools.trusted_direct_runner import run_trusted_python_script
 
         trusted_env = build_printer3d_runtime_env()
+        # zettlab-overlay(ac1015-bearer): printer runner receives action context only; upstream: none
         trusted_secrets = {
             key: trusted_env.pop(key)
             for key in (
                 "ZETTLAB_AGENT_ACTION_TOKEN",
-                "ZETTLAB_HARDWARE_EXECUTION_TOKEN",
             )
         }
         secret_values = list(trusted_secrets.values())
@@ -4556,7 +4561,8 @@ def _run_smart_home_runtime_command_if_allowed(
         from tools.environments.local import build_smart_home_runtime_env
         from tools.trusted_direct_runner import run_trusted_python_script
         trusted_env = build_smart_home_runtime_env()
-        trusted_secrets = {key: trusted_env.pop(key) for key in ("ZETTLAB_AGENT_ACTION_TOKEN", "ZETTLAB_HARDWARE_EXECUTION_TOKEN")}
+        # zettlab-overlay(ac1015-bearer): smart-home runner receives action context only; upstream: none
+        trusted_secrets = {key: trusted_env.pop(key) for key in ("ZETTLAB_AGENT_ACTION_TOKEN",)}
         secret_values = list(trusted_secrets.values())
         run_cwd = cwd if cwd and os.path.isdir(cwd) else os.getcwd()
         completed = run_trusted_python_script(
@@ -4628,11 +4634,11 @@ def _run_plaud_runtime_command_if_allowed(
         from tools.trusted_direct_runner import run_trusted_python_script
 
         trusted_env = build_plaud_runtime_env()
+        # zettlab-overlay(ac1015-bearer): PLAUD runner receives action context only; upstream: none
         trusted_secrets = {
             key: trusted_env.pop(key)
             for key in (
                 "ZETTLAB_AGENT_ACTION_TOKEN",
-                "ZETTLAB_HARDWARE_EXECUTION_TOKEN",
             )
         }
         secret_values = list(trusted_secrets.values())

@@ -11,7 +11,8 @@ from urllib.parse import urlsplit, urlunsplit
 import requests
 
 from agent.secret_scope import get_secret
-from gateway.session_context import get_session_env, hardware_execution_token
+# zettlab-overlay(ac1015-bearer): remove bearer context import; upstream: none
+from gateway.session_context import get_session_env
 from tools.registry import registry
 
 _MAX_RESPONSE_BYTES = 1 << 20
@@ -96,16 +97,19 @@ def _session_value(name: str) -> str:
         return ""
 
 
-def _runtime_context() -> tuple[str, str, str, str]:
+def _runtime_context() -> tuple[str, str, str]:
+    # zettlab-overlay(ac1015-bearer): bind action/session context only; upstream: none
     action_token = str(get_secret("ZETTLAB_AGENT_ACTION_TOKEN", "") or "").strip()
-    execution_token = str(hardware_execution_token() or "").strip()
     session_id = _session_value("HERMES_SESSION_ID") or _session_value("HERMES_SESSION_KEY")
     turn_id = _session_value("HERMES_TURN_ID")
-    return action_token, execution_token, session_id, turn_id
+    return action_token, session_id, turn_id
 
 
 def _check_ssh_control() -> bool:
-    action_token, _, session_id, turn_id = _runtime_context()
+    # zettlab-overlay(ac1015-bearer): SSH authorization no longer uses bearer; upstream: none
+    # zettlab-overlay(ac1015-bearer): enforce outer identity fields; upstream: none
+    # zettlab-overlay(ac1015-bearer): omit legacy bearer from SSH request; upstream: none
+    action_token, session_id, turn_id = _runtime_context()
     # Discovery establishes that a trusted Chat turn can ask for SSH work; it
     # must not consume the separate execution capability that authorizes an
     # operation. Dispatch remains fail-closed below and the local-server
@@ -149,8 +153,9 @@ def ssh_control_tool(args: dict[str, Any], **_: Any) -> str:
         payload = _payload(args)
     except (TypeError, ValueError) as exc:
         return json.dumps({"success": False, "code": "invalid_action", "error": str(exc)}, ensure_ascii=False)
-    action_token, execution_token, session_id, turn_id = _runtime_context()
-    if not all((action_token, execution_token, session_id, turn_id)):
+    action_token, session_id, turn_id = _runtime_context()
+    # zettlab-overlay(ac1015-bearer): require outer SSH identity only; upstream: none
+    if not all((action_token, session_id, turn_id)):
         return json.dumps({"success": False, "code": "ssh_authorization_unavailable"})
     timeout_seconds = payload.get("timeout_seconds", _DEFAULT_TIMEOUT_SECONDS - 5)
     request_timeout = min(max(int(timeout_seconds) + 5, 10), 605)
@@ -159,10 +164,10 @@ def ssh_control_tool(args: dict[str, Any], **_: Any) -> str:
             client.trust_env = False
             response = client.post(
                 _endpoint(),
+                # zettlab-overlay(ac1015-bearer): omit legacy hardware header; upstream: none
                 headers={
                     "Content-Type": "application/json",
                     "X-Zettlab-Agent-Action-Token": action_token,
-                    "X-Zettlab-Hardware-Execution-Token": execution_token,
                     "X-Hermes-Session-Id": session_id,
                     "X-Hermes-Turn-Id": turn_id,
                 },
