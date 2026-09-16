@@ -332,11 +332,12 @@ class _SkillDirectTaskContext:
 
 @dataclass(frozen=True)
 class _TrustedExecutionReceipt:
+    # zettlab-overlay(ac1015-bearer): remove per-turn hardware bearer; upstream: none
     agent_id: str = field(repr=False)
     action_token: str = field(repr=False)
-    hardware_execution_token: str = field(repr=False)
     turn_id: str
     session_id: str
+    user_id: str = ""
     gateway_session_key: str = ""
     execution_policy: str = ""
 
@@ -546,6 +547,7 @@ def _capture_trusted_execution_receipt(
         _SMART_HOME_SKILL_PATH,
     }:
         return None
+    # zettlab-overlay(ac1015-bearer): resolve owner from authenticated context; upstream: none
     try:
         from agent.secret_scope import current_secret_scope, is_multiplex_active
 
@@ -566,32 +568,37 @@ def _capture_trusted_execution_receipt(
             execution_session_key,
             execution_policy,
             get_session_env,
-            hardware_execution_token,
+            # zettlab-overlay(ac1015-bearer): resolve authenticated owner; upstream: none
+            zettlab_auth_principal,
         )
-
-        hardware_token = hardware_execution_token()
         bound_execution_policy = execution_policy()
         gateway_session_key = execution_session_key() or get_session_env(
             "HERMES_SESSION_KEY"
         )
         session_id = get_session_env("HERMES_SESSION_ID")
+        # zettlab-overlay(ac1015-bearer): preserve owner/session context without bearer; upstream: none
         if not session_id:
             session_id = gateway_session_key
+        user_id = zettlab_auth_principal() or get_session_env("HERMES_SESSION_USER_ID")
     except Exception:
-        hardware_token = ""
         bound_execution_policy = ""
         session_id = ""
         gateway_session_key = ""
+        # zettlab-overlay(ac1015-bearer): clear owner context on lookup failure; upstream: none
+        user_id = ""
 
+    # zettlab-overlay(ac1015-bearer): construct bearer-free receipt; upstream: none
     receipt = _TrustedExecutionReceipt(
         agent_id=_profile_value("ZET_AGENT_ID"),
         action_token=_profile_value("ZETTLAB_AGENT_ACTION_TOKEN"),
-        hardware_execution_token=str(hardware_token or "").strip(),
         turn_id=str(turn_identity[0] or "").strip(),
         session_id=str(session_id or "").strip(),
+        # zettlab-overlay(ac1015-bearer): retain owner context for connector routing; upstream: none
+        user_id=str(user_id or "").strip(),
         gateway_session_key=str(gateway_session_key or "").strip(),
         execution_policy=str(bound_execution_policy or "").strip().lower(),
     )
+    # zettlab-overlay(ac1015-bearer): require outer action/session identity only; upstream: none
     present = {
         "agent_id": bool(receipt.agent_id),
         "turn_id": bool(receipt.turn_id),
@@ -599,7 +606,6 @@ def _capture_trusted_execution_receipt(
     present.update(
         {
             "action_token": bool(receipt.action_token),
-            "hardware_execution_token": bool(receipt.hardware_execution_token),
             "session_id": bool(receipt.session_id),
         }
     )
@@ -609,10 +615,9 @@ def _capture_trusted_execution_receipt(
             present,
         )
         return None
+    # zettlab-overlay(ac1015-bearer): remove hardware token format validation; upstream: none
     if (
         not _is_opaque_action_token(receipt.action_token)
-        or re.fullmatch(r"[0-9a-f]{64}", receipt.hardware_execution_token)
-        is None
     ):
         logger.warning("zet_agent: hardware execution receipt is malformed")
         return None
@@ -642,39 +647,50 @@ def _trusted_skill_path_for_slug(skill_slug: str) -> str:
     return f"skills/{normalized}/SKILL.md"
 
 
-def trusted_camera_runtime_receipt() -> Mapping[str, str]:
+def _trusted_runtime_receipt() -> Mapping[str, str]:
+    # zettlab-overlay(ac1015-bearer): expose connector context without bearer; upstream: none
     """Return the private one-operation receipt for the camsnap helper."""
     receipt = _TRUSTED_HARDWARE_RUNTIME_RECEIPT.get()
     if (
         receipt is None
         or not _is_opaque_action_token(receipt.action_token)
-        or re.fullmatch(r"[0-9a-f]{64}", receipt.hardware_execution_token)
-        is None
         or not receipt.session_id
     ):
         return {}
-    return {
+    # zettlab-overlay(ac1015-bearer): add authenticated owner context; upstream: none
+    values = {
         "ZET_AGENT_ID": receipt.agent_id,
         "ZETTLAB_AGENT_ACTION_TOKEN": receipt.action_token,
-        "ZETTLAB_HARDWARE_EXECUTION_TOKEN": receipt.hardware_execution_token,
         "HERMES_TURN_ID": receipt.turn_id,
         "HERMES_SESSION_KEY": receipt.session_id,
+        # zettlab-overlay(ac1015-bearer): expose owner identity without bearer; upstream: none
+        "ZETTLAB_USER_ID": receipt.user_id,
     }
+    return values
+
+
+def trusted_camera_runtime_receipt() -> Mapping[str, str]:
+    # zettlab-overlay(ac1015-bearer): camera helper uses owner context; upstream: none
+    """Return camera context; the hardware execution bearer is optional."""
+    return _trusted_runtime_receipt()
 
 
 def trusted_printer3d_runtime_receipt() -> Mapping[str, str]:
+    # zettlab-overlay(ac1015-bearer): printer helper uses owner context; upstream: none
     """Return the private one-operation receipt for signed printer helpers."""
-    return trusted_camera_runtime_receipt()
+    return _trusted_runtime_receipt()
 
 
 def trusted_plaud_runtime_receipt() -> Mapping[str, str]:
+    # zettlab-overlay(ac1015-bearer): PLAUD helper uses owner context; upstream: none
     """Return the private one-operation receipt for the PLAUD helper."""
-    return trusted_camera_runtime_receipt()
+    return _trusted_runtime_receipt()
 
 
 def trusted_smart_home_runtime_receipt() -> Mapping[str, str]:
+    # zettlab-overlay(ac1015-bearer): smart-home helper uses owner context; upstream: none
     """Return the private one-operation receipt for the light helper."""
-    return trusted_camera_runtime_receipt()
+    return _trusted_runtime_receipt()
 
 
 def _stat_fingerprint(value: os.stat_result) -> tuple[int, ...]:

@@ -121,7 +121,7 @@ except ImportError:
     web = None  # type: ignore[assignment]
 
 from gateway.sensitive_process_boundary import (
-    gateway_sensitive_process_boundary_ready,
+    gateway_sensitive_process_boundary_ready,  # retained for legacy test/adapter patching
     initialize_gateway_sensitive_process_boundary,
 )
 from gateway.config import Platform, PlatformConfig
@@ -5654,10 +5654,8 @@ class ZetAgentAdapter(APIServerAdapter):
             request_overrides = dict(request_overrides or {})
             request_overrides["_zet_onboarding_received_mono"] = time.monotonic()
 
-        if hardware_execution_token and not gateway_sensitive_process_boundary_ready():
-            raise PermissionError(
-                "gateway process memory boundary is unavailable"
-            )
+        # Hardware bearers were removed from connector execution. Keep the
+        # optional argument for wire compatibility, but never bind or forward it.
 
         ack_status = str((plan_ack or {}).get("status", "") or "").strip().lower()
         ack_turn_id = str((plan_ack or {}).get("turn_id", "") or "").strip()
@@ -5669,13 +5667,7 @@ class ZetAgentAdapter(APIServerAdapter):
             ack_revision_requested = (
                 "1" if bool((plan_ack or {}).get("revision_requested")) else "0"
             )
-        scoped_hardware_execution_token = str(
-            hardware_execution_token or ""
-        ).strip()
-        if ack_status == "cancelled" or (ack_status and not ack_turn_id):
-            # A cancelled or malformed plan acknowledgement cannot carry the
-            # turn-bound side-effect capability into the resumed turn.
-            scoped_hardware_execution_token = ""
+        scoped_hardware_execution_token = ""
         # A plan acknowledgement is a UI receipt; it must not alter the
         # ordinary plugin/tool path or create a second execution channel.
         scoped_execution_policy = str(execution_policy or "").strip().lower()
@@ -5755,7 +5747,7 @@ class ZetAgentAdapter(APIServerAdapter):
             plan_ack_status=ack_status,
             plan_ack_turn_id=ack_turn_id,
             plan_ack_revision_requested=ack_revision_requested,
-            hardware_execution_token=scoped_hardware_execution_token,
+            hardware_execution_token="",
             execution_policy=scoped_execution_policy,
         )
         execution_session_token = push_execution_session_key(
@@ -5829,7 +5821,7 @@ class ZetAgentAdapter(APIServerAdapter):
                     turn_id=turn_id,
                     connector_route_capability=connector_route_capability,
                     creation_action_receipt_transport=creation_action_receipt_transport,
-                    hardware_execution_token=scoped_hardware_execution_token,
+                    hardware_execution_token="",
                     execution_policy=scoped_execution_policy,
                     current_turn_reference_image=current_turn_reference_image,
                     request_overrides=request_overrides,
