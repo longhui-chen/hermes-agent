@@ -1,7 +1,7 @@
 {
   "snapshot_version": 2,
-  "root_commit": "6512fd4fce0878f49b2fb713ec4b5b990148f279",
-  "sha256": "d2d8de5fe8b53c5e3d1141f4d84eed33ed73c2791b862839ce65537f08506e30",
+  "root_commit": "cfb9520cf7f3cc9640051ad14b692d569adc7e90",
+  "sha256": "94b10a59545cf736a3672fbebec122f461e46be405f94687ce3a25ba42981810",
   "payload": {
     "golden": {
       "events": {
@@ -226,7 +226,7 @@
           "backend": "hermes",
           "data": {
             "attachment": {
-              "id": "cg-proposal_demo_0001",
+              "id": "mc-turn_demo_0001",
               "category": "interactive",
               "kind": "connector.connect",
               "v": 1,
@@ -323,7 +323,7 @@
           "ts": 1756972800000,
           "backend": "hermes",
           "data": {
-            "clarify_id": "clr_demo_0001",
+            "clarify_id": "ia_demo_0002",
             "question": "周末指哪两天？",
             "choices_offered": [
               "上周末",
@@ -344,7 +344,7 @@
           "ts": 1756972800000,
           "backend": "hermes",
           "data": {
-            "clarify_id": "clr_demo_0001",
+            "clarify_id": "ia_demo_0002",
             "question": "周末指哪两天？",
             "choices_offered": [
               "上周末",
@@ -365,7 +365,7 @@
           "ts": 1756972800000,
           "backend": "hermes",
           "data": {
-            "clarify_id": "clr_demo_0001",
+            "clarify_id": "ia_demo_0002",
             "question": "周末指哪两天？",
             "choices_offered": [
               "上周末",
@@ -386,7 +386,7 @@
           "ts": 1756972800000,
           "backend": "hermes",
           "data": {
-            "clarify_id": "clr_demo_0001",
+            "clarify_id": "ia_demo_0002",
             "question": "Connector setup",
             "choices_offered": [],
             "expires_at_ms": 1756973100000,
@@ -406,7 +406,7 @@
           "ts": 1756972800000,
           "backend": "hermes",
           "data": {
-            "clarify_id": "clr_demo_0001",
+            "clarify_id": "ia_demo_0002",
             "question": "周末指哪两天？",
             "choices_offered": [
               "上周末",
@@ -427,7 +427,7 @@
           "ts": 1756972800000,
           "backend": "hermes",
           "data": {
-            "clarify_id": "clr_demo_0001",
+            "clarify_id": "ia_demo_0002",
             "question": "周末指哪两天？",
             "choices_offered": [
               "上周末",
@@ -448,7 +448,7 @@
           "ts": 1756972800000,
           "backend": "hermes",
           "data": {
-            "clarify_id": "clr_demo_0001",
+            "clarify_id": "ia_demo_0002",
             "question": "周末指哪两天？",
             "choices_offered": [
               "上周末",
@@ -469,7 +469,7 @@
           "ts": 1756972800000,
           "backend": "hermes",
           "data": {
-            "clarify_id": "clr_demo_0001",
+            "clarify_id": "ia_demo_0002",
             "question": "周末指哪两天？",
             "choices_offered": [
               "上周末",
@@ -4752,7 +4752,57 @@
           "todo",
           "subagent"
         ],
-        "identity_fields_reason": "BT-T1 frozen identity paths are producer-owned and must be mirrored before T2 wiring."
+        "identity_fields_reason": "BT-T1 frozen identity paths are producer-owned and must be mirrored before T2 wiring.",
+        "item_trajectory": [
+          [
+            "reasoning.delta"
+          ],
+          [
+            "content-chunk"
+          ],
+          [
+            "tool-frame.running"
+          ],
+          [
+            "hermes.todo"
+          ],
+          [
+            "hermes.delegation.progress"
+          ],
+          [
+            "hermes.attachment"
+          ],
+          [
+            "hermes.clarify"
+          ],
+          [
+            "hermes.approval"
+          ],
+          [
+            "context.compaction"
+          ],
+          [
+            "hermes.plan"
+          ],
+          [
+            "conversation.title"
+          ],
+          [
+            "steer_accepted",
+            "steer_dropped"
+          ]
+        ],
+        "translated_event_types": {
+          "delegation.status": "hermes.delegation.progress",
+          "attachment.upsert": "hermes.attachment",
+          "clarify": "hermes.clarify",
+          "approval": "hermes.approval",
+          "context.compaction": "context.compaction",
+          "plan.preview": "hermes.plan",
+          "conversation.title": "conversation.title",
+          "steer": "steer_accepted",
+          "steer.dropped": "steer_dropped"
+        }
       },
       "registry": {
         "web": {
