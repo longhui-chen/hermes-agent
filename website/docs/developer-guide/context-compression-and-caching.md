@@ -660,3 +660,23 @@ history on this path. Final compaction effectiveness still awaits provider usage
 Upstream auxiliary summary output-budget sizing and experimental micro compaction
 are separate policies; this change does not claim to remove every estimator from
 the repository. Old calibration fields and normal-request/post-tool scans are gone.
+
+### 2026-09-16 cloud recheck after character-estimate cleanup
+
+Tested commit `6c67919a6a` against the configured `gpt-5.6-sol` cloud route.
+All prompts and tool results were synthetic; no shared AC or user session was modified.
+
+| Probe | Result | Elapsed |
+|---|---|---|
+| Non-streaming hello | HTTP 200, `HELLO_OK`, input 12 / output 7 tokens | 24.05 s |
+| Streaming hello with usage requested | HTTP 200 headers, then SSE `upstream_error`: servers overloaded; no content or usage | 20.54 s |
+| Real Agent three-step read-only tool flow | Upstream overload before any tool call; no usage, no compaction | 43.74 s |
+| Minimal forced tool call, non-streaming | Connection terminated (`RemoteProtocolError`), no complete response | 30.53 s |
+
+The standard instance resolved window 272000 / trigger 244800. Only basic hello
+succeeded: cloud service is not yet stable enough for tool-flow or compaction
+continuation acceptance. HTTP 200 alone is not a successful streaming inference.
+The planned large tool payload was never produced, so this run does not validate
+large-context capacity or successful post-compaction continuation. No compression
+implementation change is justified by these upstream failures; preserve the
+existing local regression evidence and retry live acceptance after cloud recovery.
