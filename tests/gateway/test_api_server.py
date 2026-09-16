@@ -1529,6 +1529,9 @@ class TestHealthDetailedEndpoint:
     @pytest.mark.asyncio
     async def test_health_detailed_returns_ok(self, adapter):
         """GET /health/detailed returns status, platform, and runtime fields."""
+        from gateway.platforms import zet_agent_metrics
+        zet_agent_metrics.reset_for_tests()
+        zet_agent_metrics.interaction_terminal("unknown-state")
         app = _create_app(adapter)
         with patch("gateway.status.read_runtime_status", return_value={
             "gateway_state": "running",
@@ -1555,6 +1558,9 @@ class TestHealthDetailedEndpoint:
                 assert data["gateway_drainable"] is True
                 assert isinstance(data["pid"], int)
                 assert "updated_at" in data
+                assert data["interaction_metrics"] == {
+                    "interaction_terminal{source=hermes,state=other}": 1,
+                }
 
 
     @pytest.mark.asyncio

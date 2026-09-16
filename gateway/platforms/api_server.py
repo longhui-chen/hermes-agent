@@ -68,6 +68,17 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional
 # zettlab-overlay(H20-unowned): prestream 观测导入，收敛时 hook 化或迁出稳定层; upstream: none
 from agent.prestream_timing import PRESTREAM_TIMING_CONTEXT, PrestreamTiming
 
+
+# zettlab-overlay(UO): expose bounded ZetAgent interaction counters in the
+# existing health surface; upstream: none
+def _interaction_metrics_snapshot() -> Dict[str, int]:
+    # zettlab-overlay(UO): bounded adapter metrics helper; upstream: none
+    try:
+        from gateway.platforms.zet_agent_metrics import snapshot
+        return snapshot()
+    except Exception:
+        return {}
+
 # Sentinel returned by _resolve_request_profile when a /p/<profile>/ prefix
 # names a profile this gateway does not serve (→ 404). Distinct from None
 # (no prefix / multiplexing off → handle as the default profile).
@@ -5103,6 +5114,8 @@ class APIServerAdapter(BasePlatformAdapter):
             # the state file may carry legacy epoch floats or hand-edited junk.
             "updated_at": normalize_updated_at(runtime.get("updated_at")),
             "pid": os.getpid(),
+            # zettlab-overlay(UO): additive bounded health field; upstream: none
+            "interaction_metrics": _interaction_metrics_snapshot(),
         })
 
     async def _handle_models(self, request: "web.Request") -> "web.Response":

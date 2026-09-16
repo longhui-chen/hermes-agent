@@ -12,6 +12,7 @@ from aiohttp.test_utils import TestClient, TestServer
 
 from gateway.config import PlatformConfig
 from gateway.platforms import zet_agent as zet_agent_module
+from gateway.platforms import zet_agent_metrics
 from gateway.platforms.zet_agent import ZetAgentAdapter, _ClarifyEntry
 from gateway.session_context import clear_turn_vars, set_turn_vars
 from tools import approval
@@ -127,6 +128,15 @@ def _register_live_turn(adapter, turn_id):
     key = adapter._active_turn_key("session-1")
     adapter._active_session_tasks[key] = _LiveTask()
     adapter._active_session_turn_ids[key] = turn_id
+
+
+def test_legacy_fifo_each_approval_admission_emits_opened_once():
+    zet_agent_metrics.reset_for_tests()
+    adapter = _adapter()
+    _notify_approval(adapter, "interaction-durable", "turn-durable")
+    _notify_approval(adapter, "interaction-follow-up", "turn-durable")
+    snapshot = zet_agent_metrics.snapshot()
+    assert snapshot["interaction_opened"] == 2
 
 
 @pytest.mark.asyncio
@@ -1891,7 +1901,8 @@ async def test_failed_provisional_publication_restores_older_active_receipt():
             clarify_thread.join(1)
 
         assert not clarify_thread.is_alive()
-        assert clarify_result["value"] == ""
+        assert clarify_result["value"].startswith("[clarify:")
+        assert "state=cancelled reason=delivery_failed" in clarify_result["value"]
         finalized_body = await finalized.json()
         assert finalized_body["state"] == "active"
         assert finalized_body["fence_id"]

@@ -87,6 +87,7 @@ _HERMES_CORE_TOOLS = [
     # env via check_fn). Has a zettlab_connectors catalog entry so the
     # non-configurable recovery walk keeps it reachable on the real path.
     "list_my_connectors",
+    "connector_chat_create",
     # Main-only, session-bound read-only unified calendar.
     "get_personal_calendar",
     # Home Assistant smart home control (gated on HASS_TOKEN via check_fn)
@@ -343,8 +344,8 @@ TOOLSETS = {
     # tool from the zet_agent real path (see the zettlab_channels /
     # personal_calendar known gaps in tests/test_toolsets.py).
     "zettlab_connectors": {
-        "description": "List the user's authorized business-data connectors via local-server (zettlab)",
-        "tools": ["list_my_connectors"],
+        "description": "Inspect and create read-only business-data connections in the current Chat session (zettlab)",
+        "tools": ["list_my_connectors", "connector_chat_create"],
         "includes": []
     },
 

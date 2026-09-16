@@ -584,7 +584,7 @@ class TestSegmentedDispatchIntegration:
         with patch("run_agent.handle_function_call", side_effect=fake_handle):
             agent._execute_tool_calls(msg, messages, "task-1")
 
-        assert agent._pending_steer == "focus on the tests"
+        assert agent._pending_steer == [("", "focus on the tests")]
         contents = [m["content"] for m in messages]
         assert not [c for c in contents if "focus on the tests" in c]
 
@@ -663,7 +663,9 @@ class TestSegmentedDispatchIntegration:
 
         large_result_index = next(i for i, call in enumerate(calls) if call.id.endswith("large"))
         assert "Truncated:" in messages[large_result_index]["content"]
-        assert agent._pending_steer == "preserve this steer after budget enforcement"
+        assert agent._pending_steer == [
+            ("", "preserve this steer after budget enforcement")
+        ]
         assert not [m for m in messages if STEER_USER_PREFIX in m["content"]]
 
         agent._drain_steer_for_next_api_call(messages)
@@ -696,7 +698,9 @@ class TestSegmentedDispatchIntegration:
 
         assert len(messages) == 1
         assert "Truncated:" in messages[0]["content"]
-        assert agent._pending_steer == "preserve malformed-call steer after budget enforcement"
+        assert agent._pending_steer == [
+            ("", "preserve malformed-call steer after budget enforcement")
+        ]
         assert STEER_USER_PREFIX not in messages[0]["content"]
 
         agent._drain_steer_for_next_api_call(messages)
