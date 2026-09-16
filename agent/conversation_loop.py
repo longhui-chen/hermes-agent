@@ -7985,6 +7985,7 @@ def run_conversation(
                     _in_loop_deferred = _defer_rough_estimate(_rough_tokens)
 
                 if _in_loop_deferred:
+                    # zettlab-overlay(context-budget): distinguish estimates from measured input in logs; upstream: none
                     logger.info(
                         "Deferring in-loop compaction: estimate=%s, threshold=%s, "
                         "last measured provider input=%s",

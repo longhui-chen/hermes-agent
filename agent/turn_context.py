@@ -886,6 +886,7 @@ def build_turn_context(
         _should_compress_now = False
         _compress_block_reason = None
         if _preflight_deferred:
+            # zettlab-overlay(context-budget): report measured pressure without claiming rough overflow; upstream: none
             logger.info(
                 "Deferring preflight compaction: input=%s, threshold=%s, "
                 "last measured provider input=%s",

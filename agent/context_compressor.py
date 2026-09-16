@@ -2458,12 +2458,14 @@ class ContextCompressor(ContextEngine):
             return 0
         return max(0, self.last_real_prompt_tokens)
 
+    # zettlab-overlay(context-budget): all rough growth awaits provider measurement; upstream: none
     def should_defer_rough_estimate_to_real_usage(self, rough_tokens: int) -> bool:
         """Never promote character estimates, including large growth, into usage.
 
         Cold start and post-compaction requests are measured by the next response.
         Explicit provider overflow remains handled by the bounded recovery path.
         """
+        # zettlab-overlay(context-budget): cold start and invalidated usage cannot trigger compaction; upstream: none
         return self.automatic_compaction_tokens < self.threshold_tokens
 
     def should_defer_preflight_to_real_usage(self, rough_tokens: int) -> bool:
