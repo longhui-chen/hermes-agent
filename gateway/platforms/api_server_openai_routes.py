@@ -377,6 +377,15 @@ class _ResponsesStream:
 class OpenAICompatRoutesMixin:
     """/v1/chat/completions and /v1/responses handlers + SSE writers."""
 
+    def _project_stream_item(self, item):
+        """Optional adapter hook; return iterable of wire-ready stream items."""
+        return (item,)
+
+    def _pre_finish_frames(self, finish_chunk):
+        """Optional adapter hook for frames immediately before the terminal chunk."""
+        return ()
+
+
     def _select_request_route(
         self, body: Dict[str, Any], *, session_id, gateway_session_key, model_alias) -> tuple:
         """Resolve the model_routes alias + per-request overrides ->
@@ -667,7 +676,8 @@ class OpenAICompatRoutesMixin:
                     # Custom event: tool lifecycle for frontends without markers in history.
                     await response.write(_sse_frame(delta[1], event="hermes.tool.progress"))
                 else:
-                    await response.write(_sse_frame(_chunk({"content": delta})))
+                    for projected in self._project_stream_item(delta):
+                        await response.write(_sse_frame(_chunk({"content": projected})))
             # The agent can fail after the queue drains (task raises / result flagged failed or
             # partial): surface a non-"stop" finish_reason like the non-streaming path.
             usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
@@ -691,6 +701,8 @@ class OpenAICompatRoutesMixin:
                         "type": type(agent_error).__name__ if agent_error else "agent_error"}
                 finish_chunk["hermes"] = _hermes_extras(
                     completed, is_partial, is_failed, err_msg, finish_reason)
+            for frame in self._pre_finish_frames(finish_chunk):
+                await response.write(_sse_frame(frame))
             await response.write(_sse_frame(finish_chunk))
             await response.write(b"data: [DONE]\n\n")
         except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError):
