@@ -827,6 +827,8 @@ def build_turn_context(
             tools=agent.tools or None,
         )
         _compressor = agent.context_compressor
+        # zettlab-overlay(context-budget): provider input replaces diagnostic rough pressure; upstream: none
+        _preflight_tokens = (_compressor.automatic_compaction_tokens if hasattr(type(_compressor), "automatic_compaction_tokens") else _preflight_tokens)
         # getattr guard: minimal compressor doubles (SimpleNamespace in the
         # engine-preflight tests) and plugin context engines lack this
         # ContextCompressor-only method — absence means no snapshot, and the
@@ -885,8 +887,8 @@ def build_turn_context(
         _compress_block_reason = None
         if _preflight_deferred:
             logger.info(
-                "Skipping preflight compression: rough estimate ~%s >= %s, "
-                "but last real provider prompt was %s after compression",
+                "Deferring preflight compaction: input=%s, threshold=%s, "
+                "last measured provider input=%s",
                 f"{_preflight_tokens:,}",
                 f"{_compressor.threshold_tokens:,}",
                 f"{_compressor.last_real_prompt_tokens:,}",
@@ -999,6 +1001,9 @@ def build_turn_context(
                     system_prompt=active_system_prompt or "",
                     tools=agent.tools or None,
                 )
+                # zettlab-overlay(context-budget): post-compaction rough size cannot authorize a second pass; upstream: none
+                if hasattr(type(_compressor), "automatic_compaction_tokens"):
+                    _preflight_tokens = _compressor.automatic_compaction_tokens
                 if not _compression_made_progress(
                     _orig_len, len(messages), _orig_tokens, _preflight_tokens
                 ):

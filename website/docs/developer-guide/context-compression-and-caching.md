@@ -57,7 +57,7 @@ Located in `gateway/run.py` (search for `Session hygiene: auto-compress`). This 
 runs before the agent processes a message. It prevents API failures when sessions
 grow too large between turns (e.g., overnight accumulation in Telegram/Discord).
 
-- **Threshold**: 90% of model context length, using provider-reported usage only. Without usage, ordinary pressure is deferred to the agent replay estimator; the existing extreme-message-count guard remains.
+- **Threshold**: 90% of model context length, using provider-reported usage only. Without usage, ordinary pressure is deferred to the next provider response; the existing extreme-message-count guard remains.
 - **Token source**: Actual API-reported tokens from the last turn. Rough stored-history estimates are diagnostic only; the agent checks projected request pressure.
 - **Fires**: Only when `len(history) >= 4` and compression is enabled
 - **Purpose**: Catch sessions that escaped the agent's own compressor
@@ -266,7 +266,7 @@ packaging repository's `zpk/config/<repo>.yaml`. No shared device was changed.
 - **Accounting:** Codex `context_manager/history.rs::get_total_token_usage` uses
   the latest provider usage plus subsequent items, and avoids counting reasoning
   twice when already included by the server. Hermes uses successful input usage
-  plus projected growth with its existing bounded noisy-estimate guard; this is
+  as the automatic trigger, without promoting character estimates to measurements; this is
   an adaptation to Chat Completions, not a claim of identical Responses semantics.
 - **Reasoning:** preserve provider-required protocol state. Display summaries are
   not generic conversation content. No blanket deletion of encrypted/native state.
@@ -601,3 +601,31 @@ the earlier discarded 256k pin. Its model calls failed with cloud overload;
 a separate minimal hello request timed out. No latest live tool-flow success
 is claimed. Earlier live evidence above belongs to the previous budget revision.
 Cloud validation is deferred at the user's direction; no shared AC was modified.
+
+### Provider-measured automatic pressure (PR 480 correction)
+
+Operating envelope: the provider returns valid usage for a completed request.
+Chat Completions `prompt_tokens` includes cached input. Output/reasoning usage
+is billing information, not an extra input charge. No local tokenizer is added.
+
+| State | Automatic pressure | Behavior |
+|---|---|---|
+| Latest valid input usage | That request's input total | Compact at configured trigger |
+| Unsent tool output / user input | Not measured yet | Submit normally, replace baseline from response |
+| No usage / cold start / model change | Unknown (zero trigger signal) | Do not compact from character count |
+| Just compacted | Old usage invalid | Wait for new request usage |
+| Explicit provider context overflow / HTTP 413 | Existing bounded recovery | Compact/retry or return failure preserving history |
+| Generic 400 / timeout plus large rough count | Not evidence of overflow | Existing error handling, no guessed compaction |
+
+This intentionally differs from Codex's estimated-new-items accounting. A sudden
+large tool result can cause one rejected request before bounded recovery. It does
+not justify repeatedly summarizing fitting contexts. Missing usage must not become
+a fabricated precise count. Character estimates remain available for diagnostics
+and summary partitioning, never as automatic trigger evidence. Manual `/compress`
+and optional plugin engines retain their existing contracts.
+
+The runtime keeps only existing scalar usage state (no additional resident cache,
+model, or tokenizer). Protocol, auth scope, device YAML ownership and dependencies
+are unchanged. Reliability tradeoff: bounded explicit-overflow recovery instead of
+proactive destructive guesses. Randomized state transitions and a real agent loop
+with the provider boundary mocked must validate these invariants.

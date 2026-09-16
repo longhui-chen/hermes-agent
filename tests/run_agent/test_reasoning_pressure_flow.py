@@ -83,3 +83,80 @@ def test_explicit_runtime_window_survives_a_different_configured_route(runtime_w
         assert instance._config_context_length == runtime_window
         assert instance.context_compressor.context_length == (runtime_window or 1050000)
         assert instance.context_compressor.threshold_tokens == 244800
+
+
+@pytest.mark.parametrize('usage', [None, 50000])
+def test_large_tool_growth_never_promotes_characters_to_tokens(agent, usage):
+    comp = ContextCompressor(model='test/model', config_context_length=272000, quiet_mode=True)
+    agent.context_compressor = comp
+    sent = []
+    responses = iter([_tool_response(i) for i in range(4)] + [_stop_response()])
+    def respond(**kwargs):
+        sent.append(deepcopy(kwargs['messages']))
+        result = next(responses)
+        if usage:
+            result.usage = SimpleNamespace(prompt_tokens=usage, input_tokens=0,
+                completion_tokens=90000, total_tokens=usage + 90000,
+                prompt_tokens_details=SimpleNamespace(cached_tokens=49000),
+                completion_tokens_details=SimpleNamespace(reasoning_tokens=89900))
+        return result
+    agent.client.chat.completions.create.side_effect = respond
+    with (
+        patch.object(agent, '_compress_context', side_effect=AssertionError('false compaction')),
+        patch.object(agent, '_persist_session'), patch.object(agent, '_save_trajectory'),
+        patch.object(agent, '_cleanup_task_resources'),
+        patch('run_agent.handle_function_call', return_value='资料' * 31250),
+    ):
+        result = agent.run_conversation('GOAL-480: read the document and preserve requirements.')
+    assert result['completed']
+    assert len(sent) == 5
+    assert comp.automatic_compaction_tokens == (usage or 0)
+    assert any('GOAL-480' in str(m.get('content')) for m in sent[-1])
+    assert sum(len(str(m.get('content', ''))) for m in sent[-1] if m['role'] == 'tool') >= 250000
+
+
+def test_measured_threshold_still_compacts_once_then_waits_for_usage(agent):
+    comp = ContextCompressor(model='test/model', config_context_length=272000, quiet_mode=True)
+    agent.context_compressor = comp
+    first = _tool_response(0)
+    first.usage = SimpleNamespace(prompt_tokens=250000, completion_tokens=20, total_tokens=250020)
+    agent.client.chat.completions.create.side_effect = [first, _stop_response()]
+    def compact(messages, system_message, **kwargs):
+        comp.last_prompt_tokens = -1
+        comp.awaiting_real_usage_after_compression = True
+        return messages, system_message
+    with (
+        patch.object(agent, '_compress_context', side_effect=compact) as compress,
+        patch.object(agent, '_persist_session'), patch.object(agent, '_save_trajectory'),
+        patch.object(agent, '_cleanup_task_resources'),
+        patch('run_agent.handle_function_call', return_value='observed'),
+    ):
+        result = agent.run_conversation('Inspect and report.')
+    assert result['completed']
+    assert compress.call_count == 1
+    assert comp.automatic_compaction_tokens == 0
+
+
+@pytest.mark.parametrize('explicit_overflow', [False, True])
+def test_large_history_generic_error_is_not_overflow_but_explicit_error_recovers(agent, explicit_overflow):
+    comp = ContextCompressor(model='test/model', config_context_length=272000, quiet_mode=True)
+    agent.context_compressor = comp
+    err = Exception('context length exceeded' if explicit_overflow else 'error')
+    err.status_code = 400
+    agent.client.chat.completions.create.side_effect = [err, _stop_response()]
+    history = [{'role': 'user' if i % 2 == 0 else 'assistant', 'content': '资料' * 2000}
+               for i in range(100)]
+    def compact(messages, system_message, **kwargs):
+        comp.last_prompt_tokens = -1
+        comp.awaiting_real_usage_after_compression = True
+        return [{'role': 'user', 'content': 'Original goal: inspect and report.'}], system_message
+    with (
+        patch.object(agent, '_compress_context', side_effect=compact) as compress,
+        patch.object(agent, '_persist_session') as persist,
+        patch.object(agent, '_save_trajectory'), patch.object(agent, '_cleanup_task_resources'),
+        patch('agent.conversation_loop.time.sleep'),
+    ):
+        result = agent.run_conversation('Inspect and report.', conversation_history=history)
+    assert compress.call_count == int(explicit_overflow)
+    assert result['completed'] == explicit_overflow
+    assert persist.called

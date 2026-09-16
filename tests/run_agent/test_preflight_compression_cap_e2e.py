@@ -93,7 +93,7 @@ def _make_agent(monkeypatch, tmp_path: Path, *, max_attempts) -> AIAgent:
     return agent
 
 
-def test_preflight_runs_fourth_compaction_pass_at_cap_six(monkeypatch, tmp_path):
+def test_rough_only_pressure_does_not_spend_compaction_attempts(monkeypatch, tmp_path):
     agent = _make_agent(monkeypatch, tmp_path, max_attempts=6)
     # Config-driven attach seam (agent_init) resolved the raised cap.
     assert agent.max_compression_attempts == 6
@@ -138,12 +138,5 @@ def test_preflight_runs_fourth_compaction_pass_at_cap_six(monkeypatch, tmp_path)
         result = agent.run_conversation("hello", conversation_history=history)
 
     assert result["completed"] is True
-    # The old hardcoded range(3) made a 4th pass impossible; cap=6 must
-    # deliver it (and, with steady progress over threshold, all six).
-    assert len(compress_calls) >= 4, (
-        f"expected a 4th preflight compaction pass at cap=6, "
-        f"got {len(compress_calls)} passes"
-    )
-    assert len(compress_calls) == 6
-
-
+    # Rough-only pressure cannot justify any destructive preflight pass.
+    assert compress_calls == []

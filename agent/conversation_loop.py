@@ -3035,6 +3035,9 @@ def run_conversation(
         # LLM cooldown + anti-thrash guards (#11529). compression_attempts is a
         # hard per-turn backstop shared with the overflow error handlers.
         _compressor = agent.context_compressor
+        # zettlab-overlay(context-budget): automatic trigger uses measured input, not request character count; upstream: none
+        request_estimated_tokens = request_pressure_tokens
+        request_pressure_tokens = (_compressor.automatic_compaction_tokens if hasattr(type(_compressor), "automatic_compaction_tokens") else request_pressure_tokens)
         _preflight_threshold = int(
             getattr(_compressor, "threshold_tokens", 0) or 0
         )
@@ -4566,16 +4569,17 @@ def run_conversation(
                     # not just legacy aggregate tokens. Legacy keys stay for
                     # back-compat with engines that only read prompt/completion/total.
                     usage_dict = {
-                        "prompt_tokens": prompt_tokens,
-                        "completion_tokens": completion_tokens,
-                        "total_tokens": total_tokens,
-                        "input_tokens": canonical_usage.input_tokens,
-                        "output_tokens": canonical_usage.output_tokens,
-                        "cache_read_tokens": canonical_usage.cache_read_tokens,
-                        "cache_write_tokens": canonical_usage.cache_write_tokens,
-                        "reasoning_tokens": canonical_usage.reasoning_tokens,
+                        # zettlab-overlay(context-budget): advisor billing is not the acting model input; upstream: none
+                        "prompt_tokens": aggregator_usage.prompt_tokens,
+                        "completion_tokens": aggregator_usage.output_tokens,
+                        "total_tokens": aggregator_usage.total_tokens,
+                        "input_tokens": aggregator_usage.input_tokens,
+                        "output_tokens": aggregator_usage.output_tokens,
+                        "cache_read_tokens": aggregator_usage.cache_read_tokens,
+                        "cache_write_tokens": aggregator_usage.cache_write_tokens,
+                        "reasoning_tokens": aggregator_usage.reasoning_tokens,
                         # zettlab-overlay(context-budget): pair usage with this request estimate; upstream: none
-                        "request_estimated_tokens": request_pressure_tokens if _moa_prepared_request is None else 0,
+                        "request_estimated_tokens": request_estimated_tokens if _moa_prepared_request is None else 0,
                     }
                     agent.context_compressor.update_from_response(usage_dict)
 
@@ -4586,10 +4590,9 @@ def run_conversation(
                     # of interest is the cost/size of the latest assembled
                     # request, so we keep the most recent call's usage.
                     agent._last_turn_usage = dict(usage_dict)
-                elif getattr(
-                    agent.context_compressor,
-                    "awaiting_real_usage_after_compression",
-                    False,
+                elif hasattr(type(agent.context_compressor), "automatic_compaction_tokens") or getattr(
+                    # zettlab-overlay(context-budget): missing usage cannot retain stale measured pressure; upstream: none
+                    agent.context_compressor, "awaiting_real_usage_after_compression", False,
                 ):
                     # A response with no usage cannot adjudicate whether the
                     # prior compaction cleared the threshold. Consume the pending
@@ -5201,9 +5204,10 @@ def run_conversation(
                     api_error,
                     provider=getattr(agent, "provider", "") or "",
                     model=getattr(agent, "model", "") or "",
-                    approx_tokens=approx_tokens,
+                    # zettlab-overlay(context-budget): generic errors plus rough size are not confirmed overflow; upstream: none
+                    approx_tokens=0 if hasattr(type(_compressor), "automatic_compaction_tokens") else approx_tokens,
                     context_length=_ctx_len,
-                    num_messages=len(api_messages) if api_messages else 0,
+                    num_messages=0 if hasattr(type(_compressor), "automatic_compaction_tokens") else len(api_messages or []),
                     # Verifiable gateway origin: a content-policy block on the
                     # ai-proxy route is the Zettlab moderation gateway's verdict
                     # (compliance, no failover) even on its generic code="400"
@@ -6158,30 +6162,14 @@ def run_conversation(
                     if available_out is not None:
                         # This is an output-cap error, not input overflow.
                         # The provider's available_tokens is the authoritative
-                        # cap for the failed request, so keep it as an upper
-                        # bound.  Also estimate the current API request shape
-                        # (system prompt, injected context, tool schemas) because
-                        # Hermes may add API-only content not present in persisted
-                        # messages.  Use the smaller budget and apply a small
-                        # safety margin.  Do not alter context_length.
-                        request_input_estimate = estimate_request_tokens_rough(
-                            api_messages, tools=agent.tools or None,
-                        )
-                        local_available_out = old_ctx - request_input_estimate
-                        if local_available_out > 0:
-                            safe_out = max(1, min(available_out, local_available_out) - 64)
-                        else:
-                            # The rough local estimate can overshoot the real
-                            # request size.  Fall back to the provider-reported
-                            # budget, which is authoritative for the failed
-                            # request.
-                            safe_out = max(1, available_out - 64)
+                        # cap for this failed request. Preserve the existing 64-token margin.
+                        # zettlab-overlay(context-budget): provider available output wins over character estimates; upstream: none
+                        safe_out = max(1, available_out - 64)
                         agent._ephemeral_max_output_tokens = safe_out
                         agent._buffer_vprint(
                             f"⚠️  Output cap too large for current prompt — "
                             f"retrying with max_tokens={safe_out:,} "
                             f"(provider_available={available_out:,}, "
-                            f"estimated_request_tokens={request_input_estimate:,}; "
                             f"context_length unchanged at {old_ctx:,})"
                         )
                         # Still count against compression_attempts so we don't
@@ -6722,7 +6710,8 @@ def run_conversation(
                         _purge_refused_rows_from_session_db(
                             agent, messages, len(_kept_messages)
                         )
-                    if status_code == 400 and (approx_tokens > 50000 or len(api_messages) > 80):
+                    # zettlab-overlay(context-budget): preserve failed turns when size is only guessed; upstream: none
+                    if not hasattr(type(_compressor), "automatic_compaction_tokens") and status_code == 400 and (approx_tokens > 50000 or len(api_messages) > 80):
                         agent._vprint(
                             f"{agent.log_prefix}⚠️  Skipping session persistence "
                             f"for large failed session to prevent growth loop.",
@@ -7970,59 +7959,15 @@ def run_conversation(
                 if _tc_names == {"execute_code"}:
                     agent.iteration_budget.refund()
                 
-                # Decide compression from the *current* request shape —
-                # i.e. the messages just augmented with tool results by
-                # _execute_tool_calls above — not from the previous API
-                # response's reported prompt_tokens.
-                #
-                # last_prompt_tokens predates the tool results we just
-                # appended; a single large tool output (terminal/read_file
-                # dumping multi-MB stdout, web_search aggregating long
-                # pages) can push the next request well past the threshold
-                # while last_prompt_tokens is still under it. The old
-                # reactive check would then fire only AFTER the oversized
-                # request had been sent — by which point the provider may
-                # have already errored out, truncated, or returned empty.
-                # See board28 NAS-PM / MaxClaw token-usage timeline
-                # (~1.6M tokens in a single turn vs the 50% / 500K
-                # threshold on a 1M context model).
-                #
-                # estimate_request_tokens_rough already includes tool
-                # schemas (#14695) and counts images at a flat per-image
-                # rate (#12026 et al.), matching what the preflight
-                # compression check uses at turn entry. Take max with
-                # last_prompt_tokens so we never regress on the disconnect
-                # fallback (#2153) — should_compress(0) would never fire,
-                # but max(estimate, 0) does — and so an authoritative
-                # provider-reported count from the prior request acts as a
-                # floor when the rough estimate (4 chars/token) would
-                # under-count multipart payloads / control tokens.
+                # zettlab-overlay(context-budget): newly returned tools are unmeasured until the next response; upstream: none
                 _compressor = agent.context_compressor
-                if _compressor.last_prompt_tokens == -1:
-                    # Compression just ran and no API-reported prompt count
-                    # has arrived yet. Avoid treating a schema-heavy rough
-                    # post-compression estimate as real context pressure.
-                    _real_tokens = 0
-                else:
-                    # Include tool schemas — with 50+ tools enabled
-                    # these add 20-30K tokens the messages-only
-                    # estimate misses, which can skip compression
-                    # past the configured threshold (#14695).
-                    # zettlab-overlay(context-budget): align compaction with actual request and preserve task state; upstream: none
-                    _rough_tokens = estimate_request_tokens_rough(
-                        project_messages_for_token_estimate(
-                            messages, getattr(agent, "_copy_reasoning_content_for_api", None),
-                        ), system_prompt=agent._cached_system_prompt or "",
-                        tools=agent.tools or None
-                    )
-                    _real_tokens = _rough_tokens
-                    if _compressor.last_prompt_tokens > 0:
-                        # Only use prompt_tokens — completion/reasoning
-                        # tokens don't consume context window space.
-                        # Thinking models (GLM-5.1, QwQ, DeepSeek R1)
-                        # inflate completion_tokens with reasoning,
-                        # causing premature compression.  (#12026)
-                        _real_tokens = max(_real_tokens, _compressor.last_prompt_tokens)
+                _rough_tokens = estimate_request_tokens_rough(
+                    project_messages_for_token_estimate(
+                        messages, getattr(agent, "_copy_reasoning_content_for_api", None),
+                    ), system_prompt=agent._cached_system_prompt or "",
+                    tools=agent.tools or None,
+                )
+                _real_tokens = (_compressor.automatic_compaction_tokens if hasattr(type(_compressor), "automatic_compaction_tokens") else max(_rough_tokens, _compressor.last_prompt_tokens))
 
                 _in_loop_deferred = False
                 if agent.compression_enabled and _real_tokens > 0:
@@ -8041,8 +7986,8 @@ def run_conversation(
 
                 if _in_loop_deferred:
                     logger.info(
-                        "Skipping in-loop compression: rough estimate ~%s >= %s, "
-                        "but last real provider prompt was %s after compression",
+                        "Deferring in-loop compaction: estimate=%s, threshold=%s, "
+                        "last measured provider input=%s",
                         f"{_rough_tokens:,}",
                         f"{_compressor.threshold_tokens:,}",
                         f"{_compressor.last_real_prompt_tokens:,}",

@@ -100,12 +100,12 @@ class TestUpdateFromResponse:
 
 class TestPreflightDeferral:
 
-    def test_does_not_defer_when_rough_growth_is_large(self, compressor):
+    def test_large_rough_growth_still_waits_for_provider_usage(self, compressor):
         compressor.threshold_tokens = 85_000
         compressor.last_real_prompt_tokens = 50_000
         compressor.last_rough_tokens_when_real_prompt_fit = 90_000
 
-        assert compressor.should_defer_preflight_to_real_usage(100_000) is False
+        assert compressor.should_defer_preflight_to_real_usage(100_000) is True
 
 
     def test_defers_immediately_after_compaction_with_stale_real_prompt(self, compressor):
@@ -1741,9 +1741,9 @@ class TestUpdateModelResetsCalibration:
         assert comp.should_defer_preflight_to_real_usage(93_000) is True
 
         # After switching to a 65K model, the stale state is gone, so a rough
-        # estimate over the new threshold is NOT deferred — preflight will run.
+        # estimate on the new route must await a new provider measurement.
         comp.update_model("small-model", context_length=65_536)
-        assert comp.should_defer_preflight_to_real_usage(comp.threshold_tokens + 5_000) is False
+        assert comp.should_defer_preflight_to_real_usage(comp.threshold_tokens + 5_000) is True
 
 
 

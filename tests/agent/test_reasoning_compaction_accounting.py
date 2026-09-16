@@ -71,8 +71,8 @@ def test_successful_usage_calibrates_without_compaction_and_checks_do_not_drift(
         comp.update_from_response({'prompt_tokens': actual,
                                    'request_estimated_tokens': rough})
         for _ in range(10):
-            growth = rng.randrange(0, 12000)
-            expected = growth <= 7500 and actual + growth < 150000
+            growth = rng.randrange(0, 2000000)
+            expected = True
             assert comp.should_defer_rough_estimate_to_real_usage(rough + growth) == expected
             assert comp.last_rough_tokens_when_real_prompt_fit == rough
     # A provider reading above the trigger overrides an earlier fitting anchor.
@@ -176,3 +176,24 @@ def test_randomized_codex_budget_never_exceeds_window_or_explicit_cap():
         c.update_model('test', context_length=window, max_tokens=reserve)
         assert c.threshold_tokens == max(1, min(int(window * .9), window - reserve,
                                                 cap if cap else window))
+
+
+def test_provider_pressure_state_transitions():
+    import random
+    comp = ContextCompressor(model='test/model', config_context_length=272000, quiet_mode=True)
+    rng = random.Random(480)
+    expected = 0
+    for _ in range(1000):
+        op = rng.choice(['usage', 'missing', 'compact', 'rough'])
+        if op == 'usage':
+            expected = rng.randrange(1, 300000)
+            comp.update_from_response({'prompt_tokens': expected, 'completion_tokens': 90000,
+                                      'reasoning_tokens': 89900})
+        elif op == 'missing':
+            comp.update_from_response({})
+            expected = 0
+        elif op == 'compact':
+            comp.awaiting_real_usage_after_compression = True
+            expected = 0
+        assert comp.automatic_compaction_tokens == expected
+        assert comp.should_defer_preflight_to_real_usage(rng.randrange(1, 3000000)) == (expected < comp.threshold_tokens)

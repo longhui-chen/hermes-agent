@@ -2382,8 +2382,9 @@ class ContextCompressor(ContextEngine):
         self.last_prompt_tokens = usage.get("prompt_tokens", 0)
         self.last_completion_tokens = usage.get("completion_tokens", 0)
         self.last_total_tokens = usage.get("total_tokens", self.last_prompt_tokens + self.last_completion_tokens)
+        # zettlab-overlay(context-budget): missing usage invalidates the preceding request measurement; upstream: none
+        self.last_real_prompt_tokens = self.last_prompt_tokens
         if self.last_prompt_tokens > 0:
-            self.last_real_prompt_tokens = self.last_prompt_tokens
             # zettlab-overlay(context-budget): calibrate only from successful requests; upstream: none
             request_estimate = usage.get("request_estimated_tokens", 0)
             if isinstance(request_estimate, int) and request_estimate > 0:
@@ -2449,47 +2450,21 @@ class ContextCompressor(ContextEngine):
             return
         self.last_prompt_tokens = snapshot
 
-    def should_defer_rough_estimate_to_real_usage(self, rough_tokens: int) -> bool:
-        """Return True when a high rough request estimate is known-noisy.
-
-        ``estimate_request_tokens_rough(..., tools=...)`` intentionally
-        overestimates schema-heavy requests so Hermes compresses before a
-        provider rejects the payload. After a successful compressed API call,
-        though, provider ``prompt_tokens`` are a better signal than repeating
-        compaction from the same rough schema overhead. Defer only while the
-        rough estimate has grown modestly since a request the provider proved
-        fit under the threshold.
-        """
-        if rough_tokens < self.threshold_tokens:
-            return False
-        # Immediately after a compaction the post-compression path sets
-        # ``awaiting_real_usage_after_compression`` and parks
-        # ``last_prompt_tokens = -1``, but ``last_real_prompt_tokens`` still
-        # holds the STALE pre-compression value (above threshold — that's why
-        # compaction fired).  Without this guard that stale value defeats the
-        # ``last_real_prompt_tokens >= threshold_tokens`` check below, so
-        # preflight fires a SECOND compaction before the provider has reported
-        # real token usage for the now-shorter conversation.  Defer for exactly
-        # one turn; update_from_response() clears the flag when real usage
-        # arrives.  (#36718)
+    # zettlab-overlay(context-budget): only provider input usage can trigger automatic compaction; upstream: none
+    @property
+    def automatic_compaction_tokens(self) -> int:
+        """Measured input pressure, or zero while the current request is unmeasured."""
         if self.awaiting_real_usage_after_compression:
-            return True
-        if self.last_real_prompt_tokens <= 0:
-            return False
-        if self.last_real_prompt_tokens >= self.threshold_tokens:
-            return False
+            return 0
+        return max(0, self.last_real_prompt_tokens)
 
-        baseline = self.last_rough_tokens_when_real_prompt_fit or self.last_compression_rough_tokens
-        if baseline <= 0:
-            return False
+    def should_defer_rough_estimate_to_real_usage(self, rough_tokens: int) -> bool:
+        """Never promote character estimates, including large growth, into usage.
 
-        growth = max(0, rough_tokens - baseline)
-        tolerated_growth = max(4096, int(self.threshold_tokens * 0.05))
-        if growth > tolerated_growth:
-            return False
-
-        # zettlab-overlay(context-budget): checks cannot move a provider-confirmed anchor; upstream: none
-        return self.last_real_prompt_tokens + growth < self.threshold_tokens
+        Cold start and post-compaction requests are measured by the next response.
+        Explicit provider overflow remains handled by the bounded recovery path.
+        """
+        return self.automatic_compaction_tokens < self.threshold_tokens
 
     def should_defer_preflight_to_real_usage(self, rough_tokens: int) -> bool:
         """Compatibility wrapper for older context-engine call sites."""
