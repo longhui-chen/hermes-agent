@@ -1,7 +1,7 @@
 {
   "snapshot_version": 2,
-  "root_commit": "2b37c20854ae8b42be965e079534648a4d636c8b",
-  "sha256": "d103aa1d4adb22e817aa728424367df92018186133eda55d545af5242c173275",
+  "root_commit": "c009eaea1def79b90063f98aa9f11a5e72e05214",
+  "sha256": "aa5720235cbb40c63d95e353625727b1f04c156b6fdbcddb3f72cb459dab8b56",
   "payload": {
     "golden": {
       "events": {
@@ -1606,7 +1606,7 @@
           "snapshot_seq": 44,
           "next_since": {
             "updated_seq": 44,
-            "row_key": "a:40"
+            "row_key": "a:41"
           },
           "active_turn": {
             "turn_id": "turn_demo_0001",
@@ -1630,6 +1630,19 @@
               "turn_id": "turn_demo_0001",
               "kind": "thinking",
               "status": "streaming",
+              "updated_seq": 44,
+              "last_fanout_seq": 9
+            },
+            {
+              "activity_id": 41,
+              "call_id": "hp_t_demo_0001",
+              "item_id": "01996f2e-7b6a-7c31-9f8e-4a3d6c1b2e91",
+              "turn_id": "turn_demo_0001",
+              "kind": "tool",
+              "name": "file_search",
+              "label": "Search demo files",
+              "status": "running",
+              "created_seq": 41,
               "updated_seq": 44,
               "last_fanout_seq": 9
             }
@@ -1729,6 +1742,19 @@
               "kind": "thinking",
               "status": "done",
               "created_seq": 40,
+              "updated_seq": 45,
+              "last_fanout_seq": 9
+            },
+            {
+              "activity_id": 41,
+              "call_id": "hp_t_demo_0001",
+              "item_id": "01996f2e-7b6a-7c31-9f8e-4a3d6c1b2e91",
+              "turn_id": "turn_demo_0001",
+              "kind": "tool",
+              "name": "file_search",
+              "label": "Search demo files",
+              "status": "success",
+              "created_seq": 41,
               "updated_seq": 45,
               "last_fanout_seq": 9
             }
@@ -3783,10 +3809,18 @@
             "required": true,
             "type": "string"
           },
+          "label": {
+            "required": false,
+            "type": "string"
+          },
           "last_fanout_seq": {
             "required": false,
             "type": "number",
             "integer": true
+          },
+          "name": {
+            "required": false,
+            "type": "string"
           },
           "status": {
             "required": true,
