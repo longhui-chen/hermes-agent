@@ -1,7 +1,7 @@
 {
   "snapshot_version": 2,
-  "root_commit": "b35de64d330b4d2171285d665bed8388eac1a161",
-  "sha256": "6a4b78a64ae4c87c472c31cd382f78b86308b2e74db6e0f6eb6fe3884a345a6a",
+  "root_commit": "09071f4502c9a34c3a964643d327292eef144c7c",
+  "sha256": "8fe578c799e411178ea1a461a202db34cb8af3e477e9134bbb65e23c44090e68",
   "payload": {
     "golden": {
       "events": {
@@ -4349,6 +4349,11 @@
             "required": false,
             "type": "number",
             "integer": true
+          },
+          "item_index": {
+            "required": false,
+            "type": "number",
+            "integer": true
           }
         }
       },
@@ -4554,10 +4559,6 @@
       },
       "tail_message_row": {
         "fields": {
-          "activity_text_boundaries": {
-            "required": false,
-            "type": "array"
-          },
           "app_element": {
             "required": false,
             "type": "object"
@@ -4699,6 +4700,19 @@
           "ui_hint": {
             "required": false,
             "type": "any"
+          },
+          "canonical_omitted": {
+            "required": false,
+            "type": "boolean"
+          },
+          "item_index": {
+            "required": false,
+            "type": "number",
+            "integer": true
+          },
+          "subagent": {
+            "required": false,
+            "type": "object"
           }
         }
       }
