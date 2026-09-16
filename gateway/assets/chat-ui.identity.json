@@ -1,0 +1,10 @@
+{
+  "hermes.attachment": "attachment.id",
+  "hermes.clarify": "clarify_id",
+  "hermes.approval": "approval_id",
+  "steer_accepted": "steer_id",
+  "steer_dropped": "steer_id",
+  "context.compaction": "fixed",
+  "hermes.plan": "fixed",
+  "conversation.title": "fixed"
+}

@@ -6270,7 +6270,7 @@ class ZetAgentAdapter(APIServerAdapter):
             self._active_turn_key(session_id) if session_id else ""
         )
         self._register_active_session_turn(session_id, active_ref, agent_task)
-        projection = WriterProjection()
+        projection = WriterProjection(turn_id=getattr(agent_ref[0] if agent_ref else None, "_zettlab_active_turn_id", None))
         projection_token = projection_context.set(projection)
         try:
             return await super()._write_sse_chat_completion(

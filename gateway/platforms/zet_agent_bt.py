@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from contextvars import ContextVar
 import json
-from pathlib import Path
+from importlib.resources import files
 from typing import Any
 
 from .item_sequencer import ItemSequencer
@@ -21,14 +21,13 @@ class BTContentDelta(str):
 
 def identity_fields() -> dict[str, str]:
     """The vendored producer manifest is the runtime identity registry."""
-    manifest = json.loads((Path(__file__).parents[2] / "schemas/chat-ui.manifest.json").read_text())
-    return {name: shape["identity_field"] for name, shape in manifest["hermes"]["frame_shapes"].items()
-            if "identity_field" in shape}
+    manifest = json.loads(files("gateway").joinpath("assets/chat-ui.identity.json").read_text())
+    return manifest
 
 
 class WriterProjection:
-    def __init__(self, identities: dict[str, str] | None = None):
-        self.sequencer = ItemSequencer(identity_fields=identity_fields() if identities is None else identities)
+    def __init__(self, turn_id: str | None = None, identities: dict[str, str] | None = None):
+        self.sequencer = ItemSequencer(turn_id=turn_id, identity_fields=identity_fields() if identities is None else identities)
 
     def project(self, item: Any) -> list[Any]:
         if isinstance(item, str):
@@ -83,6 +82,7 @@ def tool_callbacks(stream_q, timing=None):
     """Only build bounded payloads here; identity is assigned when drained."""
     from gateway.platforms.api_server import _tool_completion_payload
     from tools.registry import registry
+    from agent.display import build_tool_preview, get_tool_emoji
 
     def start(call_id, name, args):
         if not isinstance(call_id, str) or not isinstance(name, str) or name.startswith("_"):
@@ -93,7 +93,7 @@ def tool_callbacks(stream_q, timing=None):
             server = entry.toolset.removeprefix("mcp-")
             registration = {"kind": "mcp", "server": server, "server_label": server}
         display = build_tool_start_display(name, args, registration)
-        stream_q.put(("__tool_progress__", {"tool": name, "toolCallId": call_id, "status": "running", **display}))
+        stream_q.put(("__tool_progress__", {"tool": name, "emoji": get_tool_emoji(name), "label": build_tool_preview(name, args) or name, "toolCallId": call_id, "status": "running", **display}))
         if timing:
             timing.observe_queued_semantic("tool_start")
 

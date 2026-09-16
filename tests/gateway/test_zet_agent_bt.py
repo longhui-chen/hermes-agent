@@ -104,3 +104,10 @@ def test_projection_is_writer_ordered_not_queue_callback_order():
     last = projection.project(tool_result)[0][1]
     assert first['index'] == last['index'] == 0
     assert next(v for v in text if isinstance(v,str)).wire_fields['hermes']['index'] == 1
+
+
+def test_rejected_text_uses_single_legacy_fallback_without_recursion():
+    projection = WriterProjection()
+    value = "x" * (256 * 1024 + 1)
+    emitted = projection.project(value)
+    assert emitted == [value]
