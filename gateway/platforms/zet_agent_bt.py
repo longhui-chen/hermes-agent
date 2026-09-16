@@ -36,14 +36,23 @@ class WriterProjection:
             self.sequencer._count("item_frame_unclassified")
             return [item]
         tag, payload = item
+        if tag == "__hermes_error__" and isinstance(payload, dict):
+            return [item]
         if tag != "__tool_progress__" or not isinstance(payload, dict):
+            self.sequencer._count("item_frame_unclassified")
             return [item]
         # Tool progress has no type discriminator in the registered wire dialect.
         tool = not payload.get("type") and isinstance(payload.get("tool"), str)
         frame = dict(payload)
+        if not tool and not isinstance(frame.get("type"), str):
+            self.sequencer._count("item_frame_unclassified")
+            return [item]
         if tool:
             frame["type"] = "tool.result" if frame.get("status") == "completed" else "tool.start"
+        rejected_before = self.sequencer.counters.get("item_frame_rejected{reason:unregistered}", 0)
         frames = self.sequencer.process(frame)
+        if self.sequencer.counters.get("item_frame_rejected{reason:unregistered}", 0) > rejected_before:
+            self.sequencer._count("item_frame_unregistered")
         if frames == [frame] and "item_id" not in frame and "index" not in frame:
             return [item]  # rejected producer input retains the existing fallback
         result = []

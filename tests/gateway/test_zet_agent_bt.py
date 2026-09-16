@@ -13,7 +13,7 @@ from gateway.platforms.zet_agent import ZetAgentAdapter
 from gateway.platforms.zet_agent_bt import WriterProjection, projection_context
 
 
-async def write_flow(monkeypatch, items, result):
+async def write_flow(monkeypatch, items, result, projection=None):
     response = SimpleNamespace(prepare=AsyncMock(), write=AsyncMock())
     monkeypatch.setattr(api_server.web, 'StreamResponse', lambda **_: response)
     adapter = object.__new__(ZetAgentAdapter)
@@ -23,7 +23,7 @@ async def write_flow(monkeypatch, items, result):
     queue.put(None)
     task = asyncio.get_running_loop().create_future()
     task.set_result((result, {}))
-    token = projection_context.set(WriterProjection())
+    token = projection_context.set(projection or WriterProjection())
     try:
         await api_server.APIServerAdapter._write_sse_chat_completion(
             adapter, SimpleNamespace(headers={}), 'completion', 'model', 100, queue, task)
@@ -111,3 +111,10 @@ def test_rejected_text_uses_single_legacy_fallback_without_recursion():
     value = "x" * (256 * 1024 + 1)
     emitted = projection.project(value)
     assert emitted == [value]
+
+
+@pytest.mark.asyncio
+async def test_writer_classifies_non_frame_queue_values(monkeypatch):
+    projection = WriterProjection()
+    await write_flow(monkeypatch, [17], {"completed": True}, projection)
+    assert projection.sequencer.counters["item_frame_unclassified"] == 1

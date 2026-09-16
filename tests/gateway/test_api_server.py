@@ -31,25 +31,8 @@ from aiohttp.test_utils import TestClient, TestServer
 from agent.browser_state_preview import MAX_PREVIEW_BYTES
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms import api_server as api_server_module
-from gateway.platforms.api_server import (
-    APIServerAdapter,
-    ResponseStore,
-    _IdempotencyCache,
-    _derive_chat_session_id,
-    _extract_creation_action_receipt_transport,
-    _has_creation_recommendation_wrapper,
-    _is_canonical_final_creation_action,
-    _make_request_fingerprint,
-    _hermes_version,
-    _redact_api_error_text,
-    _request_agent_overrides,
-    _extract_connector_route_capability,
-    _redact_api_error_text,
-    _tool_completion_payload,
-    check_api_server_requirements,
-    cors_middleware,
-    security_headers_middleware,
-)
+from gateway.platforms.zet_agent import _extract_creation_action_receipt_transport, _extract_connector_route_capability, _extract_hardware_execution_token
+from gateway.platforms.api_server import APIServerAdapter, ResponseStore, _IdempotencyCache, _derive_chat_session_id, _has_creation_recommendation_wrapper, _is_canonical_final_creation_action, _make_request_fingerprint, _hermes_version, _redact_api_error_text, _request_agent_overrides, _redact_api_error_text, _tool_completion_payload, check_api_server_requirements, cors_middleware, security_headers_middleware
 
 # ---------------------------------------------------------------------------
 # check_api_server_requirements
@@ -57,7 +40,9 @@ from gateway.platforms.api_server import (
 
 
 def test_extract_connector_policy_disabled_skills_is_bounded_and_normalized():
-    extract = api_server_module._extract_connector_policy_disabled_skills
+    from gateway.platforms.zet_agent import _extract_connector_policy_disabled_skills
+
+    extract = _extract_connector_policy_disabled_skills
     assert extract({"metadata": {"connector_policy_disabled_skills": [
         "github", "github", "bad/name", " jira ", 42,
     ]}}) == ("github", "jira")
@@ -1995,7 +1980,7 @@ class TestChatCompletionsEndpoint:
         不设上限的话，少量携带超长 turn_id 的请求就能把端侧内存吃掉，而这些
         请求本身完全合法、不会被任何其他门拦下。
         """
-        from gateway.platforms.api_server import MAX_CANONICAL_FINAL_TURN_ID_LEN
+        from gateway.platforms.zet_agent import MAX_CANONICAL_FINAL_TURN_ID_LEN
 
         body = self._canonical_action_body()
         body["metadata"]["turn_id"] = "t" * (MAX_CANONICAL_FINAL_TURN_ID_LEN + 1)
@@ -2012,7 +1997,7 @@ class TestChatCompletionsEndpoint:
     @pytest.mark.asyncio
     async def test_canonical_final_endpoint_allows_turn_id_at_limit(self, adapter):
         """对照：正好卡在上限的 turn_id 不该被误伤。"""
-        from gateway.platforms.api_server import MAX_CANONICAL_FINAL_TURN_ID_LEN
+        from gateway.platforms.zet_agent import MAX_CANONICAL_FINAL_TURN_ID_LEN
 
         body = self._canonical_action_body()
         body["metadata"]["turn_id"] = "t" * MAX_CANONICAL_FINAL_TURN_ID_LEN
@@ -2899,6 +2884,27 @@ class TestChatCompletionsEndpoint:
         assert '"recoverable": false' in body
         assert '"finish_reason": "error"' in body
         assert "[DONE]" in body
+
+    @pytest.mark.asyncio
+    async def test_stream_tail_and_item_completion_precede_error(self, adapter):
+        result = {"final_response": "trusted-tail", "failed": True,
+                  "completed": False, "error": "provider failed"}
+        adapter._pre_finish_frames = lambda result: (
+            ("__tool_progress__", {"type": "item.completed", "item_id": "finished"}),
+        )
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as run:
+                run.return_value = (result, {})
+                response = await cli.post("/v1/chat/completions", json={
+                    "model": "test", "messages": [{"role": "user", "content": "hi"}],
+                    "stream": True,
+                })
+                body = await response.text()
+        assert response.status == 200
+        assert body.index("trusted-tail") < body.index("item.completed")
+        assert body.index("item.completed") < body.index("event: hermes.error")
+        assert body.index("event: hermes.error") < body.index('"finish_reason": "error"')
 
     @pytest.mark.asyncio
     async def test_stream_agent_failure_hermes_error_is_redacted(self, adapter):
@@ -5929,8 +5935,8 @@ def test_hardware_execution_token_parser_accepts_only_fixed_opaque_header():
     request = types.SimpleNamespace(
         headers={"X-Zettlab-Hardware-Execution-Token": "b" * 64}
     )
-    assert api_server_module._extract_hardware_execution_token(request) == "b" * 64
-    assert api_server_module._extract_hardware_execution_token(
+    assert _extract_hardware_execution_token(request) == "b" * 64
+    assert _extract_hardware_execution_token(
         types.SimpleNamespace(
             headers={"X-Zettlab-Hardware-Execution-Token": "not-a-token"}
         )

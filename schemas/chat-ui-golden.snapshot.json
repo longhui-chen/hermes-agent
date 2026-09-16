@@ -1,7 +1,7 @@
 {
   "snapshot_version": 2,
-  "root_commit": "09071f4502c9a34c3a964643d327292eef144c7c",
-  "sha256": "8fe578c799e411178ea1a461a202db34cb8af3e477e9134bbb65e23c44090e68",
+  "root_commit": "cfb9520cf7f3cc9640051ad14b692d569adc7e90",
+  "sha256": "94b10a59545cf736a3672fbebec122f461e46be405f94687ce3a25ba42981810",
   "payload": {
     "golden": {
       "events": {
@@ -61,7 +61,7 @@
             "expires_at_ms": 1756973100000,
             "state": "cancelled",
             "state_reason": "delivery_failed",
-            "index": 1
+            "index": 7
           }
         },
         "approval.cancelled.session_reset": {
@@ -84,7 +84,7 @@
             "expires_at_ms": 1756973100000,
             "state": "cancelled",
             "state_reason": "session_reset",
-            "index": 1
+            "index": 7
           }
         },
         "approval.cancelled.turn_interrupted": {
@@ -107,7 +107,7 @@
             "expires_at_ms": 1756973100000,
             "state": "cancelled",
             "state_reason": "turn_interrupted",
-            "index": 1
+            "index": 7
           }
         },
         "approval.expired.timeout": {
@@ -130,7 +130,7 @@
             "expires_at_ms": 1756973100000,
             "state": "expired",
             "state_reason": "timeout",
-            "index": 1
+            "index": 7
           }
         },
         "approval": {
@@ -153,7 +153,7 @@
             "expires_at_ms": 1756973100000,
             "state": "",
             "state_reason": "",
-            "index": 1
+            "index": 7
           }
         },
         "approval.runtime_lost.gateway_restart": {
@@ -176,7 +176,7 @@
             "expires_at_ms": 1756973100000,
             "state": "runtime_lost",
             "state_reason": "gateway_restart",
-            "index": 1
+            "index": 7
           }
         },
         "approval.runtime_lost.request_unknown": {
@@ -199,7 +199,7 @@
             "expires_at_ms": 1756973100000,
             "state": "runtime_lost",
             "state_reason": "request_unknown",
-            "index": 1
+            "index": 7
           }
         },
         "attachment.action.ack": {
@@ -226,7 +226,7 @@
           "backend": "hermes",
           "data": {
             "attachment": {
-              "id": "cg-proposal_demo_0001",
+              "id": "mc-turn_demo_0001",
               "category": "interactive",
               "kind": "connector.connect",
               "v": 1,
@@ -259,7 +259,7 @@
               "dedup_key": "connector:notion",
               "fallback_text": "连接 Notion 以继续"
             },
-            "index": 1
+            "index": 5
           }
         },
         "capabilities": {
@@ -323,7 +323,7 @@
           "ts": 1756972800000,
           "backend": "hermes",
           "data": {
-            "clarify_id": "clr_demo_0001",
+            "clarify_id": "ia_demo_0002",
             "question": "周末指哪两天？",
             "choices_offered": [
               "上周末",
@@ -333,7 +333,7 @@
             "state": "cancelled",
             "state_reason": "delivery_failed",
             "connector_setup": null,
-            "index": 1
+            "index": 6
           }
         },
         "clarify.cancelled.session_reset": {
@@ -344,7 +344,7 @@
           "ts": 1756972800000,
           "backend": "hermes",
           "data": {
-            "clarify_id": "clr_demo_0001",
+            "clarify_id": "ia_demo_0002",
             "question": "周末指哪两天？",
             "choices_offered": [
               "上周末",
@@ -354,7 +354,7 @@
             "state": "cancelled",
             "state_reason": "session_reset",
             "connector_setup": null,
-            "index": 1
+            "index": 6
           }
         },
         "clarify.cancelled.turn_interrupted": {
@@ -365,7 +365,7 @@
           "ts": 1756972800000,
           "backend": "hermes",
           "data": {
-            "clarify_id": "clr_demo_0001",
+            "clarify_id": "ia_demo_0002",
             "question": "周末指哪两天？",
             "choices_offered": [
               "上周末",
@@ -375,7 +375,7 @@
             "state": "cancelled",
             "state_reason": "turn_interrupted",
             "connector_setup": null,
-            "index": 1
+            "index": 6
           }
         },
         "clarify.connector-setup": {
@@ -386,7 +386,7 @@
           "ts": 1756972800000,
           "backend": "hermes",
           "data": {
-            "clarify_id": "clr_demo_0001",
+            "clarify_id": "ia_demo_0002",
             "question": "Connector setup",
             "choices_offered": [],
             "expires_at_ms": 1756973100000,
@@ -395,7 +395,7 @@
             "connector_setup": {
               "resource_kind": "camera"
             },
-            "index": 1
+            "index": 6
           }
         },
         "clarify.expired.timeout": {
@@ -406,7 +406,7 @@
           "ts": 1756972800000,
           "backend": "hermes",
           "data": {
-            "clarify_id": "clr_demo_0001",
+            "clarify_id": "ia_demo_0002",
             "question": "周末指哪两天？",
             "choices_offered": [
               "上周末",
@@ -416,7 +416,7 @@
             "state": "expired",
             "state_reason": "timeout",
             "connector_setup": null,
-            "index": 1
+            "index": 6
           }
         },
         "clarify": {
@@ -427,7 +427,7 @@
           "ts": 1756972800000,
           "backend": "hermes",
           "data": {
-            "clarify_id": "clr_demo_0001",
+            "clarify_id": "ia_demo_0002",
             "question": "周末指哪两天？",
             "choices_offered": [
               "上周末",
@@ -437,7 +437,7 @@
             "state": "",
             "state_reason": "",
             "connector_setup": null,
-            "index": 1
+            "index": 6
           }
         },
         "clarify.runtime_lost.gateway_restart": {
@@ -448,7 +448,7 @@
           "ts": 1756972800000,
           "backend": "hermes",
           "data": {
-            "clarify_id": "clr_demo_0001",
+            "clarify_id": "ia_demo_0002",
             "question": "周末指哪两天？",
             "choices_offered": [
               "上周末",
@@ -458,7 +458,7 @@
             "state": "runtime_lost",
             "state_reason": "gateway_restart",
             "connector_setup": null,
-            "index": 1
+            "index": 6
           }
         },
         "clarify.runtime_lost.request_unknown": {
@@ -469,7 +469,7 @@
           "ts": 1756972800000,
           "backend": "hermes",
           "data": {
-            "clarify_id": "clr_demo_0001",
+            "clarify_id": "ia_demo_0002",
             "question": "周末指哪两天？",
             "choices_offered": [
               "上周末",
@@ -479,7 +479,7 @@
             "state": "runtime_lost",
             "state_reason": "request_unknown",
             "connector_setup": null,
-            "index": 1
+            "index": 6
           }
         },
         "context.compaction": {
@@ -494,7 +494,7 @@
             "message": "上下文已压缩",
             "old_session_id": "sess_demo_0001",
             "new_session_id": "sess_demo_0002",
-            "index": 1
+            "index": 8
           }
         },
         "conversation.title": {
@@ -504,7 +504,7 @@
           "data": {
             "title": "周末公园 vlog",
             "session_id": "sess_demo_0001",
-            "index": 1
+            "index": 10
           }
         },
         "delegation.status": {
@@ -530,7 +530,7 @@
             "status": "running",
             "duration_seconds": 3.5,
             "item_id": "01996f2e-7b6a-7c35-9f8e-4a3d6c1b2e90",
-            "index": 5,
+            "index": 4,
             "v": 1
           }
         },
@@ -798,7 +798,7 @@
             "plan_id": "plan_demo_0001",
             "status": "pending",
             "revision_requested": false,
-            "index": 1
+            "index": 9
           }
         },
         "reasoning.delta": {
@@ -870,7 +870,7 @@
             "steer_id": "01998f2d-7c00-7000-8000-000000000001",
             "text": "顺便加上字幕",
             "reason": "unconsumed",
-            "index": 1
+            "index": 11
           }
         },
         "steer": {
@@ -883,7 +883,7 @@
           "data": {
             "steer_id": "01998f2d-7c00-7000-8000-000000000001",
             "text": "顺便加上字幕",
-            "index": 1
+            "index": 11
           }
         },
         "text.delta": {
@@ -1503,13 +1503,13 @@
           "after_messages": 12,
           "after_tokens": 6000,
           "error": "",
-          "index": 7
+          "index": 8
         },
         "conversation.title": {
           "type": "conversation.title",
           "turn_id": "turn_demo_0001",
           "title": "周末公园 vlog",
-          "index": 9
+          "index": 10
         },
         "finish-chunk": {
           "id": "chatcmpl_demo_0001",
@@ -1572,7 +1572,8 @@
           "expires_at_ms": 1756973100000,
           "validation_target": "terminal",
           "state": "cancelled",
-          "state_reason": "delivery_failed"
+          "state_reason": "delivery_failed",
+          "index": 7
         },
         "hermes.approval.cancelled.session_reset": {
           "type": "hermes.approval",
@@ -1591,7 +1592,8 @@
           "expires_at_ms": 1756973100000,
           "validation_target": "terminal",
           "state": "cancelled",
-          "state_reason": "session_reset"
+          "state_reason": "session_reset",
+          "index": 7
         },
         "hermes.approval.cancelled.turn_interrupted": {
           "type": "hermes.approval",
@@ -1610,7 +1612,8 @@
           "expires_at_ms": 1756973100000,
           "validation_target": "terminal",
           "state": "cancelled",
-          "state_reason": "turn_interrupted"
+          "state_reason": "turn_interrupted",
+          "index": 7
         },
         "hermes.approval.expired.timeout": {
           "type": "hermes.approval",
@@ -1629,7 +1632,8 @@
           "expires_at_ms": 1756973100000,
           "validation_target": "terminal",
           "state": "expired",
-          "state_reason": "timeout"
+          "state_reason": "timeout",
+          "index": 7
         },
         "hermes.approval": {
           "type": "hermes.approval",
@@ -1647,7 +1651,7 @@
           ],
           "expires_at_ms": 1756973100000,
           "validation_target": "terminal",
-          "index": 6
+          "index": 7
         },
         "hermes.attachment": {
           "type": "hermes.attachment",
@@ -1667,7 +1671,7 @@
               ]
             }
           },
-          "index": 4
+          "index": 5
         },
         "hermes.clarify.cancelled.delivery_failed": {
           "type": "hermes.clarify",
@@ -1683,7 +1687,8 @@
           "expires_at_ms": 1756973100000,
           "turn_id": "turn_demo_0001",
           "state": "cancelled",
-          "state_reason": "delivery_failed"
+          "state_reason": "delivery_failed",
+          "index": 6
         },
         "hermes.clarify.cancelled.session_reset": {
           "type": "hermes.clarify",
@@ -1699,7 +1704,8 @@
           "expires_at_ms": 1756973100000,
           "turn_id": "turn_demo_0001",
           "state": "cancelled",
-          "state_reason": "session_reset"
+          "state_reason": "session_reset",
+          "index": 6
         },
         "hermes.clarify.cancelled.turn_interrupted": {
           "type": "hermes.clarify",
@@ -1715,7 +1721,8 @@
           "expires_at_ms": 1756973100000,
           "turn_id": "turn_demo_0001",
           "state": "cancelled",
-          "state_reason": "turn_interrupted"
+          "state_reason": "turn_interrupted",
+          "index": 6
         },
         "hermes.clarify.expired.timeout": {
           "type": "hermes.clarify",
@@ -1731,7 +1738,8 @@
           "expires_at_ms": 1756973100000,
           "turn_id": "turn_demo_0001",
           "state": "expired",
-          "state_reason": "timeout"
+          "state_reason": "timeout",
+          "index": 6
         },
         "hermes.clarify": {
           "type": "hermes.clarify",
@@ -1746,7 +1754,7 @@
           "connector_setup": {
             "resource_kind": "camera"
           },
-          "index": 5
+          "index": 6
         },
         "hermes.delegation.progress": {
           "type": "hermes.delegation.progress",
@@ -1767,7 +1775,7 @@
           "depth": 1,
           "exit_reason": "",
           "item_id": "01996f2e-7b6a-7c35-9f8e-4a3d6c1b2e90",
-          "index": 5,
+          "index": 4,
           "v": 1
         },
         "hermes.plan": {
@@ -1786,7 +1794,7 @@
             }
           ],
           "auto_execute": false,
-          "index": 8
+          "index": 9
         },
         "hermes.todo": {
           "type": "hermes.todo",
@@ -1842,7 +1850,7 @@
           "steer_id": "01998f2d-7c00-7000-8000-000000000001",
           "turn_id": "turn_demo_0001",
           "text": "顺便加上字幕",
-          "index": 10
+          "index": 11
         },
         "steer_dropped": {
           "type": "steer_dropped",
@@ -1850,7 +1858,7 @@
           "turn_id": "turn_demo_0001",
           "text": "顺便加上字幕",
           "reason": "unconsumed",
-          "index": 10
+          "index": 11
         },
         "tool-frame.completed": {
           "tool": "image_generate",
@@ -4726,9 +4734,7 @@
           "text"
         ],
         "reason": "Non-frame dict literals in zet_agent.py that also carry a \"type\" key: reasoning-config `disabled`, the OpenAI-style error body `invalid_request_error`, and `text` content blocks. Any other undotted type literal is a new frame until registered here.",
-        "frame_shape_exempt": {
-          "context.compaction": "The frame is the upstream compaction status payload forwarded as-is (dict(payload) + type); its fields are frozen by golden/hermes/context.compaction.json and asserted by tests/gateway/test_zet_agent_producer_conformance.py against the three real producer shapes."
-        },
+        "frame_shape_exempt": {},
         "identity_fields": {
           "hermes.attachment": "attachment.id",
           "hermes.clarify": "clarify_id",
@@ -4746,7 +4752,57 @@
           "todo",
           "subagent"
         ],
-        "identity_fields_reason": "BT-T1 frozen identity paths are producer-owned and must be mirrored before T2 wiring."
+        "identity_fields_reason": "BT-T1 frozen identity paths are producer-owned and must be mirrored before T2 wiring.",
+        "item_trajectory": [
+          [
+            "reasoning.delta"
+          ],
+          [
+            "content-chunk"
+          ],
+          [
+            "tool-frame.running"
+          ],
+          [
+            "hermes.todo"
+          ],
+          [
+            "hermes.delegation.progress"
+          ],
+          [
+            "hermes.attachment"
+          ],
+          [
+            "hermes.clarify"
+          ],
+          [
+            "hermes.approval"
+          ],
+          [
+            "context.compaction"
+          ],
+          [
+            "hermes.plan"
+          ],
+          [
+            "conversation.title"
+          ],
+          [
+            "steer_accepted",
+            "steer_dropped"
+          ]
+        ],
+        "translated_event_types": {
+          "delegation.status": "hermes.delegation.progress",
+          "attachment.upsert": "hermes.attachment",
+          "clarify": "hermes.clarify",
+          "approval": "hermes.approval",
+          "context.compaction": "context.compaction",
+          "plan.preview": "hermes.plan",
+          "conversation.title": "conversation.title",
+          "steer": "steer_accepted",
+          "steer.dropped": "steer_dropped"
+        }
       },
       "registry": {
         "web": {
