@@ -493,6 +493,8 @@ def _extract_response_mode(body: Dict[str, Any]) -> str:
 
 def _extract_plan_ack(body: Dict[str, Any]) -> Dict[str, Any]:
     """Extract the App's structured Plan Review action from metadata."""
+    # zettlab-overlay(BT): call fork-owned request helpers lazily to avoid adapter import cycle; upstream: https://github.com/longhui-chen/hermes-agent/pull/1
+    from gateway.platforms.zet_agent import _extract_turn_id
     metadata = body.get("metadata")
     if not isinstance(metadata, dict):
         return {}
@@ -569,75 +571,6 @@ def _resolve_plan_auto_execute(meta_override: Optional[bool]) -> bool:
         from utils import is_truthy_value
         return is_truthy_value(raw, default=False)
     return False
-
-
-# MAX_CANONICAL_FINAL_TURN_ID_LEN 限住会被 governor 当作 pending receipt 键、
-# 并驻留到 TTL 到期的那个 turn_id。正常值是 local-server 的 UUID 类关联令牌，
-# 200 已经很宽松；不设上限则少量请求就能长期占住设备内存。
-# zettlab-overlay(H12-BT): turn_id 提取与长度上限，BT T2 纯搬家到 gateway/platforms/zet_agent.py; upstream: none
-MAX_CANONICAL_FINAL_TURN_ID_LEN = 200
-
-
-# Upper bound for metadata.turn_id (characters). One limit for every path:
-# the ordinary chat request (the id is echoed onto every extension frame of the
-# turn, so it must be bounded) and canonical-final (which already refused ids
-# longer than MAX_CANONICAL_FINAL_TURN_ID_LEN). Keeping them equal means a
-# 129–200 char id that canonical-final accepts is never silently dropped here.
-MAX_TURN_ID_LEN = MAX_CANONICAL_FINAL_TURN_ID_LEN
-
-
-def _extract_turn_id(body: Dict[str, Any]) -> str:
-    """Extract metadata.turn_id (zettlab local-server's per-turn correlation
-    token) so the NAS agent-search fallback can echo it back as the
-    X-Zettlab-Turn-Id header. Reject only what would corrupt that header
-    (whitespace / control chars); don't restrict the charset further —
-    local-server accepts any trimmed token, so a stricter filter would silently
-    drop valid ids and lose the precise-turn pinning."""
-    metadata = body.get("metadata")
-    if not isinstance(metadata, dict):
-        return ""
-    raw = metadata.get("turn_id", metadata.get("turnId", ""))
-    tid = str(raw or "").strip()
-    if not tid or any(c.isspace() or ord(c) < 0x20 for c in tid):
-        return ""
-    # The id is echoed onto every extension frame of the turn (HERMES_TURN_ID →
-    # zet_agent `_stamp_extension_turn_id`), so an oversized value would be
-    # re-serialised hundreds of times per streamed turn. Anything past the cap
-    # is dropped rather than truncated (a truncated id would silently
-    # mis-correlate); the cap is the canonical-final one so both paths agree.
-    if len(tid) > MAX_TURN_ID_LEN:
-        return ""
-    return tid
-
-
-# zettlab-overlay(H13-unowned): 连接器路由能力提取，BT T2 纯搬家到 gateway/platforms/zet_agent.py; upstream: none
-def _extract_connector_route_capability(body: Dict[str, Any]) -> str:
-    """Extract local-server's opaque per-turn Connector routing capability.
-
-    The fixed 32-byte base64url shape keeps malformed or oversized metadata
-    out of the dedicated runner environment. It is transport-only and never
-    becomes a general session variable or model-visible instruction.
-    """
-    metadata = body.get("metadata")
-    if not isinstance(metadata, dict):
-        return ""
-    raw = metadata.get("connector_route_capability")
-    if not isinstance(raw, str):
-        return ""
-    capability = raw.strip()
-    if re.fullmatch(r"[A-Za-z0-9_-]{43}", capability) is None:
-        return ""
-    return capability
-
-
-def _extract_creation_action_receipt_transport(body: Dict[str, Any]) -> str:
-    metadata = body.get("metadata")
-    if not isinstance(metadata, dict):
-        return ""
-    raw = metadata.get("creation_action_receipt_transport")
-    if raw == "canonical_final_v1":
-        return "canonical_final_v1"
-    return ""
 
 
 # 与 _handle_chat_completions 收进 conversation_messages 的那组 role 保持同源。
@@ -757,105 +690,6 @@ def _is_canonical_final_creation_action(body: Dict[str, Any]) -> bool:
         and isinstance(payload.get("dedup_key"), str)
         and payload["dedup_key"].strip()
     )
-
-
-# zettlab-overlay(H13-unowned): 可信技能入口与执行策略提取，BT T2 纯搬家到 gateway/platforms/zet_agent.py; upstream: none
-def _extract_skill_slug(body: Dict[str, Any]) -> str:
-    """Extract metadata.skill_slug — the App quick-pick's EXPLICIT skill
-    invocation signal (ZET fork).
-
-    The client owns the text↔selection UX (it drops the field when the user
-    edits the inserted "/<slug>" token away); the server NEVER sniffs message
-    text for slash commands — in-band signaling is ambiguous ("/<skill> 是什么"
-    would fire the skill) and this explicit field is the only trigger.
-    Absent/malformed → no skill. A leading slash is tolerated and stripped so
-    the client may send either "deep-research" or "/deep-research"."""
-    metadata = body.get("metadata")
-    if not isinstance(metadata, dict):
-        return ""
-    raw = metadata.get("skill_slug", metadata.get("skillSlug", ""))
-    slug = str(raw or "").strip().lstrip("/")
-    if not slug or any(c.isspace() or ord(c) < 0x20 for c in slug):
-        return ""
-    return slug
-
-
-def _extract_connector_policy_disabled_skills(body: Dict[str, Any]) -> tuple[str, ...]:
-    """Read the machine-authored Chat visibility overlay from metadata."""
-    metadata = body.get("metadata")
-    if not isinstance(metadata, dict):
-        return ()
-    raw = metadata.get("connector_policy_disabled_skills")
-    if not isinstance(raw, list) or len(raw) > 2048:
-        return ()
-    out: list[str] = []
-    seen: set[str] = set()
-    for value in raw:
-        skill = str(value or "").strip()
-        if re.fullmatch(r"[a-z][a-z0-9_-]{1,127}", skill) and skill not in seen:
-            seen.add(skill)
-            out.append(skill)
-    return tuple(out)
-
-
-def _strip_skill_display_token(user_message: Any, skill_slug: str) -> Any:
-    """Remove only the App quick-pick token from a string user task."""
-    if not isinstance(user_message, str) or not skill_slug:
-        return user_message
-    token = "/" + skill_slug
-    task_text = re.sub(
-        r"(?<!\S)" + re.escape(token) + r"(?!\S)",
-        "",
-        user_message,
-    )
-    return "\n".join(
-        line for line in (value.rstrip() for value in task_text.splitlines()) if line
-    ).strip()
-
-
-def _trusted_skill_task_message(user_message: Any, skill_slug: str) -> Any:
-    """Preserve user-authored task text separately from transport selection."""
-    return _strip_skill_display_token(user_message, skill_slug)
-
-
-def _is_video_edit_skill_slug(skill_slug: str) -> bool:
-    """Identify the ordinary video orchestration Skill for silent turns.
-
-    Silent automation normally skips Skill expansion because it has no
-    interactive user-facing command flow. Weekly video still needs the
-    Skill's business sequencing instructions; this prompt-only expansion does
-    not restore ``skill_view`` or any capability/attestation protocol.
-    """
-    normalized = str(skill_slug or "").strip().lower().strip("/")
-    return normalized in {
-        "video-edit-workflow-mini",
-        "video-edit-workflow",
-        "video-edit",
-        "video_edit",
-    }
-
-
-_HARDWARE_EXECUTION_TOKEN_HEADER = "X-Zettlab-Hardware-Execution-Token"
-
-
-def _extract_hardware_execution_token(request: Any) -> str:
-    """Relay the dedicated capability only to trusted hardware helpers."""
-    if request is None:
-        return ""
-    token = str(
-        request.headers.get(_HARDWARE_EXECUTION_TOKEN_HEADER, "") or ""
-    ).strip()
-    return token if re.fullmatch(r"[0-9a-f]{64}", token) is not None else ""
-
-
-def _extract_requested_execution_policy(body: Dict[str, Any]) -> str:
-    metadata = body.get("metadata")
-    if not isinstance(metadata, dict):
-        return ""
-    raw = metadata.get("execution_policy", metadata.get("executionPolicy", ""))
-    if not isinstance(raw, str):
-        return ""
-    return raw.strip().lower()
 
 
 def _normalize_chat_content(
@@ -1255,52 +1089,6 @@ def _content_has_image_payload(content: Any) -> bool:
 def _content_has_image(content: Any) -> bool:
     """Compatibility name used by provider image fallback paths."""
     return _content_has_image_payload(content)
-
-
-def _extract_current_turn_reference_image(content: Any) -> str:
-    """Return one bounded data image from the current normalized user turn.
-
-    This is intentionally fail-closed without rejecting the surrounding chat:
-    remote URLs, malformed bytes, unsupported formats, and turns containing a
-    second image simply do not grant the desktop-pet tool image access.
-    """
-    if not isinstance(content, list):
-        return ""
-    image_urls: List[str] = []
-    for part in content:
-        if not isinstance(part, dict) or part.get("type") != "image_url":
-            continue
-        image_ref = part.get("image_url")
-        value = image_ref.get("url") if isinstance(image_ref, dict) else None
-        if isinstance(value, str) and value.strip():
-            image_urls.append(value.strip())
-    if len(image_urls) != 1:
-        return ""
-
-    value = image_urls[0]
-    header, separator, encoded = value.partition(",")
-    if not separator or not header.startswith("data:") or not header.endswith(";base64"):
-        return ""
-    declared_mime = header[len("data:") : -len(";base64")].lower()
-    if declared_mime not in _CURRENT_TURN_IMAGE_MIMES or not encoded:
-        return ""
-    padding = 2 if encoded.endswith("==") else 1 if encoded.endswith("=") else 0
-    if len(encoded) % 4 != 0:
-        return ""
-    decoded_size = len(encoded) // 4 * 3 - padding
-    if decoded_size <= 0 or decoded_size > _CURRENT_TURN_IMAGE_MAX_BYTES:
-        return ""
-    try:
-        raw = base64.b64decode(encoded, validate=True)
-    except (binascii.Error, ValueError):
-        return ""
-    if declared_mime == "image/png":
-        valid_magic = raw.startswith(b"\x89PNG\r\n\x1a\n")
-    elif declared_mime == "image/jpeg":
-        valid_magic = raw.startswith(b"\xff\xd8\xff")
-    else:
-        valid_magic = len(raw) >= 12 and raw.startswith(b"RIFF") and raw[8:12] == b"WEBP"
-    return value if valid_magic else ""
 
 
 # zettlab-overlay(H17-B1): 终态单一来源的错误取材与归一，B1 保留; upstream: none
@@ -6141,6 +5929,8 @@ class APIServerAdapter(BasePlatformAdapter):
     async def _handle_canonical_final_chat_completions(
         self, request: "web.Request"
     ) -> "web.Response":
+        # zettlab-overlay(BT): call fork-owned request helpers lazily to avoid adapter import cycle; upstream: https://github.com/longhui-chen/hermes-agent/pull/1
+        from gateway.platforms.zet_agent import MAX_CANONICAL_FINAL_TURN_ID_LEN, _extract_creation_action_receipt_transport, _extract_turn_id
         auth_err = self._check_auth(request)
         if auth_err:
             return auth_err
@@ -6209,6 +5999,8 @@ class APIServerAdapter(BasePlatformAdapter):
     @_admit_api_agent_request
     async def _handle_chat_completions(self, request: "web.Request") -> "web.Response":
         """POST /v1/chat/completions — OpenAI Chat Completions format."""
+        # zettlab-overlay(BT): call fork-owned request helpers lazily to avoid adapter import cycle; upstream: https://github.com/longhui-chen/hermes-agent/pull/1
+        from gateway.platforms.zet_agent import _extract_connector_policy_disabled_skills, _extract_connector_route_capability, _extract_creation_action_receipt_transport, _extract_current_turn_reference_image, _extract_hardware_execution_token, _extract_requested_execution_policy, _extract_skill_slug, _extract_turn_id, _is_video_edit_skill_slug, _trusted_skill_task_message
         # zettlab-overlay(H20-unowned): prestream 入口时间戳，收敛时 hook 化或迁出稳定层; upstream: none
         prestream_ingress_at = time.monotonic()
         # Bound total in-flight agent runs (configurable; #7483).
@@ -7079,7 +6871,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 """
                 semantic_event = None
                 # zettlab-overlay(BT): project after streamed_text_parts append; upstream: https://github.com/longhui-chen/hermes-agent/pull/1
-                if not _projected and (isinstance(item, str) or isinstance(item, tuple)):
+                if not _projected:
                     if isinstance(item, str):
                         streamed_text_parts.append(item)
                     for projected in getattr(self, "_project_stream_item", lambda value: (value,))(item):
@@ -7212,9 +7004,6 @@ class APIServerAdapter(BasePlatformAdapter):
                             emit_terminals(terminal_turn_id)
                     except Exception:
                         logger.debug("terminal interaction emission failed", exc_info=True)
-            if error_payload:
-                await _emit(("__hermes_error__", error_payload))
-
             # zettlab-overlay(H15-B3): 流关闭前补发 transform_suffix，与 H14 同批删除; upstream: none
             # Output-transform hooks run after the model token stream has
             # finished. Chat platforms can edit the streamed message in place,
@@ -7256,6 +7045,9 @@ class APIServerAdapter(BasePlatformAdapter):
             # zettlab-overlay(BT): pre-finish frames share the B1 terminal seam; upstream: https://github.com/longhui-chen/hermes-agent/pull/1
             for projected in getattr(self, "_pre_finish_frames", lambda result: ())(result_dict):
                 await _emit(projected, True)
+            if error_payload:
+                await _emit(("__hermes_error__", error_payload))
+
             # Finish chunk
             finish_chunk = {
                 "id": completion_id, "object": "chat.completion.chunk",

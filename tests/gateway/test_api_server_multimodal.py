@@ -14,15 +14,8 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 from gateway.config import PlatformConfig
-from gateway.platforms.api_server import (
-    APIServerAdapter,
-    _content_has_image,
-    _content_has_visible_payload,
-    _extract_current_turn_reference_image,
-    _normalize_multimodal_content,
-    cors_middleware,
-    security_headers_middleware,
-)
+from gateway.platforms.zet_agent import _extract_current_turn_reference_image
+from gateway.platforms.api_server import APIServerAdapter, _content_has_image, _content_has_visible_payload, _normalize_multimodal_content, cors_middleware, security_headers_middleware
 
 
 TINY_PNG_DATA_URL = (
