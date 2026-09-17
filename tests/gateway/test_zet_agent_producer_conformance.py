@@ -245,3 +245,72 @@ def test_saturated_producers_reject_and_count_without_enqueuing():
     for kind in ("attachment", "subagent"):
         key = f"item_frame_dropped_backlog{{kind={kind}}}"
         assert after[key] == before.get(key, 0) + 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("abort", [False, True])
+async def test_bt_counters_reach_existing_health_from_request_writers(monkeypatch, abort):
+    """Normal/failed writers export process totals without retaining profile IDs."""
+    from queue import Queue
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+    from aiohttp import web
+    from aiohttp.test_utils import TestClient, TestServer
+    from gateway.platforms import api_server, zet_agent_metrics as metrics
+    from gateway.platforms.zet_agent import ZetAgentAdapter
+    from gateway.platforms.zet_agent_bt import projection_context
+
+    metrics.reset_for_tests()
+    adapter = object.__new__(ZetAgentAdapter)
+    monkeypatch.setattr(adapter, "_register_active_session_turn", lambda *args: None)
+    monkeypatch.setattr(adapter, "_clear_active_session_turn", lambda *args: None)
+    projections = []
+
+    async def drain(*args, **kwargs):
+        projection = projection_context.get()
+        projections.append(projection)
+        projection.project("hello")
+        projection.project(17)
+        projection.project(("__tool_progress__", {"type": "unknown.secret-profile"}))
+        queue = args[5]
+        assert queue.get_nowait() is None
+        if abort:
+            raise ConnectionResetError("reader left")
+
+    monkeypatch.setattr(api_server.APIServerAdapter, "_write_sse_chat_completion", drain)
+    for _ in range(2):
+        queue = Queue()
+        queue.put(None)
+        queue.put(("__tool_progress__", {"type": "conversation.title", "title": "late"}))
+        try:
+            await adapter._write_sse_chat_completion(SimpleNamespace(), "id", "model", 1, queue, None)
+        except ConnectionResetError:
+            assert abort
+    assert projections[0] is not projections[1]
+    assert all(p.sequencer.next_index == 1 for p in projections)
+    assert all(p.sequencer.counters["item_frame_unregistered"] == 1 for p in projections)
+    queue = Mock()
+    queue.qsize.return_value = 2001
+    assert not adapter._build_attachment_emitter(queue)({"id": "overload", "kind": "memory.citations"})
+    adapter._make_delegation_progress_cb(queue)("subagent.start", subagent_id="child")
+    queue.put.assert_not_called()
+
+    monkeypatch.setattr(adapter, "_check_auth", lambda request: None)
+    monkeypatch.setattr(adapter, "_readiness_work_counts", lambda: (0, 0, 0))
+    monkeypatch.setattr("gateway.status.read_runtime_status", lambda: {})
+    monkeypatch.setattr("gateway.run._resolve_gateway_model", lambda: "test/model")
+    monkeypatch.setattr(api_server, "collect_runtime_readiness", lambda **kwargs: {"status": "ok"})
+    app = web.Application()
+    app.router.add_get("/health/detailed", adapter._handle_health_detailed)
+    async with TestClient(TestServer(app)) as client:
+        response = await client.get("/health/detailed")
+        assert response.status == 200
+        actual = (await response.json())["interaction_metrics"]
+    assert actual == {
+        "item_frame_stranded": 2,
+        "item_frame_unregistered": 2,
+        "item_frame_unclassified": 2,
+        "item_frame_dropped_backlog{kind=attachment}": 1,
+        "item_frame_dropped_backlog{kind=subagent}": 1,
+        "item_frame_dropped_backlog{kind=other}": 0,
+    }

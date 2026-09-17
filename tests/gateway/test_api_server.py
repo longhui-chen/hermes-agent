@@ -1544,6 +1544,7 @@ class TestHealthDetailedEndpoint:
                 assert isinstance(data["pid"], int)
                 assert "updated_at" in data
                 assert data["interaction_metrics"] == {
+                    **zet_agent_metrics._ITEM_FRAME_DEFAULTS,
                     "interaction_terminal{source=hermes,state=other}": 1,
                 }
 
