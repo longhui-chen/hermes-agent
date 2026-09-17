@@ -25,7 +25,8 @@ def test_connector_chat_create_probe_and_create_keep_secret_out_of_result(monkey
             return {"result": {"tools": [{"name": "connector.create_readonly_template"}]}}
         return {"result": {
             "connection_id": "conn-1", "connection_status": "active",
-            "template_id": "jira-data-center-pat-api", "verified": False,
+            "template_id": "jira-data-center-pat-api", "session_ready": True,
+            "verified": False,
             "secret": "synthetic-pat-not-real",
         }}
 
@@ -41,7 +42,8 @@ def test_connector_chat_create_probe_and_create_keep_secret_out_of_result(monkey
     }))
     assert created == {
         "ok": True, "connection_id": "conn-1", "connection_status": "active",
-        "template_id": "jira-data-center-pat-api", "verified": False,
+        "template_id": "jira-data-center-pat-api", "session_ready": True,
+        "verified": False,
     }
     assert "synthetic-pat-not-real" not in json.dumps(created)
     assert seen[1][1]["params"]["arguments"]["secret"] == "synthetic-pat-not-real"
@@ -63,12 +65,17 @@ def test_connector_chat_create_rejects_external_url_and_missing_turn(monkeypatch
     assert json.loads(connector_tool.connector_chat_create_tool({"action": "probe"}))["available"] is False
 
 
-def test_connector_chat_create_tool_reachable_in_zet_agent_catalog():
+def test_connector_chat_create_tool_reachable_in_zet_agent_catalog(monkeypatch):
     import toolsets
 
     assert "connector_chat_create" in toolsets._HERMES_CORE_TOOLS
     assert "connector_chat_create" in toolsets.TOOLSETS["zettlab_connectors"]["tools"]
     assert "connector_chat_create" in toolsets.resolve_toolset("hermes-zet-agent")
+    monkeypatch.setattr(connector_tool, "_runtime_env", _env)
+    definition = connector_tool.registry.get_definitions({"connector_chat_create"}, quiet=True)[0]
+    description = definition["function"]["description"]
+    assert "for the next turn" in description
+    assert "no automatic tool authorization" not in description.lower()
 
 
 def test_connector_chat_create_uses_current_profile_session_and_turn_not_process_env(monkeypatch):
