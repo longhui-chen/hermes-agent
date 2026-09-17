@@ -420,6 +420,14 @@ class GatewayBusySessionMixin:
         **{w: ("approve", "session") for w in ("session", "approve session", "session approve")},
     }
 
+    def plaintext_approval_words(self, event: MessageEvent) -> Dict[str, tuple]:
+        """Return exact, lowercase replies mapped to (approval verb, slash args).
+
+        Override to select a localized or platform-specific vocabulary from the
+        event. Called only when gateway control is allowed and an approval blocks.
+        """
+        return self._PLAINTEXT_APPROVAL_WORDS
+
     async def _route_plaintext_approval_while_busy(self, event: MessageEvent, session_key: str) -> bool:
         """Route a bare "yes"/"no" to the approval handlers while a dangerous-command approval blocks.
 
@@ -444,7 +452,7 @@ class GatewayBusySessionMixin:
             # the draining-case send above).
             if event.allow_gateway_control and has_blocking_approval(session_key):
                 _raw_text = (event.text or "").strip().lower()
-                _match = self._PLAINTEXT_APPROVAL_WORDS.get(_raw_text)
+                _match = self.plaintext_approval_words(event).get(_raw_text)
                 if _match is not None:
                     _verb, _normalized_args = _match
                     _approval_handler = (
