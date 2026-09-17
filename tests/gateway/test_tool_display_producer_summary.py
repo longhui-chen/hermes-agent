@@ -112,3 +112,42 @@ def test_whitespace_over_scan_budget_is_omitted_without_unbounded_strip():
     assert 'hidden document' not in display['summary']
     assert '{' not in display['summary']
     assert display['bytes'] == len(raw.encode())
+
+
+@pytest.mark.parametrize('text', ['[INFO] build complete', '[guide](https://example.org)', '{not JSON} useful text'])
+@pytest.mark.parametrize('tool', ['other', 'terminal'])
+def test_non_json_bracket_text_is_not_discarded(text, tool):
+    raw = json.dumps({'exit_code': 0, 'output': text}) if tool == 'terminal' else text
+    display = result_display(raw, tool_id=tool)
+    assert text in display['summary']
+    assert 'Structured result' not in display['summary']
+
+
+def test_nested_non_json_bracket_text_keeps_redaction():
+    display = result_display(json.dumps({'message': '[INFO] token=private done'}))
+    assert '[INFO]' in display['summary'] and 'done' in display['summary']
+    assert 'private' not in display['summary']
+
+
+@pytest.mark.parametrize('item,expected', [
+    ({'type': 'commandExecution', 'command': 'build', 'exitCode': 7,
+      'aggregatedOutput': '\n'.join(f'line-{n}' for n in range(25))}, ['Exit code: 7', 'line-24']),
+    ({'type': 'commandExecution', 'command': 'build', 'exitCode': 0,
+      'aggregatedOutput': '[INFO] build complete'}, ['Exit code: unavailable', '[INFO] build complete']),
+    ({'type': 'fileChange', 'status': 'completed', 'changes': [
+        {'path': 'src/demo.py', 'kind': {'type': 'update'}, 'diff': '-old\n+new'}]},
+     ['Files: src/demo.py', 'counts unavailable', 'apply_patch status=completed']),
+])
+def test_codex_actual_completion_shapes_use_specialized_summary(item, expected):
+    from agent.codex_runtime import _codex_item_to_tool_name, _codex_item_to_args, _codex_item_completion_payload
+    name = _codex_item_to_tool_name(item)
+    args = _codex_item_to_args(item)
+    raw, _ = _codex_item_completion_payload(item)
+    q = queue.Queue()
+    _, complete = tool_callbacks(q)
+    complete('codex-call', name, args, raw)
+    display = q.get_nowait()[1]['display']
+    for text in expected:
+        assert text in display['summary']
+    assert 'line-0\n' not in display['summary']
+    assert display['bytes'] == len(raw.encode())

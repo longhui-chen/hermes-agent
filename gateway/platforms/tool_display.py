@@ -177,6 +177,10 @@ def _decode_result(value: Any) -> tuple[Any, bool]:
             return None, True
         try:
             return json.loads(value), False
+        except json.JSONDecodeError:
+            # A bracket prefix alone is not JSON: logs and Markdown links are
+            # ordinary text. Preserve them through the bounded sanitizer.
+            return value, False
         except (ValueError, RecursionError):
             return None, True
     return value, False
@@ -203,9 +207,11 @@ def _flat_text(value: Any) -> tuple[str, bool]:
             if structured:
                 decoded, omitted = _decode_result(item)
                 cut |= omitted
-                if decoded is not None:
+                if decoded is not None and not isinstance(decoded, str):
                     visit(decoded, depth + 1)
-                return
+                    return
+                if decoded is None:
+                    return
             # Avoid cutting credential atoms before redaction. Inspect one
             # bounded atom; oversized strings safely omit the remainder.
             cut |= len(item) > 1024
@@ -269,8 +275,9 @@ def _lines(value: Any, count: int, *, tail: bool = False) -> tuple[list[str], bo
         return ["Structured result omitted"], True
     if structured:
         decoded, cut = _decode_result(value)
-        text, clipped = _preferred_text(decoded)
-        return [text or "Structured result"], cut or clipped
+        if not isinstance(decoded, str):
+            text, clipped = _preferred_text(decoded)
+            return [text or "Structured result"], cut or clipped
     cut = len(value) > _LINE_WINDOW_CHARS
     window = value[-_LINE_WINDOW_CHARS:] if tail else value[:_LINE_WINDOW_CHARS]
     lines = window.splitlines()
@@ -293,6 +300,13 @@ def _lines(value: Any, count: int, *, tail: bool = False) -> tuple[list[str], bo
 def _derive_summary(value: Any, tool_id: str, arguments: Any) -> tuple[str, bool]:
     row = value if isinstance(value, Mapping) else {}
     args = arguments if isinstance(arguments, Mapping) else {}
+    codex_command = tool_id == "exec_command"
+    codex_patch = tool_id == "apply_patch"
+    tool_id = {"exec_command": "terminal", "apply_patch": "patch"}.get(tool_id, tool_id)
+    if codex_command and isinstance(value, str):
+        exit_match = re.match(r"\[exit (-?\d{1,12})\]\n", value[:64])
+        row = {"exit_code": exit_match.group(1) if exit_match else "unavailable",
+               "output": value}
     if tool_id == "terminal":
         code, cut = _flat_text(row.get("exit_code", "unknown"))
         lines, clipped = _lines(row.get("output", row.get("stdout", value)), 20, tail=True)
@@ -306,6 +320,13 @@ def _derive_summary(value: Any, tool_id: str, arguments: Any) -> tuple[str, bool
         lines, c = _lines(row.get("content", ""), 5)
         return f"File: {path}\nLines: {total}; Bytes: {size}\n" + "\n".join(lines), cut or a or b or c
     if tool_id == "patch":
+        if codex_patch:
+            changes = args.get("changes", [])
+            paths = [change.get("path", "") for change in islice(changes, 64) if isinstance(change, Mapping)] if isinstance(changes, (list, tuple)) else []
+            names, cut = _flat_text(paths)
+            status, clipped = _preferred_text(value)
+            # Codex completion omits the diff. Do not fabricate +0/-0 counts.
+            return f"Files: {names or 'unavailable'}\nChanges: counts unavailable\n{status}", cut or clipped
         files = [row.get(key, []) for key in ("files_modified", "files_created", "files_deleted")]
         names, cut = _flat_text(files if any(files) else args.get("path", "File"))
         diff = row.get("diff", "")
