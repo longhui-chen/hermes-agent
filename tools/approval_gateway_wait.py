@@ -182,7 +182,7 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict, *,
     _ctx._fire_approval_hook("pre_approval_request", **payload)
     # Bridges sync agent thread → async gateway.
     try:
-        notify_cb(dict(entry.data))
+        cleanup = notify_cb(dict(entry.data))
     except Exception as exc:
         logger.warning("Gateway approval notify failed: %s", exc)
         _drop_entry("notify_failed")
@@ -200,4 +200,11 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict, *,
         entry.event.set()
     _drop_entry("answered" if state == "set" else state)
     extra = {"cancelled": cancelled} if cancelled else {}
-    return _finish(payload, state != "timeout", choice, entry.reason, **extra)
+    decision = _finish(payload, state != "timeout", choice, entry.reason, **extra)
+    on_result = getattr(cleanup, "on_result", None)
+    if callable(on_result):
+        try:
+            on_result(resolved=decision["resolved"], choice=decision["choice"], reason=decision["reason"])
+        except Exception:
+            logger.debug("Gateway approval result callback failed", exc_info=True)
+    return decision
