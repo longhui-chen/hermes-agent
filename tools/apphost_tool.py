@@ -24,6 +24,7 @@ from urllib.parse import quote, urlsplit
 
 from agent.credential_broker import request_app_auto_refresh_token
 from agent.secret_scope import get_secret
+# zettlab-overlay(apphost-change-budget-import): 就地修改流程的每轮改动预算住在 gateway 里，这里只引名字; upstream: none
 from gateway import app_change_budget
 
 _ACTION_TOKEN_HEADER = "X-Zettlab-Agent-Action-Token"
@@ -106,6 +107,7 @@ _CALL_WRITE_PATHS = frozenset({"/api/refresh"})
 # it (an action token authenticates one agent, not the device); recovery from
 # the recycle bin lives on the JWT member face, i.e. the client app's list.
 _HTTP_ACTIONS = (
+    # zettlab-overlay(apphost-inplace-actions): prepare/discard 是设备侧就地修改流程的入口，上游没有应用目录这个概念; upstream: none
     # prepare hands back the one directory an app lives in — the platform
     # creates it (and its version repository) for a new app, and puts an
     # existing app's working tree back on the live version for a change.
@@ -130,6 +132,7 @@ APP_HOST_SCHEMA = {
     "description": (
         "Manage device-hosted generated applications via the local App Host. "
         "Hermes holds the credentials and performs the HTTP calls — never try "
+        # zettlab-overlay(apphost-inplace-actions-doc): 工具描述要讲清就地修改怎么走，否则模型会去猜路径; upstream: none
         "to reach App Host endpoints from shell. Actions: prepare (get the "
         "one directory this app lives in — create it for a new app, or put an "
         "existing one's source back on its live version; write code and "
@@ -191,6 +194,7 @@ APP_HOST_SCHEMA = {
             "slug": {
                 "type": "string",
                 "description": (
+                    # zettlab-overlay(apphost-inplace-slug-doc): slug 在就地发布里是必填，描述跟着改; upstream: none
                     "Application slug. Required for prepare, publish with "
                     "in_place, install, reload, rollback, delete, lifecycle, "
                     "logs, and call."
@@ -229,6 +233,7 @@ APP_HOST_SCHEMA = {
                     "updates an existing app owned by the current agent."
                 ),
             },
+            # zettlab-overlay(apphost-inplace-flag): in_place 让发布直接用应用自己的目录，不再拷贝源码; upstream: none
             "in_place": {
                 "type": "boolean",
                 "description": (
@@ -716,6 +721,7 @@ def _build_request(action, args):
         if not slot_token:
             raise _BadRequest("release_slot 需要提供 slot_token 参数")
         return "DELETE", "/buildslot/" + quote(slot_token, safe=""), None, timeout
+    # zettlab-overlay(apphost-inplace-requests): prepare/discard 的请求构造，对应设备端的 /prepare 与 /discard; upstream: none
     if action == "prepare":
         slug = str(args.get("slug", "") or "").strip()
         if not slug:
@@ -731,6 +737,7 @@ def _build_request(action, args):
         if mode not in _PUBLISH_MODES:
             raise _BadRequest("publish 需要 mode 参数（install/reload）")
         body = {"mode": mode}
+        # zettlab-overlay(apphost-inplace-publish): 就地发布不带 source_subdir，改成必须报应用名; upstream: none
         # 就地发布：源码已经在 prepare 给的那个应用目录里，平台什么都不拷。
         # 这时没有 source_subdir 可言，改成必须报上应用名。
         in_place = bool(args.get("in_place"))
@@ -925,6 +932,7 @@ def _build_env_result():
 _COMPLETION_STATUS = {
     "probe": {200}, "list": {200}, "app_capabilities": {200},
     "app_operation": {200}, "acquire_slot": {200}, "release_slot": {204},
+    # zettlab-overlay(apphost-inplace-status): 两个新动作的成功状态码; upstream: none
     "prepare": {200}, "discard": {200},
     "publish": {200, 202}, "install": {200, 202}, "reload": {200, 202}, "rollback": {200},
     "delete": {204}, "lifecycle": {200}, "logs": {200}, "call": {200},
@@ -1040,6 +1048,7 @@ def app_host_tool(args, **_kw):
     # the model provider as non-string content and gets rejected (same
     # contract as list_my_channels).
     args = args or {}
+    # zettlab-overlay(apphost-change-budget): 同一个应用一轮里重建几次在工具这层拦，设备端看不见修了几轮; upstream: none
     # Per-user-turn change budget (gateway.app_change_budget). The reason the
     # count sits here rather than in local-server: compiling and self-testing
     # run through `terminal` inside the app directory, so the server never sees
@@ -1052,6 +1061,7 @@ def app_host_tool(args, **_kw):
         refusal_code, refusal_message = refusal
         return _local_error(refusal_code, refusal_message, status=_STATUS_NOT_SENT)
     result = _app_host_tool_dispatch(args, **_kw)
+    # zettlab-overlay(apphost-change-budget-observe): 每次调用回来记一笔账; upstream: none
     app_change_budget.observe(args, result)
     _record_app_operation_attempt(args, result)
     return result
