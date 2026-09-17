@@ -30,7 +30,6 @@ from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.conversation_compression import (
     COMPRESSION_RETRY_CONTEXT_REDUCED_STATUS_TEMPLATE,
     COMPRESSION_RETRY_MESSAGES_STATUS_TEMPLATE,
-    COMPRESSION_RETRY_TOKENS_STATUS_TEMPLATE,
     COMPRESSION_RETRY_TOO_LARGE_STATUS_TEMPLATE,
     PRE_API_COMPRESSION_STATUS_TEMPLATE,
     compression_skipped_due_to_lock,
@@ -70,6 +69,8 @@ from agent.model_metadata import (
     _estimate_tools_tokens_rough,
     estimate_messages_tokens_rough,
     estimate_request_tokens_rough,
+    # zettlab-overlay(context-budget): align compaction with actual request and preserve task state; upstream: none
+    project_messages_for_token_estimate,
     get_context_length_from_provider_error,
     is_output_cap_error,
     parse_available_output_tokens_from_error,
@@ -99,6 +100,15 @@ from hermes_constants import PARTIAL_STREAM_STUB_ID
 from hermes_logging import set_session_context
 from tools.skill_provenance import set_current_write_origin
 from utils import base_url_host_matches, env_var_enabled
+
+
+# zettlab-overlay(context-budget): compare recovery payloads in bytes, never infer capacity; upstream: none
+def _replayed_payload_bytes(agent, messages):
+    projected = project_messages_for_token_estimate(
+        messages, getattr(agent, "_copy_reasoning_content_for_api", None),
+    )
+    encoder = json.JSONEncoder(ensure_ascii=False, default=str)
+    return sum(len(part.encode("utf-8")) for part in encoder.iterencode(projected))
 
 
 def _onboarding_fast_retry_delay(agent, status_code, is_rate_limited):
@@ -2981,16 +2991,16 @@ def run_conversation(
             if _moa_prepared_request is not None:
                 api_messages = _moa_prepared_request["messages"]
 
-        # One image-stripped message estimate feeds both figures. Was: a
-        # str(msg) char walk (re-serialized base64 every call) + a second
-        # messages walk inside estimate_request_tokens_rough. Tools added
-        # separately (compression needs them: 50+ tools = 20-30K tokens).
-        # total_chars is a rough (~) proxy — verbose log + hook metric only.
-        approx_tokens = estimate_messages_tokens_rough(api_messages)
-        request_pressure_tokens = approx_tokens + (
-            _estimate_tools_tokens_rough(agent.tools) if agent.tools else 0
-        )
-        total_chars = approx_tokens * 4
+        # zettlab-overlay(context-budget): no character tokenization on the measured-usage path; upstream: none
+        _measured_capacity = hasattr(type(agent.context_compressor), "automatic_compaction_tokens")
+        if _measured_capacity:
+            approx_tokens = agent.context_compressor.automatic_compaction_tokens
+            request_pressure_tokens = approx_tokens
+            total_chars = 0  # Legacy hook field: unmeasured, never inferred from tokens.
+        else:
+            approx_tokens = estimate_messages_tokens_rough(api_messages)
+            request_pressure_tokens = approx_tokens + (_estimate_tools_tokens_rough(agent.tools) if agent.tools else 0)
+            total_chars = approx_tokens * 4
 
         _runtime_context_error = _ollama_context_limit_error(
             agent, request_pressure_tokens
@@ -3033,6 +3043,8 @@ def run_conversation(
         # LLM cooldown + anti-thrash guards (#11529). compression_attempts is a
         # hard per-turn backstop shared with the overflow error handlers.
         _compressor = agent.context_compressor
+        # zettlab-overlay(context-budget): automatic trigger uses measured input, not request character count; upstream: none
+        request_pressure_tokens = (_compressor.automatic_compaction_tokens if hasattr(type(_compressor), "automatic_compaction_tokens") else request_pressure_tokens)
         _preflight_threshold = int(
             getattr(_compressor, "threshold_tokens", 0) or 0
         )
@@ -3199,7 +3211,8 @@ def run_conversation(
         
         if not agent.quiet_mode:
             agent._vprint(f"\n{agent.log_prefix}🔄 Making API call #{api_call_count}/{agent.max_iterations}...")
-            agent._vprint(f"{agent.log_prefix}   📊 Request size: {len(api_messages)} messages, ~{approx_tokens:,} tokens (~{total_chars:,} chars)")
+            # zettlab-overlay(context-budget): keep literal payload size separate from provider token capacity; upstream: none
+            agent._vprint(f"{agent.log_prefix}   📊 Request size: {len(api_messages)} messages, {approx_tokens:,} last measured input tokens")
             agent._vprint(f"{agent.log_prefix}   🔧 Available tools: {len(agent.tools) if agent.tools else 0}")
         else:
             # Animated thinking spinner in quiet mode
@@ -4564,14 +4577,15 @@ def run_conversation(
                     # not just legacy aggregate tokens. Legacy keys stay for
                     # back-compat with engines that only read prompt/completion/total.
                     usage_dict = {
-                        "prompt_tokens": prompt_tokens,
-                        "completion_tokens": completion_tokens,
-                        "total_tokens": total_tokens,
-                        "input_tokens": canonical_usage.input_tokens,
-                        "output_tokens": canonical_usage.output_tokens,
-                        "cache_read_tokens": canonical_usage.cache_read_tokens,
-                        "cache_write_tokens": canonical_usage.cache_write_tokens,
-                        "reasoning_tokens": canonical_usage.reasoning_tokens,
+                        # zettlab-overlay(context-budget): advisor billing is not the acting model input; upstream: none
+                        "prompt_tokens": aggregator_usage.prompt_tokens,
+                        "completion_tokens": aggregator_usage.output_tokens,
+                        "total_tokens": aggregator_usage.total_tokens,
+                        "input_tokens": aggregator_usage.input_tokens,
+                        "output_tokens": aggregator_usage.output_tokens,
+                        "cache_read_tokens": aggregator_usage.cache_read_tokens,
+                        "cache_write_tokens": aggregator_usage.cache_write_tokens,
+                        "reasoning_tokens": aggregator_usage.reasoning_tokens,
                     }
                     agent.context_compressor.update_from_response(usage_dict)
 
@@ -4582,10 +4596,9 @@ def run_conversation(
                     # of interest is the cost/size of the latest assembled
                     # request, so we keep the most recent call's usage.
                     agent._last_turn_usage = dict(usage_dict)
-                elif getattr(
-                    agent.context_compressor,
-                    "awaiting_real_usage_after_compression",
-                    False,
+                elif hasattr(type(agent.context_compressor), "automatic_compaction_tokens") or getattr(
+                    # zettlab-overlay(context-budget): missing usage cannot retain stale measured pressure; upstream: none
+                    agent.context_compressor, "awaiting_real_usage_after_compression", False,
                 ):
                     # A response with no usage cannot adjudicate whether the
                     # prior compaction cleared the threshold. Consume the pending
@@ -5197,9 +5210,10 @@ def run_conversation(
                     api_error,
                     provider=getattr(agent, "provider", "") or "",
                     model=getattr(agent, "model", "") or "",
-                    approx_tokens=approx_tokens,
+                    # zettlab-overlay(context-budget): generic errors plus rough size are not confirmed overflow; upstream: none
+                    approx_tokens=0 if hasattr(type(_compressor), "automatic_compaction_tokens") else approx_tokens,
                     context_length=_ctx_len,
-                    num_messages=len(api_messages) if api_messages else 0,
+                    num_messages=0 if hasattr(type(_compressor), "automatic_compaction_tokens") else len(api_messages or []),
                     # Verifiable gateway origin: a content-policy block on the
                     # ai-proxy route is the Zettlab moderation gateway's verdict
                     # (compliance, no failover) even on its generic code="400"
@@ -5803,7 +5817,8 @@ def run_conversation(
                         # the true request (msgs + tools + system), not the tool-blind message count.
                         messages, active_system_prompt = agent._compress_context(
                             messages, system_message,
-                            approx_tokens=estimate_request_tokens_rough(api_messages, tools=agent.tools or None),
+                            # zettlab-overlay(context-budget): keep literal payload size separate from provider token capacity; upstream: none
+                            approx_tokens=(agent.context_compressor.automatic_compaction_tokens if _measured_capacity else estimate_request_tokens_rough(api_messages, tools=agent.tools or None)),
                             task_id=effective_task_id,
                         )
                         conversation_history = conversation_history_after_compression(
@@ -6057,13 +6072,15 @@ def run_conversation(
                     agent._buffer_status(f"⚠️  Request payload too large (413) — compression attempt {compression_attempts}/{max_compression_attempts}...")
 
                     original_len = len(messages)
-                    original_tokens = estimate_messages_tokens_rough(messages)
+                    # zettlab-overlay(context-budget): keep literal payload size separate from provider token capacity; upstream: none
+                    original_tokens = _replayed_payload_bytes(agent, messages)
                     _overflow_input = messages
                     # Option A (LCM issue 441): overhead-aware request size so recovery arms on the
                     # true request (msgs + tools + system), not the tool-blind message count.
                     messages, active_system_prompt = agent._compress_context(
                         messages, system_message,
-                        approx_tokens=estimate_request_tokens_rough(api_messages, tools=agent.tools or None),
+                        # zettlab-overlay(context-budget): keep literal payload size separate from provider token capacity; upstream: none
+                        approx_tokens=(agent.context_compressor.automatic_compaction_tokens if _measured_capacity else estimate_request_tokens_rough(api_messages, tools=agent.tools or None)),
                         task_id=effective_task_id,
                     )
                     if messages is _overflow_input and compression_skipped_due_to_lock(agent):
@@ -6086,14 +6103,16 @@ def run_conversation(
                     # compression (tool-result pruning, in-place summarization)
                     # can materially reduce request size without reducing the
                     # message array.  (#39550)
-                    new_tokens = estimate_messages_tokens_rough(messages)
-                    approx_tokens = new_tokens  # update for downstream logging
+                    new_tokens = _replayed_payload_bytes(agent, messages)
+                    # zettlab-overlay(context-budget): bytes measure retry progress, usage remains unknown; upstream: none
+                    approx_tokens = 0
 
                     if len(messages) < original_len or (new_tokens > 0 and new_tokens < original_tokens * 0.95):
                         if len(messages) < original_len:
                             agent._buffer_status(COMPRESSION_RETRY_MESSAGES_STATUS_TEMPLATE.format(before=original_len, after=len(messages)))
                         else:
-                            agent._buffer_status(COMPRESSION_RETRY_TOKENS_STATUS_TEMPLATE.format(before=original_tokens, after=new_tokens))
+                            # zettlab-overlay(context-budget): keep literal payload size separate from provider token capacity; upstream: none
+                            agent._buffer_status(f"Context payload reduced: {original_tokens:,} → {new_tokens:,} bytes; retrying.")
                         time.sleep(2)  # Brief pause between compression retries
                         _retry.restart_with_compressed_messages = True
                         break
@@ -6154,30 +6173,14 @@ def run_conversation(
                     if available_out is not None:
                         # This is an output-cap error, not input overflow.
                         # The provider's available_tokens is the authoritative
-                        # cap for the failed request, so keep it as an upper
-                        # bound.  Also estimate the current API request shape
-                        # (system prompt, injected context, tool schemas) because
-                        # Hermes may add API-only content not present in persisted
-                        # messages.  Use the smaller budget and apply a small
-                        # safety margin.  Do not alter context_length.
-                        request_input_estimate = estimate_request_tokens_rough(
-                            api_messages, tools=agent.tools or None,
-                        )
-                        local_available_out = old_ctx - request_input_estimate
-                        if local_available_out > 0:
-                            safe_out = max(1, min(available_out, local_available_out) - 64)
-                        else:
-                            # The rough local estimate can overshoot the real
-                            # request size.  Fall back to the provider-reported
-                            # budget, which is authoritative for the failed
-                            # request.
-                            safe_out = max(1, available_out - 64)
+                        # cap for this failed request. Preserve the existing 64-token margin.
+                        # zettlab-overlay(context-budget): provider available output wins over character estimates; upstream: none
+                        safe_out = max(1, available_out - 64)
                         agent._ephemeral_max_output_tokens = safe_out
                         agent._buffer_vprint(
                             f"⚠️  Output cap too large for current prompt — "
                             f"retrying with max_tokens={safe_out:,} "
                             f"(provider_available={available_out:,}, "
-                            f"estimated_request_tokens={request_input_estimate:,}; "
                             f"context_length unchanged at {old_ctx:,})"
                         )
                         # Still count against compression_attempts so we don't
@@ -6324,7 +6327,8 @@ def run_conversation(
                     agent._buffer_status(COMPRESSION_RETRY_TOO_LARGE_STATUS_TEMPLATE.format(tokens=approx_tokens, attempt=compression_attempts, cap=max_compression_attempts))
 
                     original_len = len(messages)
-                    original_tokens = estimate_messages_tokens_rough(messages)
+                    # zettlab-overlay(context-budget): keep literal payload size separate from provider token capacity; upstream: none
+                    original_tokens = _replayed_payload_bytes(agent, messages)
                     _overflow_input = messages
                     # Option A (LCM issue 441): pass the OVERHEAD-AWARE request size (msgs + tool
                     # schemas + system), not the tool-blind message count, so LCM forced-overflow
@@ -6332,7 +6336,8 @@ def run_conversation(
                     # _should_force_overflow_recovery. (approx_tokens stays for the status display.)
                     messages, active_system_prompt = agent._compress_context(
                         messages, system_message,
-                        approx_tokens=estimate_request_tokens_rough(api_messages, tools=agent.tools or None),
+                        # zettlab-overlay(context-budget): keep literal payload size separate from provider token capacity; upstream: none
+                        approx_tokens=(agent.context_compressor.automatic_compaction_tokens if _measured_capacity else estimate_request_tokens_rough(api_messages, tools=agent.tools or None)),
                         task_id=effective_task_id,
                     )
                     if messages is _overflow_input and compression_skipped_due_to_lock(agent):
@@ -6355,14 +6360,16 @@ def run_conversation(
                     # compression (tool-result pruning, in-place summarization)
                     # can materially reduce request size without reducing the
                     # message array.  (#39550)
-                    new_tokens = estimate_messages_tokens_rough(messages)
-                    approx_tokens = new_tokens  # update for downstream logging
+                    new_tokens = _replayed_payload_bytes(agent, messages)
+                    # zettlab-overlay(context-budget): bytes measure retry progress, usage remains unknown; upstream: none
+                    approx_tokens = 0
 
                     if len(messages) < original_len or (new_tokens > 0 and new_tokens < original_tokens * 0.95) or (new_ctx and new_ctx < old_ctx):
                         if len(messages) < original_len:
                             agent._buffer_status(COMPRESSION_RETRY_MESSAGES_STATUS_TEMPLATE.format(before=original_len, after=len(messages)))
                         elif new_tokens > 0 and new_tokens < original_tokens * 0.95:
-                            agent._buffer_status(COMPRESSION_RETRY_TOKENS_STATUS_TEMPLATE.format(before=original_tokens, after=new_tokens))
+                            # zettlab-overlay(context-budget): keep literal payload size separate from provider token capacity; upstream: none
+                            agent._buffer_status(f"Context payload reduced: {original_tokens:,} → {new_tokens:,} bytes; retrying.")
                         time.sleep(2)  # Brief pause between compression retries
                         _retry.restart_with_compressed_messages = True
                         break
@@ -6718,7 +6725,8 @@ def run_conversation(
                         _purge_refused_rows_from_session_db(
                             agent, messages, len(_kept_messages)
                         )
-                    if status_code == 400 and (approx_tokens > 50000 or len(api_messages) > 80):
+                    # zettlab-overlay(context-budget): preserve failed turns when size is only guessed; upstream: none
+                    if not hasattr(type(_compressor), "automatic_compaction_tokens") and status_code == 400 and (approx_tokens > 50000 or len(api_messages) > 80):
                         agent._vprint(
                             f"{agent.log_prefix}⚠️  Skipping session persistence "
                             f"for large failed session to prevent growth loop.",
@@ -7966,55 +7974,19 @@ def run_conversation(
                 if _tc_names == {"execute_code"}:
                     agent.iteration_budget.refund()
                 
-                # Decide compression from the *current* request shape —
-                # i.e. the messages just augmented with tool results by
-                # _execute_tool_calls above — not from the previous API
-                # response's reported prompt_tokens.
-                #
-                # last_prompt_tokens predates the tool results we just
-                # appended; a single large tool output (terminal/read_file
-                # dumping multi-MB stdout, web_search aggregating long
-                # pages) can push the next request well past the threshold
-                # while last_prompt_tokens is still under it. The old
-                # reactive check would then fire only AFTER the oversized
-                # request had been sent — by which point the provider may
-                # have already errored out, truncated, or returned empty.
-                # See board28 NAS-PM / MaxClaw token-usage timeline
-                # (~1.6M tokens in a single turn vs the 50% / 500K
-                # threshold on a 1M context model).
-                #
-                # estimate_request_tokens_rough already includes tool
-                # schemas (#14695) and counts images at a flat per-image
-                # rate (#12026 et al.), matching what the preflight
-                # compression check uses at turn entry. Take max with
-                # last_prompt_tokens so we never regress on the disconnect
-                # fallback (#2153) — should_compress(0) would never fire,
-                # but max(estimate, 0) does — and so an authoritative
-                # provider-reported count from the prior request acts as a
-                # floor when the rough estimate (4 chars/token) would
-                # under-count multipart payloads / control tokens.
+                # zettlab-overlay(context-budget): newly returned tools are unmeasured until the next response; upstream: none
                 _compressor = agent.context_compressor
-                if _compressor.last_prompt_tokens == -1:
-                    # Compression just ran and no API-reported prompt count
-                    # has arrived yet. Avoid treating a schema-heavy rough
-                    # post-compression estimate as real context pressure.
-                    _real_tokens = 0
+                if hasattr(type(_compressor), "automatic_compaction_tokens"):
+                    _real_tokens = _rough_tokens = _compressor.automatic_compaction_tokens
                 else:
-                    # Include tool schemas — with 50+ tools enabled
-                    # these add 20-30K tokens the messages-only
-                    # estimate misses, which can skip compression
-                    # past the configured threshold (#14695).
                     _rough_tokens = estimate_request_tokens_rough(
-                        messages, tools=agent.tools or None
+                        # zettlab-overlay(context-budget): keep literal payload size separate from provider token capacity; upstream: none
+                        project_messages_for_token_estimate(
+                            messages, getattr(agent, "_copy_reasoning_content_for_api", None),
+                        ), system_prompt=agent._cached_system_prompt or "", tools=agent.tools or None,
                     )
-                    _real_tokens = _rough_tokens
-                    if _compressor.last_prompt_tokens > 0:
-                        # Only use prompt_tokens — completion/reasoning
-                        # tokens don't consume context window space.
-                        # Thinking models (GLM-5.1, QwQ, DeepSeek R1)
-                        # inflate completion_tokens with reasoning,
-                        # causing premature compression.  (#12026)
-                        _real_tokens = max(_real_tokens, _compressor.last_prompt_tokens)
+                    # zettlab-overlay(context-budget): keep literal payload size separate from provider token capacity; upstream: none
+                    _real_tokens = max(_rough_tokens, _compressor.last_prompt_tokens)
 
                 _in_loop_deferred = False
                 if agent.compression_enabled and _real_tokens > 0:
@@ -8032,9 +8004,10 @@ def run_conversation(
                     _in_loop_deferred = _defer_rough_estimate(_rough_tokens)
 
                 if _in_loop_deferred:
+                    # zettlab-overlay(context-budget): distinguish estimates from measured input in logs; upstream: none
                     logger.info(
-                        "Skipping in-loop compression: rough estimate ~%s >= %s, "
-                        "but last real provider prompt was %s after compression",
+                        "Deferring in-loop compaction: estimate=%s, threshold=%s, "
+                        "last measured provider input=%s",
                         f"{_rough_tokens:,}",
                         f"{_compressor.threshold_tokens:,}",
                         f"{_compressor.last_real_prompt_tokens:,}",

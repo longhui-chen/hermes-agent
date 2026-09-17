@@ -61,7 +61,7 @@ def test_merge_appends_to_existing_warning(monkeypatch):
     result.warning_message = "expensive"
     merge_preflight_compression_warning(result, agent=agent)
     assert "expensive" in result.warning_message
-    assert "preflight compression" in result.warning_message
+    assert "must measure its own input" in result.warning_message
 
 
 
@@ -167,7 +167,7 @@ def test_custom_provider_context_avoids_false_shrink_warning(monkeypatch):
     )
     merge_preflight_compression_warning(result3, agent=agent_no_cp)
     assert result3.warning_message
-    assert "preflight compression" in result3.warning_message
+    assert "must measure its own input" in result3.warning_message
     assert "shrinks" in result3.warning_message
     # Must not honor the unused 1M custom override when no providers were passed.
     assert "1,048,576" not in result3.warning_message

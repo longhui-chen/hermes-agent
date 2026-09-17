@@ -247,3 +247,39 @@ def test_format_reference_value_round_trips_through_the_parser(value):
 
     assert match is not None
     assert match.group("value").strip("`\"'") == value
+
+
+@pytest.mark.asyncio
+async def test_large_cjk_attachment_is_not_a_token_capacity_estimate(tmp_path):
+    from agent.context_references import preprocess_context_references_async
+    text = "资料" * 125000
+    (tmp_path / "notes.md").write_text(text)
+    result = await preprocess_context_references_async(
+        "Read @file:notes.md", cwd=tmp_path, context_length=1000,
+    )
+    assert not result.blocked
+    assert text in result.message
+    assert result.injected_bytes >= len(text.encode("utf-8"))
+    assert result.injected_tokens == 0
+
+
+@pytest.mark.asyncio
+async def test_attachment_byte_limit_preserves_original_request(tmp_path):
+    from agent.context_references import MAX_REFERENCE_BYTES, preprocess_context_references_async
+    for name in ("a.md", "b.md"):
+        (tmp_path / name).write_text("a" * (MAX_REFERENCE_BYTES // 2))
+    request = "Keep my goal and read @file:a.md @file:b.md"
+    result = await preprocess_context_references_async(request, cwd=tmp_path, context_length=1000000)
+    assert result.blocked
+    assert result.message == request
+    assert "device resource limit" in result.warnings[-1]
+
+
+@pytest.mark.asyncio
+async def test_reference_count_limit_rejects_before_reading(tmp_path):
+    from agent.context_references import MAX_CONTEXT_REFERENCES, preprocess_context_references_async
+    request = " ".join(f"@file:file{i}.md" for i in range(MAX_CONTEXT_REFERENCES + 1))
+    with patch("agent.context_references._expand_reference", side_effect=AssertionError("must not read")):
+        result = await preprocess_context_references_async(request, cwd=tmp_path, context_length=1000000)
+    assert result.blocked
+    assert result.message == request

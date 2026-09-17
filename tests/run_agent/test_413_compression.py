@@ -454,6 +454,7 @@ class TestPreflightCompression:
             focus_topic=None,
             force=False,
             memory_context="",
+            token_estimator=None, payload_size=None,
         ):
             events.append(("compress", "started"))
             return [{"role": "user", "content": f"{SUMMARY_PREFIX}\nPrevious conversation"}]
@@ -634,6 +635,7 @@ class TestPreflightCompression:
         agent.context_compressor.context_length = 200_000
         agent.context_compressor.threshold_tokens = 130_000
         agent.context_compressor.emit_automatic_compaction_status = False
+        agent.context_compressor.update_from_response({"prompt_tokens": 144669})
 
         history = [
             {"role": "user", "content": "earlier question"},
@@ -647,7 +649,7 @@ class TestPreflightCompression:
         with (
             # Keep the turn-prologue preflight quiet-by-size so only the
             # in-loop pre-API pressure gate fires.
-            patch("agent.turn_context.estimate_request_tokens_rough", return_value=10_000),
+            patch("agent.turn_context._should_run_preflight_estimate", return_value=False),
             patch("agent.conversation_loop.estimate_request_tokens_rough", return_value=144_669),
             patch(
                 "agent.conversation_loop.estimate_messages_tokens_rough",
@@ -678,6 +680,7 @@ class TestPreflightCompression:
         # that the compressed result (2 short messages) fits in a single pass.
         agent.context_compressor.context_length = 2000
         agent.context_compressor.threshold_tokens = 200
+        agent.context_compressor.update_from_response({"prompt_tokens": 300})
 
         # Build a history that will be large enough to trigger preflight
         # (each message ~50 chars ≈ 13 tokens, 40 messages ≈ 520 tokens > 200 threshold)
@@ -705,6 +708,10 @@ class TestPreflightCompression:
                 ],
                 "new system prompt",
             )
+            def _invalidate_usage(*args, **kwargs):
+                agent.context_compressor.awaiting_real_usage_after_compression = True
+                return mock_compress.return_value
+            mock_compress.side_effect = _invalidate_usage
             result = agent.run_conversation("hello", conversation_history=big_history)
 
         # Preflight compression is a multi-pass loop (up to 3 passes for very
@@ -728,6 +735,7 @@ class TestPreflightCompression:
         agent.compression_enabled = True
         agent.context_compressor.context_length = 200_000
         agent.context_compressor.threshold_tokens = 100_000
+        agent.context_compressor.update_from_response({"prompt_tokens": 114000})
         agent.context_compressor.emit_automatic_compaction_status = False
 
         big_history = []
@@ -772,6 +780,7 @@ class TestPreflightCompression:
         agent.compression_enabled = True
         agent.context_compressor.context_length = 200_000
         agent.context_compressor.threshold_tokens = 100_000
+        agent.context_compressor.update_from_response({"prompt_tokens": 114000})
 
         def _custom_status(**kwargs):
             assert kwargs["phase"] == "preflight"
@@ -818,8 +827,8 @@ class TestPreflightCompression:
         assert not any("Preflight compression" in msg for msg in lifecycle_messages)
 
 
-    def test_preflight_compresses_when_rough_growth_after_fit_is_large(self, agent):
-        """Large rough growth after a fitting request still triggers preflight."""
+    def test_preflight_waits_for_usage_even_when_rough_growth_is_large(self, agent):
+        """Large rough growth after a fitting request does not trigger preflight."""
         agent.compression_enabled = True
         agent.context_compressor.context_length = 200_000
         agent.context_compressor.threshold_tokens = 100_000
@@ -866,7 +875,7 @@ class TestPreflightCompression:
             )
             result = agent.run_conversation("hello", conversation_history=big_history)
 
-        mock_compress.assert_called_once()
+        mock_compress.assert_not_called()
         assert result["completed"] is True
 
     def test_no_preflight_when_under_threshold(self, agent):
@@ -934,6 +943,7 @@ class TestPreflightCompression:
         agent.compression_enabled = True
         agent.context_compressor.context_length = 200_000
         agent.context_compressor.threshold_tokens = 130_000
+        agent.context_compressor.update_from_response({"prompt_tokens": 144669})
 
         big_history = []
         for i in range(20):
@@ -1036,6 +1046,7 @@ class TestPreflightCompression:
         agent._interrupt_requested = True
         agent.context_compressor.context_length = 200_000
         agent.context_compressor.threshold_tokens = 130_000
+        agent.context_compressor.update_from_response({"prompt_tokens": 144669})
         agent.context_compressor.last_prompt_tokens = 74_400
         agent.context_compressor._ineffective_compression_count = 1
 
@@ -1111,7 +1122,7 @@ class TestToolResultPreflightCompression:
         mock_compress.assert_called_once()
         assert result["completed"] is True
 
-    def test_mid_turn_retry_compares_fully_assembled_requests(self, agent):
+    def test_unmeasured_mid_turn_growth_does_not_compact(self, agent):
         """API-only context must not make marginal compression look effective."""
         agent.compression_enabled = True
         agent.context_compressor.context_length = 200_000
@@ -1162,7 +1173,7 @@ class TestToolResultPreflightCompression:
 
         assert result["completed"] is True
         assert result["final_response"] == "Done after one compression"
-        assert mock_compress.call_count == 1
+        assert mock_compress.call_count == 0
 
     def test_small_tool_result_defers_when_recent_real_usage_fit(self, agent):
         """Schema-heavy rough estimates should not re-compact after a fitting call."""
@@ -1189,6 +1200,9 @@ class TestToolResultPreflightCompression:
 
         with (
             patch("run_agent.handle_function_call", return_value="ok"),
+            patch("agent.turn_context.estimate_request_tokens_rough", return_value=113_000),
+            patch("agent.conversation_loop.estimate_messages_tokens_rough", return_value=113_000),
+            patch("agent.conversation_loop._estimate_tools_tokens_rough", return_value=0),
             patch("agent.conversation_loop.estimate_request_tokens_rough", return_value=114_000),
             patch.object(agent, "_compress_context") as mock_compress,
             patch.object(agent, "_persist_session"),
@@ -1200,7 +1214,7 @@ class TestToolResultPreflightCompression:
         mock_compress.assert_not_called()
         assert result["completed"] is True
         assert result["final_response"] == "Continued without rotation"
-        assert agent.context_compressor.last_rough_tokens_when_real_prompt_fit == 114_000
+        assert agent.context_compressor.last_rough_tokens_when_real_prompt_fit == 113_000
 
     def test_anthropic_prompt_too_long_safety_net(self, agent):
         """Anthropic 'prompt is too long' triggers compression as a safety net."""

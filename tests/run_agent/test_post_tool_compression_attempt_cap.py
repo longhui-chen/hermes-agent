@@ -86,6 +86,8 @@ def _pressured_compressor() -> MagicMock:
     compressor.threshold_tokens = 10_000
     compressor.context_length = 200_000
     compressor.last_prompt_tokens = 150_000
+    compressor.last_real_prompt_tokens = 150_000
+    compressor.should_defer_rough_estimate_to_real_usage.return_value = False
     compressor.should_compress.return_value = True
     compressor.should_defer_preflight_to_real_usage.return_value = True
     compressor.get_active_compression_failure_cooldown.return_value = None

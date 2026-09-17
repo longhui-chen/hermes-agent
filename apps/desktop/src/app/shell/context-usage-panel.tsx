@@ -7,7 +7,9 @@ import type { ContextBreakdown, ContextUsageCategory, UsageStats } from '@/types
 
 interface ContextUsagePanelProps {
   currentUsage: UsageStats
-  onUsageSnapshot?: (usage: Pick<UsageStats, 'context_max' | 'context_percent' | 'context_used'>) => void
+  onUsageSnapshot?: (
+    usage: Pick<UsageStats, 'context_max' | 'context_percent' | 'context_used' | 'context_measurement'>
+  ) => void
   requestGateway: <T = unknown>(method: string, params?: Record<string, unknown>) => Promise<T>
   sessionId: string | null
 }
@@ -43,7 +45,8 @@ export function ContextUsagePanel({
           onUsageSnapshotRef.current?.({
             context_max: data.context_max,
             context_percent: data.context_percent,
-            context_used: data.context_used
+            context_used: data.context_used,
+            ...(data.context_measurement ? { context_measurement: data.context_measurement } : {})
           })
         }
       })
@@ -63,6 +66,9 @@ export function ContextUsagePanel({
     }
   }, [requestGateway, sessionId])
 
+  const unknown = breakdown?.context_measurement === 'unknown'
+  const sizesInBytes = breakdown?.size_unit === 'bytes'
+
   const contextMax = breakdown?.context_max ?? currentUsage.context_max ?? 0
   const contextUsed = breakdown?.context_used ?? currentUsage.context_used ?? 0
 
@@ -75,6 +81,7 @@ export function ContextUsagePanel({
     () =>
       (breakdown?.categories ?? []).map(category => ({
         ...category,
+        tokens: category.bytes ?? category.tokens,
         label: copy.categories[category.id as keyof typeof copy.categories] ?? category.label
       })),
     [breakdown?.categories, copy]
@@ -88,11 +95,11 @@ export function ContextUsagePanel({
         <p className="font-medium text-foreground">{copy.title}</p>
 
         <span className="text-[0.6875rem] text-muted-foreground">
-          {copy.tokenSummary(`~${compactNumber(contextUsed)}`, compactNumber(contextMax))}
+          {unknown ? copy.unmeasured : copy.tokenSummary(compactNumber(contextUsed), compactNumber(contextMax))}
         </span>
       </div>
 
-      <p className="text-[0.6875rem] text-foreground">{copy.percentFull(contextPercent)}</p>
+      <p className="text-[0.6875rem] text-foreground">{unknown ? copy.unmeasured : copy.percentFull(contextPercent)}</p>
 
       <ContextUsageBar categories={categories} segmentTotal={segmentTotal} />
 
@@ -105,7 +112,10 @@ export function ContextUsagePanel({
               <span className="truncate text-muted-foreground">{category.label}</span>
             </span>
 
-            <span className="shrink-0 tabular-nums text-foreground">{compactNumber(category.tokens)}</span>
+            <span className="shrink-0 tabular-nums text-foreground">
+              {compactNumber(category.tokens)}
+              {sizesInBytes ? ' B' : ''}
+            </span>
           </li>
         ))}
       </ul>
