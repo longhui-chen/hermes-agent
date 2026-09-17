@@ -154,8 +154,25 @@ _PARSE_MAX_CHARS = 64 * 1024
 _LINE_WINDOW_CHARS = 4096
 
 
+def _structured_prefix(value: str) -> tuple[bool, bool]:
+    """Scan leading whitespace only within the JSON admission budget.
+
+    Exhausting the window is an omission, never permission to treat the unseen
+    suffix as display text. Do not lstrip/copy an unbounded original result.
+    """
+    for char in islice(value, _PARSE_MAX_CHARS):
+        if not char.isspace():
+            return char in {"{", "["}, False
+    return False, len(value) > _PARSE_MAX_CHARS
+
+
 def _decode_result(value: Any) -> tuple[Any, bool]:
-    if isinstance(value, str) and value[:128].lstrip()[:1] in {"{", "["}:
+    if isinstance(value, str):
+        structured, omitted = _structured_prefix(value)
+        if omitted:
+            return None, True
+        if not structured:
+            return value, False
         if len(value) > _PARSE_MAX_CHARS:
             return None, True
         try:
@@ -179,7 +196,11 @@ def _flat_text(value: Any) -> tuple[str, bool]:
             cut = True
             return
         if isinstance(item, str):
-            if item[:128].lstrip()[:1] in {"{", "["}:
+            structured, omitted = _structured_prefix(item)
+            if omitted:
+                cut = True
+                return
+            if structured:
                 decoded, omitted = _decode_result(item)
                 cut |= omitted
                 if decoded is not None:
@@ -243,7 +264,10 @@ def _lines(value: Any, count: int, *, tail: bool = False) -> tuple[list[str], bo
     if not isinstance(value, str):
         text, cut = _preferred_text(value)
         return [text], cut
-    if value[:128].lstrip()[:1] in {"{", "["}:
+    structured, omitted = _structured_prefix(value)
+    if omitted:
+        return ["Structured result omitted"], True
+    if structured:
         decoded, cut = _decode_result(value)
         text, clipped = _preferred_text(decoded)
         return [text or "Structured result"], cut or clipped

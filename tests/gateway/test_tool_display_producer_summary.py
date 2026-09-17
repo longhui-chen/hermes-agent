@@ -82,3 +82,33 @@ def test_plain_text_preview_is_allowed_and_bounded_separately():
     assert display['summary'].startswith('Result: normal text')
     assert len(display['summary'].removeprefix('Result: ').encode()) <= 512
     assert display['truncated']
+
+
+@pytest.mark.parametrize('prefix', [' ' * 129, '\t\n ' * 90])
+@pytest.mark.parametrize('location', ['root', 'nested', 'terminal'])
+def test_long_whitespace_cannot_disguise_json(prefix, location):
+    document = prefix + json.dumps({'message': 'Human result', 'token': 'secret-value'})
+    if location == 'root':
+        raw, tool = document, 'other'
+    elif location == 'nested':
+        raw, tool = json.dumps({'text': document}), 'other'
+    else:
+        raw, tool = json.dumps({'exit_code': 0, 'output': document}), 'terminal'
+    display = result_display(raw, tool_id=tool)
+    assert 'Human result' in display['summary']
+    assert '{' not in display['summary']
+    assert 'secret-value' not in display['summary']
+    assert display['bytes'] == len(raw.encode())
+
+
+def test_whitespace_over_scan_budget_is_omitted_without_unbounded_strip():
+    from gateway.platforms.tool_display import _PARSE_MAX_CHARS
+    class NoStrip(str):
+        def lstrip(self, *args):
+            raise AssertionError('unbounded strip is forbidden')
+    raw = NoStrip(' ' * (_PARSE_MAX_CHARS + 1) + '{"message":"hidden document"}')
+    display = result_display(raw)
+    assert display['truncated']
+    assert 'hidden document' not in display['summary']
+    assert '{' not in display['summary']
+    assert display['bytes'] == len(raw.encode())
