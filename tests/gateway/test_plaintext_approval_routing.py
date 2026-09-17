@@ -51,11 +51,11 @@ def _clear_approval_state():
     mod._pending.clear()
 
 
-def _make_runner():
+def _make_runner(runner_type=None):
     """Minimal GatewayRunner that exercises the real busy-session handler."""
     from gateway.run import GatewayRunner
 
-    runner = object.__new__(GatewayRunner)
+    runner = object.__new__(runner_type or GatewayRunner)
     runner.config = GatewayConfig(
         platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="***")}
     )
@@ -134,3 +134,60 @@ def test_no_pending_approval_does_not_consume_conversational_yes():
     _clear_approval_state()
 
 
+
+@pytest.mark.parametrize("reply,expected", [
+    ("同意", "once"), ("拒绝", "deny"), ("同意但先备份", None),
+    (" YES ", "once"), ("no", "deny"), ("always", "always"), ("session", "session"),
+])
+def test_localized_vocabulary_routes_only_exact_replies(reply, expected):
+    from gateway.run import GatewayRunner
+
+    class LocalizedRunner(GatewayRunner):
+        def plaintext_approval_words(self, event):
+            assert event.source.platform == Platform.TELEGRAM
+            return {
+                **super().plaintext_approval_words(event),
+                "同意": ("approve", ""), "拒绝": ("deny", ""),
+            }
+
+    _clear_approval_state()
+    try:
+        runner, _ = _make_runner(LocalizedRunner)
+        session_key, entry = _register_blocking_approval(runner)
+        event = _make_event(reply)
+        asyncio.run(runner._handle_active_session_busy_message(event, session_key))
+        assert entry.event.is_set() is (expected is not None)
+        if expected is not None:
+            assert entry.result == expected
+        else:
+            assert event.text == reply
+    finally:
+        _clear_approval_state()
+
+
+@pytest.mark.parametrize("pending,allow_control", [(False, True), (True, False)])
+def test_vocabulary_hook_is_not_called_without_approval_permission(pending, allow_control):
+    from gateway.run import GatewayRunner
+
+    calls = []
+
+    class LocalizedRunner(GatewayRunner):
+        def plaintext_approval_words(self, event):
+            calls.append(event)
+            return {"同意": ("approve", "")}
+
+    _clear_approval_state()
+    try:
+        runner, _ = _make_runner(LocalizedRunner)
+        session_key = runner._session_key_for_source(_make_source())
+        if pending:
+            session_key, entry = _register_blocking_approval(runner)
+        event = _make_event("同意")
+        event.allow_gateway_control = allow_control
+        asyncio.run(runner._handle_active_session_busy_message(event, session_key))
+        assert calls == []
+        assert event.text == "同意"
+        if pending:
+            assert not entry.event.is_set()
+    finally:
+        _clear_approval_state()
