@@ -532,3 +532,181 @@ def test_maintenance_key_present_without_app_slug_verdict_does_not_apply(tmp_pat
     assert session_id.startswith("cron_task_coexist-key-only_")
     # Ordinary success: agent replied non-emptily, no app_slug to override it.
     assert marks == [("coexist-key-only", True, None)]
+# --- the round's own closing verdict line -----------------------------------
+# 2026-09-17, storage-market-pulse「存储市场脉搏」: a round that could not
+# cross-check its quotes sent the reserved no-op heartbeat through
+# market.bundle_replace (App Host answers that one itself with ok:true, so a
+# genuinely empty round is not judged a failure) and closed with
+# "**Status:** failed — SNDK/WDC 收盘价交叉核验冲突". The import ledger saw an
+# accepted write, so the execution was recorded completed with no error while
+# every table in the app stayed at zero rows. A false success is worse than a
+# failure: the user sees green and has nothing to debug.
+#
+# The prompt local-server writes for these jobs promises "The platform reads
+# only this line to decide success or failure". These pin that promise, and
+# pin that it is one-way: the line can downgrade an accepted write, never
+# clear a write the platform itself rejected.
+
+_MARKET_JOB = {
+    "id": "j-market",
+    "name": "立即更新行情与新闻",
+    "app_slug": "storage-market-pulse",
+    "import_operation": "market.bundle_replace",
+}
+
+
+def _market_job(job_id):
+    return dict(_MARKET_JOB, id=job_id)
+
+
+def test_app_slug_round_that_declares_itself_failed_is_recorded_failed(monkeypatch):
+    """The exact 2026-09-17 round: heartbeat accepted, verdict says failed."""
+    calls = _patch_pipeline(
+        monkeypatch,
+        success=True,
+        final=(
+            "本轮未写入行情：来源冲突，已发送 0 条心跳，保留基线数据。\n"
+            "\n"
+            "**Status:** failed — SNDK/WDC 收盘价交叉核验冲突"
+        ),
+        import_attempts=[{"operation": "market.bundle_replace", "ok": True}],
+    )
+
+    s.run_one_job(_market_job("j-market-self-failed"))
+
+    _, jid, ok, err = _mark_call(calls)
+    assert (jid, ok) == ("j-market-self-failed", False)
+    assert err == "SNDK/WDC 收盘价交叉核验冲突"
+
+
+def test_app_slug_round_that_declares_itself_ok_keeps_the_accepted_write(monkeypatch):
+    """The legitimate empty round: nothing new, heartbeat sent, verdict ok.
+    This must stay a success — 'wrote nothing' is not by itself a failure."""
+    calls = _patch_pipeline(
+        monkeypatch,
+        success=True,
+        final="本轮无新数据，已报 0 条\n\n**Status:** ok",
+        import_attempts=[{"operation": "market.bundle_replace", "ok": True}],
+    )
+
+    s.run_one_job(_market_job("j-market-noop-ok"))
+
+    assert _mark_call(calls) == ("mark", "j-market-noop-ok", True, None)
+
+
+def test_app_slug_round_verdict_ok_cannot_clear_a_platform_rejection(monkeypatch):
+    """One-way: a round may confess, it may never absolve itself. The app
+    rejected the write; the agent claiming ok must not flip that to green."""
+    calls = _patch_pipeline(
+        monkeypatch,
+        success=True,
+        final="已更新\n\n**Status:** ok",
+        import_attempts=[{
+            "operation": "market.bundle_replace", "ok": False,
+            "error_code": "app_error",
+            "error_message": "SNDK 行情字段无效 (HTTP 400)",
+        }],
+    )
+
+    s.run_one_job(_market_job("j-market-lying-ok"))
+
+    _, jid, ok, err = _mark_call(calls)
+    assert (jid, ok) == ("j-market-lying-ok", False)
+    assert err == "SNDK 行情字段无效 (HTTP 400)"
+
+
+def test_app_slug_round_without_a_verdict_line_is_judged_exactly_as_before(monkeypatch):
+    """Back-compat pin: apps published before the verdict line existed (and
+    any round that simply forgets it) keep the pure import-ledger verdict."""
+    calls = _patch_pipeline(
+        monkeypatch,
+        success=True,
+        final="更新完成，写入 4 条行情",
+        import_attempts=[{"operation": "market.bundle_replace", "ok": True}],
+    )
+
+    s.run_one_job(_market_job("j-market-no-verdict"))
+
+    assert _mark_call(calls) == ("mark", "j-market-no-verdict", True, None)
+
+
+def test_app_slug_round_verdict_failed_without_a_reason_still_records_one(monkeypatch):
+    """last_error must never be empty on a failed round — the task panel shows
+    it verbatim and an empty string reads as 'failed for no reason'."""
+    calls = _patch_pipeline(
+        monkeypatch,
+        success=True,
+        final="**Status:** failed",
+        import_attempts=[{"operation": "market.bundle_replace", "ok": True}],
+    )
+
+    s.run_one_job(_market_job("j-market-bare-failed"))
+
+    _, _, ok, err = _mark_call(calls)
+    assert ok is False
+    assert err == "the maintenance round reported itself failed"
+
+
+def test_non_app_slug_job_is_unaffected_by_a_verdict_line(monkeypatch):
+    """Ordinary cron jobs (reminders, digests, watchdogs) have no app contract
+    and no verdict discipline — a line that merely looks like one must not
+    turn a successful reminder into a failure."""
+    calls = _patch_pipeline(
+        monkeypatch, success=True,
+        final="提醒已发出\n\n**Status:** failed — 这不是应用任务",
+    )
+
+    s.run_one_job({"id": "j-plain-reminder", "name": "reminder"})
+
+    assert _mark_call(calls) == ("mark", "j-plain-reminder", True, None)
+
+
+# --- the verdict reader itself ---------------------------------------------
+
+
+def test_verdict_reads_only_the_last_non_empty_line():
+    assert s._app_task_agent_verdict(
+        "**Status:** failed — 判词写早了\n\n后面还有话，所以这不是收尾判词"
+    ) is None
+
+
+def test_verdict_ignores_a_quoted_example_earlier_in_the_reply():
+    """The saved markdown carries the prompt too, and the prompt itself spells
+    out '**Status:** ok' / '**Status:** failed — <one short reason>'. Reading
+    the last line of final_response is what keeps that echo out."""
+    assert s._app_task_agent_verdict(
+        '提示词要求我以 "**Status:** failed — <one short reason>" 收尾\n'
+        "**Status:** ok"
+    ) == (True, "")
+
+
+def test_verdict_trims_every_reason_separator():
+    for line in (
+        "**Status:** failed — 原因",
+        "**Status:** failed - 原因",
+        "**Status:** failed: 原因",
+        "**Status:** failed：原因",
+        "**Status:** failed，原因",
+    ):
+        assert s._app_task_agent_verdict(line) == (False, "原因"), line
+
+
+def test_verdict_ignores_platform_authored_status_lines():
+    """cron/scheduler.py writes '**Status:** silent (...)' and
+    '**Status:** BLOCKED' into saved docs. Those are not round verdicts."""
+    assert s._app_task_agent_verdict("**Status:** silent (empty output)") is None
+    assert s._app_task_agent_verdict("**Status:** BLOCKED") is None
+
+
+def test_verdict_absent_for_ordinary_replies_and_junk():
+    assert s._app_task_agent_verdict("更新完成，写入 4 条行情") is None
+    assert s._app_task_agent_verdict("") is None
+    assert s._app_task_agent_verdict("   \n\n  ") is None
+    assert s._app_task_agent_verdict(None) is None
+
+
+def test_verdict_reason_is_bounded():
+    verdict = s._app_task_agent_verdict("**Status:** failed — " + "x" * 5000)
+    assert verdict is not None
+    assert verdict[0] is False
+    assert len(verdict[1]) == s._MAX_APP_TASK_VERDICT_REASON
