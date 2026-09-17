@@ -370,7 +370,7 @@ Fields from `contracts/chat-ui/v1/golden/hermes/tool-frame.completed.json` (do n
 | `browserContentEvidence` | object | `{"text":"demo"}` |
 | `item_id` | string | `"01996f2e-7b6a-7c33-9f8e-4a3d6c1b2e90"` |
 | `index` | number | `2` |
-| `display` | object | `{"summary":"result","content_type":"text","truncated":false,"bytes":6}` |
+| `display` | object | `{"summary":"Result: Generated cover image","content_type":"text","truncated":false}` |
 <!-- generated:end tool-frame.completed -->
 
 <!-- generated:begin tool-frame.error -->
@@ -390,7 +390,7 @@ Fields from `contracts/chat-ui/v1/golden/hermes/tool-frame.error.json` (do not e
 | `output` | object | `{"success":false}` |
 | `item_id` | string | `"01996f2e-7b6a-7c33-9f8e-4a3d6c1b2e90"` |
 | `index` | number | `2` |
-| `display` | object | `{"summary":"permission denied","content_type":"error","truncated":false,"bytes":16}` |
+| `display` | object | `{"summary":"Error: connector returned 401","content_type":"error","truncated":false,"bytes":22}` |
 <!-- generated:end tool-frame.error -->
 
 Built by upstream `api_server.py` (`_on_tool_start` / `_on_tool_complete`

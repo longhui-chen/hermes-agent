@@ -1,7 +1,7 @@
 {
   "snapshot_version": 2,
-  "root_commit": "393a7e2bf4fb9b60dc3f6650cf1e2a015d272054",
-  "sha256": "82f85c40f496eede0fc8b20b5a81e58f8a89a29fa0769133d65677e8f447bb13",
+  "root_commit": "837f2d27942c6c40b687810e711f7e3f0601eb7b",
+  "sha256": "cdec855b1eb3ab571972ae9ebd71ae6b6caa68e9879990291c385ee1dd692da6",
   "payload": {
     "golden": {
       "events": {
@@ -969,10 +969,10 @@
             "item_id": "01996f2e-7b6a-7c33-9f8e-4a3d6c1b2e90",
             "index": 2,
             "display": {
-              "summary": "permission denied",
+              "summary": "Error: search backend unavailable",
               "content_type": "error",
               "truncated": false,
-              "bytes": 17
+              "bytes": 26
             }
           }
         },
@@ -1008,10 +1008,10 @@
             "item_id": "01996f2e-7b6a-7c33-9f8e-4a3d6c1b2e90",
             "index": 2,
             "display": {
-              "summary": "x",
-              "content_type": "text",
+              "summary": "Error: search backend unavailable",
+              "content_type": "error",
               "truncated": true,
-              "bytes": 1
+              "bytes": 26
             }
           }
         },
@@ -1047,7 +1047,7 @@
             "item_id": "01996f2e-7b6a-7c33-9f8e-4a3d6c1b2e90",
             "index": 2,
             "display": {
-              "summary": "search backend unavailable",
+              "summary": "Error: search backend unavailable",
               "content_type": "error",
               "truncated": false,
               "bytes": 26
@@ -1884,10 +1884,9 @@
           "item_id": "01996f2e-7b6a-7c33-9f8e-4a3d6c1b2e90",
           "index": 2,
           "display": {
-            "summary": "result",
+            "summary": "Result: Generated cover image",
             "content_type": "text",
-            "truncated": false,
-            "bytes": 6
+            "truncated": false
           }
         },
         "tool-frame.error": {
@@ -1912,10 +1911,10 @@
           "item_id": "01996f2e-7b6a-7c33-9f8e-4a3d6c1b2e90",
           "index": 2,
           "display": {
-            "summary": "permission denied",
+            "summary": "Error: connector returned 401",
             "content_type": "error",
             "truncated": false,
-            "bytes": 16
+            "bytes": 22
           }
         },
         "tool-frame.running": {
@@ -2042,6 +2041,30 @@
               "item_index": 4,
               "v": 1,
               "preview": "Found demo files"
+            },
+            {
+              "turn_id": "turn_demo_0001",
+              "kind": "clarify",
+              "status": "done",
+              "item_index": 6,
+              "activity_id": 45,
+              "call_id": "ia_demo_0002"
+            },
+            {
+              "turn_id": "turn_demo_0001",
+              "kind": "context",
+              "status": "done",
+              "item_index": 8,
+              "activity_id": 46,
+              "call_id": "context"
+            },
+            {
+              "turn_id": "turn_demo_0001",
+              "kind": "plan_preview",
+              "status": "done",
+              "item_index": 9,
+              "activity_id": 47,
+              "call_id": "plan_preview"
             }
           ],
           "truncated": false
@@ -2159,6 +2182,65 @@
                 "kind": "subagent",
                 "status": "done",
                 "preview": "Found demo files"
+              }
+            },
+            {
+              "turn_id": "turn_demo_0001",
+              "kind": "clarify",
+              "status": "done",
+              "item_index": 6,
+              "id": 7,
+              "role": "assistant",
+              "content": "",
+              "clarify_id": "ia_demo_0002",
+              "clarify": {
+                "clarify_id": "ia_demo_0002",
+                "question": "周末指哪两天？",
+                "choices_offered": [
+                  "上周末",
+                  "本周末"
+                ],
+                "expires_at_ms": 1756973100000
+              }
+            },
+            {
+              "turn_id": "turn_demo_0001",
+              "kind": "context",
+              "status": "done",
+              "item_index": 8,
+              "id": 7,
+              "role": "assistant",
+              "content": "",
+              "context_compaction": {
+                "state": "done",
+                "message": "上下文已压缩",
+                "old_session_id": "sess_demo_0001",
+                "new_session_id": "sess_demo_0002"
+              }
+            },
+            {
+              "turn_id": "turn_demo_0001",
+              "kind": "plan_preview",
+              "status": "done",
+              "item_index": 9,
+              "id": 7,
+              "role": "assistant",
+              "content": "",
+              "plan_preview": {
+                "title": "剪辑 vlog",
+                "groups": [
+                  {
+                    "icon": "🎬",
+                    "label": "素材",
+                    "count": 1,
+                    "items": [
+                      "挑选 4 段"
+                    ]
+                  }
+                ],
+                "plan_id": "plan_demo_0001",
+                "status": "pending",
+                "revision_requested": false
               }
             }
           ]
@@ -2294,6 +2376,30 @@
               "item_index": 4,
               "v": 1,
               "preview": "Found demo files"
+            },
+            {
+              "turn_id": "turn_demo_0001",
+              "kind": "clarify",
+              "status": "done",
+              "item_index": 6,
+              "activity_id": 45,
+              "call_id": "ia_demo_0002"
+            },
+            {
+              "turn_id": "turn_demo_0001",
+              "kind": "context",
+              "status": "done",
+              "item_index": 8,
+              "activity_id": 46,
+              "call_id": "context"
+            },
+            {
+              "turn_id": "turn_demo_0001",
+              "kind": "plan_preview",
+              "status": "done",
+              "item_index": 9,
+              "activity_id": 47,
+              "call_id": "plan_preview"
             }
           ],
           "truncated": false
