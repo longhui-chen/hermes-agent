@@ -3906,9 +3906,9 @@ class ZetAgentAdapter(APIServerAdapter):
             from gateway.platforms.connector_input_guard import requests_secret_input
             if connector_setup is None and any(requests_secret_input(text) for text in [question, *(choices or [])]):
                 raise ValueError(
-                    "connector_setup_required: ordinary clarify sends answers to the model; "
-                    "it is not protected input. Retry with validated connector_setup metadata, "
-                    "never ask for credentials in question/choices or redirect to settings."
+                    "connector_chat_turn_required: do not block on clarify for Connector "
+                    "credentials. Ask in an ordinary Chat message, end the turn, and "
+                    "continue with connector_chat_create after the user's reply."
                 )
             if connector_setup is not None:
                 if not connector_input_capable:

@@ -161,17 +161,18 @@ def clarify_tool(
     if callback is None:
         return tool_error("Clarify tool is not available in this execution context.")
 
+    # zettlab-overlay(connector-chat-cleanup): retire software setup on clarify; upstream: none
     if connector_setup is not None:
         import inspect
         try:
             intent = normalize_connector_setup(connector_setup)
             if choices or multi_select or "connector_setup" not in inspect.signature(callback).parameters:
-                return tool_error("connector_setup_unavailable: do not request credentials in ordinary chat")
+                return tool_error("connector_setup_unavailable: software Connector setup belongs in ordinary Chat turns, not clarify")
             raw_response = callback("Connector setup", None, connector_setup=intent)
             return connector_setup_result(raw_response)
         except Exception:
             # Neither callback errors nor arbitrary responses may echo credentials.
-            return tool_error("connector_setup_unavailable: do not request credentials in ordinary chat")
+            return tool_error("connector_setup_unavailable: software Connector setup belongs in ordinary Chat turns, not clarify")
 
     try:
         raw_response = _invoke_callback(callback, question, choices, multi_select)
@@ -202,12 +203,12 @@ def check_clarify_requirements() -> bool:
 CLARIFY_SCHEMA = {
     "name": "clarify",
     "description": (
-        # zettlab-overlay(connector-input): distinguish trusted input from ordinary clarify; upstream: none
+        # zettlab-overlay(connector-chat-cleanup): route software setup to Chat turns; upstream: none
         "SECURITY: Ordinary clarify answers are sent to the model and chat history. "
-        "Never request a password, PAT, API key or other credential in question/choices, "
-        "even when calling the panel secure. For supported Connector setup use the "
-        "connector_setup parameter; only that path collects credentials outside chat. "
-        "A submitted setup receipt contains no credential; do not infer exposure from it. "
+        "Do not use this blocking tool to request a password, PAT, API key or other "
+        "Connector credential. Ask for missing Connector fields in an ordinary Chat "
+        "message, end the turn, then use connector_chat_create after the user's reply. "
+        "connector_setup is reserved for camera observation/live/recording consent. "
         "Ask the user a question when you need clarification, feedback, or a "
         "decision before proceeding. Supports three modes:\n\n"
         "1. **Single-select multiple choice** — provide up to 4 choices. The user picks one "
