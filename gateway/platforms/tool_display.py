@@ -14,7 +14,8 @@ from typing import Any
 from agent.redact import redact_sensitive_text
 
 ARGS_MAX_BYTES = 256
-SUMMARY_MAX_BYTES = 4 * 1024
+SUMMARY_MAX_BYTES = 1024
+_SOURCE_MAX_BYTES = 4 * 1024
 
 _SECRET_PATTERNS = (
     (re.compile(r"(?i)(bearer\s+)[^\s,;]+"), r"\1[REDACTED]"),
@@ -28,7 +29,7 @@ _SECRET_PATTERNS = (
 
 def redact(text: str) -> str:
     """Redact bounded text using the IM policy plus display-only private paths."""
-    if len(text) > SUMMARY_MAX_BYTES:
+    if len(text) > _SOURCE_MAX_BYTES:
         return "[TRUNCATED]"
     try:
         text.encode("utf-8", "strict")
@@ -140,7 +141,7 @@ def source_from_registration(tool_id: str, registration: Mapping[str, Any] | Non
     # MCP grouping identity is the registered server, never the tool's id.
     source_id = (row.get("server") or row.get("id") or tool_id) if kind == "mcp" else (row.get("id") or tool_id)
     label = row.get("server_label") or row.get("label") or row.get("name") or source_id
-    return {"kind": kind, "id": _display_text(source_id, SUMMARY_MAX_BYTES)[0], "label": _display_text(label, SUMMARY_MAX_BYTES)[0]}
+    return {"kind": kind, "id": _display_text(source_id, _SOURCE_MAX_BYTES)[0], "label": _display_text(label, _SOURCE_MAX_BYTES)[0]}
 
 
 def args_summary(arguments: Any) -> dict[str, Any]:
@@ -148,29 +149,233 @@ def args_summary(arguments: Any) -> dict[str, Any]:
     return {"args_summary": text, "truncated": truncated}
 
 
-def result_display(output: Any = None, *, error: Any = None, content_type: str | None = None) -> dict[str, Any]:
-    is_error = error is not None and not (isinstance(error, str) and error == "")
-    value = error if is_error else output
-    # Preserve scalar text conventions without invoking arbitrary __str__.
-    if value is None:
-        value = ""
-    elif isinstance(value, bool):
-        value = "True" if value else "False"
-    summary, truncated, size = _display_text(value, SUMMARY_MAX_BYTES)
-    if is_error:
-        kind = "error"
-    elif content_type in {"text", "markdown", "json", "error"}:
-        kind = content_type
-    elif isinstance(output, (Mapping, list, tuple)):
-        kind = "json"
+# Bound JSON parsing and line inspection independently of the emitted summary.
+_PARSE_MAX_CHARS = 64 * 1024
+_LINE_WINDOW_CHARS = 4096
+
+
+def _decode_result(value: Any) -> tuple[Any, bool]:
+    if isinstance(value, str) and value[:128].lstrip()[:1] in {"{", "["}:
+        if len(value) > _PARSE_MAX_CHARS:
+            return None, True
+        try:
+            return json.loads(value), False
+        except (ValueError, RecursionError):
+            return None, True
+    return value, False
+
+
+def _flat_text(value: Any) -> tuple[str, bool]:
+    """Select human text, never serialize a result tree back into JSON."""
+    pieces: list[str] = []
+    nodes = 0
+    cut = False
+    seen: set[int] = set()
+
+    def visit(item: Any, depth: int = 0) -> None:
+        nonlocal nodes, cut
+        nodes += 1
+        if nodes > 64 or depth > 8 or sum(map(len, pieces)) >= 1024:
+            cut = True
+            return
+        if isinstance(item, str):
+            if item[:128].lstrip()[:1] in {"{", "["}:
+                decoded, omitted = _decode_result(item)
+                cut |= omitted
+                if decoded is not None:
+                    visit(decoded, depth + 1)
+                return
+            # Avoid cutting credential atoms before redaction. Inspect one
+            # bounded atom; oversized strings safely omit the remainder.
+            cut |= len(item) > 1024
+            pieces.append(redact(item[:1024]))
+        elif isinstance(item, Mapping):
+            if id(item) in seen:
+                cut = True
+                return
+            seen.add(id(item))
+            for key, child in islice(item.items(), 64):
+                if nodes >= 64:
+                    cut = True
+                    break
+                if not isinstance(key, str) or len(key) > 256:
+                    cut = True
+                    continue
+                if _SECRET_KEYS.search(key):
+                    continue
+                visit(child, depth + 1)
+            cut |= len(item) > 64
+            seen.remove(id(item))
+        elif isinstance(item, (list, tuple)):
+            if id(item) in seen:
+                cut = True
+                return
+            seen.add(id(item))
+            for child in islice(item, 64):
+                if nodes >= 64:
+                    cut = True
+                    break
+                visit(child, depth + 1)
+            cut |= len(item) > 64
+            seen.remove(id(item))
+        elif item is None:
+            return
+        elif isinstance(item, (bool, float)) or isinstance(item, int) and item.bit_length() <= 64:
+            pieces.append(str(item))
+        else:
+            cut = True
+
+    visit(value)
+    text, clipped, _ = _truncate_utf8(" • ".join(pieces), 512)
+    return text, cut or clipped
+
+
+def _preferred_text(value: Any) -> tuple[str, bool]:
+    if isinstance(value, Mapping):
+        for field in ("summary", "message", "error", "text"):
+            selected = value.get(field)
+            if selected is not None and selected != "":
+                return _flat_text(selected)
+    return _flat_text(value)
+
+
+def _lines(value: Any, count: int, *, tail: bool = False) -> tuple[list[str], bool]:
+    if not isinstance(value, str):
+        text, cut = _preferred_text(value)
+        return [text], cut
+    if value[:128].lstrip()[:1] in {"{", "["}:
+        decoded, cut = _decode_result(value)
+        text, clipped = _preferred_text(decoded)
+        return [text or "Structured result"], cut or clipped
+    cut = len(value) > _LINE_WINDOW_CHARS
+    window = value[-_LINE_WINDOW_CHARS:] if tail else value[:_LINE_WINDOW_CHARS]
+    lines = window.splitlines()
+    if cut:
+        # Drop the partial boundary line, so a sliced credential cannot lose
+        # its label and escape the sanitizer.
+        lines = lines[1:] if tail else lines[:-1]
+    cut |= len(lines) > count
+    selected = lines[-count:] if tail else lines[:count]
+    result = []
+    for line in selected:
+        if len(line) > SUMMARY_MAX_BYTES:
+            result.append("[TRUNCATED]")
+            cut = True
+        else:
+            result.append(redact(line))
+    return result, cut
+
+
+def _derive_summary(value: Any, tool_id: str, arguments: Any) -> tuple[str, bool]:
+    row = value if isinstance(value, Mapping) else {}
+    args = arguments if isinstance(arguments, Mapping) else {}
+    if tool_id == "terminal":
+        code, cut = _flat_text(row.get("exit_code", "unknown"))
+        lines, clipped = _lines(row.get("output", row.get("stdout", value)), 20, tail=True)
+        stderr, stderr_cut = _lines(row.get("stderr", ""), 20, tail=True)
+        combined = (lines + stderr)[-20:]
+        return "Exit code: " + code + "\n" + "\n".join(combined), cut or clipped or stderr_cut or len(lines + stderr) > 20
+    if tool_id == "read_file":
+        path, cut = _flat_text(args.get("path", row.get("path", "File")))
+        total, a = _flat_text(row.get("total_lines", "unknown"))
+        size, b = _flat_text(row.get("file_size", "unknown"))
+        lines, c = _lines(row.get("content", ""), 5)
+        return f"File: {path}\nLines: {total}; Bytes: {size}\n" + "\n".join(lines), cut or a or b or c
+    if tool_id == "patch":
+        files = [row.get(key, []) for key in ("files_modified", "files_created", "files_deleted")]
+        names, cut = _flat_text(files if any(files) else args.get("path", "File"))
+        diff = row.get("diff", "")
+        if not isinstance(diff, str) or len(diff) > _PARSE_MAX_CHARS:
+            return f"Files: {names}\nChanges: counts unavailable", True
+        added = removed = 0
+        # No full split/copy of the diff: inspect at most the bounded source.
+        import io
+        for line in io.StringIO(diff):
+            added += line.startswith("+") and not line.startswith("+++")
+            removed += line.startswith("-") and not line.startswith("---")
+        return f"Files: {names}\nChanges: +{added} -{removed}", cut
+    if tool_id in {"search", "search_files", "nas_search"}:
+        total, cut = _flat_text(row.get("total_count", row.get("total", "unknown")))
+        titles = []
+        matches = row.get("matches", row.get("results", row.get("files", [])))
+        if isinstance(matches, (list, tuple)):
+            cut |= len(matches) > 3
+            for match in islice(matches, 3):
+                title = match.get("title", match.get("path", match.get("content", ""))) if isinstance(match, Mapping) else match
+                text, clipped = _flat_text(title)
+                titles.append(text)
+                cut |= clipped
+        if not titles and isinstance(row.get("matches_text"), str):
+            lines, clipped = _lines(row["matches_text"], 12)
+            path = ""
+            for line in lines:
+                if line.startswith("  "):
+                    titles.append(f"{path}: {line.strip()}")
+                    if len(titles) == 3:
+                        break
+                else:
+                    path = line
+            cut |= clipped or len(lines) > len(titles) + 1
+
+        return f"Matches: {total}\n" + "\n".join(titles), cut
+    if tool_id == "todo" and isinstance(row.get("summary"), Mapping):
+        counts = row["summary"]
+        fields = []
+        cut = False
+        for field in ("total", "completed", "pending", "in_progress", "cancelled"):
+            text, clipped = _flat_text(counts.get(field, 0))
+            fields.append(f"{field}: {text}")
+            cut |= clipped
+        action = "write" if args.get("todos") is not None else "read"
+        return f"Action: {action} tasks\n" + "; ".join(fields), cut
+    if tool_id == "skill_view" and row.get("name"):
+        name, cut = _flat_text(row["name"])
+        status, clipped = _flat_text(row.get("readiness_status", "loaded"))
+        return f"Action: view skill {name}\nResult: {status}", cut or clipped
+    if tool_id == "app_host" and isinstance(row.get("data"), Mapping):
+        data = row["data"]
+        selected = next((data[key] for key in ("summary", "message", "error", "text", "outcome", "state") if data.get(key) is not None), "Completed" if row.get("ok") else "Result unavailable")
+        text, cut = _preferred_text(selected)
     else:
-        kind = "markdown" if "```" in summary else "text"
-    return {"summary": summary, "content_type": kind, "truncated": truncated, "bytes": size}
+        text, cut = _preferred_text(value)
+    if tool_id in {"app_host", "skill_view", "todo"}:
+        action, clipped = _flat_text(args.get("action", tool_id))
+        return f"Action: {action}\nResult: {text}", cut or clipped
+    if isinstance(value, (bool, int, float)):
+        return text, cut
+    return "Result: " + (text or "Structured result"), cut
+
+
+def result_display(output: Any = None, *, error: Any = None, content_type: str | None = None,
+                   tool_id: str = "", arguments: Any = None) -> dict[str, Any]:
+    is_error = error is not None and not (isinstance(error, str) and error == "")
+    value, omitted = _decode_result(error if is_error else output)
+    if isinstance(value, Mapping):
+        is_error |= bool(value.get("error"))
+    if is_error:
+        text, cut = _preferred_text(value)
+        summary = "Error: " + (text or "Tool failed")
+    else:
+        summary, cut = _derive_summary(value, tool_id, arguments)
+    summary, clipped, _ = _truncate_utf8(summary, SUMMARY_MAX_BYTES)
+    kind = "error" if is_error or content_type == "error" else "markdown" if content_type == "markdown" else "text"
+    display = {"summary": summary, "content_type": kind, "truncated": omitted or cut or clipped}
+    original = error if error is not None and error != "" else output
+    if isinstance(original, str):
+        try:
+            # D1 requires original byte size. Measure without a whole-result
+            # allocation/encode; this is O(n) counting with constant memory.
+            display["bytes"] = sum(len(original[i:i + 1024].encode("utf-8", "strict"))
+                                   for i in range(0, len(original), 1024))
+        except UnicodeError:
+            pass  # No valid UTF-8 source size exists; optional bytes is absent.
+    # A mapping has no original wire encoding. Do not invent one for counting.
+    return display
 
 
 def build_tool_start_display(tool_id: str, arguments: Any, registration: Mapping[str, Any] | None = None) -> dict[str, Any]:
     return {"source": source_from_registration(tool_id, registration), "display": args_summary(arguments)}
 
 
-def build_tool_result_display(output: Any = None, *, error: Any = None, content_type: str | None = None) -> dict[str, Any]:
-    return {"display": result_display(output, error=error, content_type=content_type)}
+def build_tool_result_display(output: Any = None, *, error: Any = None, content_type: str | None = None, tool_id: str = "", arguments: Any = None) -> dict[str, Any]:
+    return {"display": result_display(output, error=error, content_type=content_type, tool_id=tool_id, arguments=arguments)}
