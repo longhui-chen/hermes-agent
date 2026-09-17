@@ -21,14 +21,14 @@ def test_random_redaction_and_utf8_bounds():
 def test_error_always_uses_error_content_type_and_exact_bytes():
     display = build_tool_result_display({"ignored": True}, error="token=bad")['display']
     assert display["content_type"] == "error"
-    assert display["bytes"] == len(display["summary"].encode())
+    assert display["bytes"] == len("token=bad".encode())
     assert "token=bad" not in display["summary"]
 
 
 def test_truncation_sets_flag_and_keeps_character_boundary():
     display = build_tool_result_display("🙂" * (SUMMARY_MAX_BYTES + 100))["display"]
     assert display["truncated"] is True
-    assert display["bytes"] <= SUMMARY_MAX_BYTES
+    assert display["bytes"] == len(("🙂" * (SUMMARY_MAX_BYTES + 100)).encode())
     display["summary"].encode("utf-8")
 
 
@@ -66,11 +66,14 @@ def test_oversized_atoms_are_rejected_before_redaction_or_encoding(monkeypatch):
         return original(text, **kwargs)
 
     monkeypatch.setattr(tool_display, "redact_sensitive_text", checked)
-    oversized = Unencodable("secret" * (SUMMARY_MAX_BYTES + 1))
+    oversized = Unencodable("token=" + "secret" * (SUMMARY_MAX_BYTES + 1))
     for value in (oversized, {"nested": oversized}, {oversized: "value"}):
         display = result_display(value)
         assert display["truncated"]
-        assert display["bytes"] == len(display["summary"].encode())
+        if isinstance(value, str):
+            assert display["bytes"] == len(value)
+        else:
+            assert "bytes" not in display
         assert "secret" not in display["summary"]
     assert all(len(text) <= SUMMARY_MAX_BYTES for text in inspected)
 
@@ -108,7 +111,7 @@ def test_cycles_depth_and_unsupported_values_fail_closed():
     for value in (cycle, deep, Dangerous(), 1 << 100000):
         display = result_display(value)
         assert display["truncated"]
-        assert display["bytes"] <= SUMMARY_MAX_BYTES
+        assert "bytes" not in display
 
 
 def test_redactor_failure_does_not_disclose_input(monkeypatch):
@@ -118,7 +121,7 @@ def test_redactor_failure_does_not_disclose_input(monkeypatch):
         raise RuntimeError("redactor failed")
 
     monkeypatch.setattr(tool_display, "redact_sensitive_text", broken)
-    assert result_display("secret material")["summary"] == "[INVALID_TEXT]"
+    assert result_display("secret material")["summary"] == "Result: [INVALID_TEXT]"
 
 
 def test_random_short_inputs_use_shared_redactor_and_private_path_policy():
@@ -130,7 +133,7 @@ def test_random_short_inputs_use_shared_redactor_and_private_path_policy():
                     f'ghp_{secret}', f'token={secret}'):
             display = result_display(raw)
             assert secret not in display["summary"]
-            assert display["bytes"] == len(display["summary"].encode())
+            assert display["bytes"] == len(raw.encode())
 
 
 def test_random_utf8_character_boundaries_and_preprocessing_truncation():
@@ -144,7 +147,8 @@ def test_random_utf8_character_boundaries_and_preprocessing_truncation():
     # Redaction/omission can shrink the output below the cap; lost input still
     # requires truncated=true rather than guessing from the final byte length.
     display = result_display({"safe": "x" * (SUMMARY_MAX_BYTES + 1)})
-    assert display["truncated"] and display["bytes"] < SUMMARY_MAX_BYTES
+    assert display["truncated"] and len(display["summary"].encode()) <= SUMMARY_MAX_BYTES
+    assert "bytes" not in display
 
 
 def test_mcp_uses_server_identity_and_server_display_name():

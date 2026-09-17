@@ -117,7 +117,7 @@ def tool_callbacks(stream_q, timing=None):
             return
         payload = _tool_completion_payload(call_id, name, result)
         error = result if payload.get("outcome") == "error" else None
-        payload.update(build_tool_result_display(result, error=error))
+        payload.update(build_tool_result_display(result, error=error, tool_id=name, arguments=args))
         stream_q.put(("__tool_progress__", payload))
 
     return start, complete
