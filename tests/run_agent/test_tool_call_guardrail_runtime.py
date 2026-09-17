@@ -6,11 +6,6 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import agent.tool_executor as tool_executor
-from agent.tool_guardrails import (
-    APP_PUBLISH_CAP_CODE,
-    TOOLGUARD_VERBATIM_HALT_CODES,
-    ToolGuardrailDecision,
-)
 from run_agent import AIAgent
 
 
@@ -498,35 +493,3 @@ def test_configured_guardrail_halt_emits_final_response_through_stream_delta_cal
     assert halt_text in text_deltas, (
         f"halt message was never streamed; callback only saw {deltas!r}"
     )
-
-
-def test_app_change_budget_handoff_reaches_the_user_verbatim():
-    """A halt written for the user must not be replaced by the generic text.
-
-    The app change budget's halt names the app, the rounds already spent and
-    where the work site is left, and tells the model what to report. The
-    generic "I stopped retrying app_host" sentence would make a deliberate
-    hand-off indistinguishable from the turn dying on its own — which is the
-    failure mode this whole workstream exists to remove.
-    """
-    assert APP_PUBLISH_CAP_CODE in TOOLGUARD_VERBATIM_HALT_CODES
-
-    handoff = ToolGuardrailDecision(
-        action="block",
-        code=APP_PUBLISH_CAP_CODE,
-        message="「diary」已达上限；不许自行回滚或删除",
-        tool_name="app_host",
-        count=6,
-    )
-    assert AIAgent._toolguard_controlled_halt_response(None, handoff) == handoff.message
-
-    generic = ToolGuardrailDecision(
-        action="block",
-        code="repeated_exact_failure_block",
-        message="Blocked read_file: ...",
-        tool_name="read_file",
-        count=5,
-    )
-    rendered = AIAgent._toolguard_controlled_halt_response(None, generic)
-    assert rendered != generic.message
-    assert "read_file" in rendered

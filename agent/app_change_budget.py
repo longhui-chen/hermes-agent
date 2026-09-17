@@ -24,11 +24,13 @@ produced *before* any HTTP request leaves the tool.
 
 What "one repair task" means
 ----------------------------
-One user turn. The user speaking is what clears the counters, because a turn
-boundary is the only moment a human has had the chance to say "keep going".
-The turn identity comes from :func:`gateway.session_context.current_turn_identity`,
-whose opaque binding object is minted fresh per request and cannot be
-reconstructed from model- or client-supplied metadata.
+One user turn, and only a turn the platform can actually attest. The identity
+comes from :func:`gateway.session_context.current_turn_identity`, whose opaque
+binding object is minted fresh per request and cannot be reconstructed from
+model- or client-supplied metadata. **When no such identity is bound this gate
+stands down entirely and every call passes** — a budget is a promise about one
+user turn, and inventing a turn boundary out of process-local state would make
+the gate mean something the platform cannot vouch for.
 
 Context compression deliberately does NOT reset anything. Compression happens
 *inside* a turn and keeps the same task context, so the same binding object is
@@ -52,8 +54,7 @@ argument is not a repair round.
 
 This module never raises. Every public entry point swallows its own errors and
 degrades to "no opinion": a bookkeeping bug must not break the tool call the
-model is waiting on, and the per-turn loop cap in ``agent.tool_guardrails``
-remains as the backstop.
+model is waiting on. A refusal is produced only when the ledger is certain.
 """
 
 from __future__ import annotations
@@ -91,10 +92,6 @@ _MAX_SITE_CHARS = 512
 
 _lock = threading.RLock()
 _ledgers: "OrderedDict[Any, _TurnLedger]" = OrderedDict()
-# Fallback turn counter for entry points that do not bind a turn identity (the
-# CLI and the single-profile daemon). Advanced by :func:`note_turn_boundary`
-# from ``agent.turn_context.reset_for_turn``, the one per-user-turn reset point.
-_local_turn_generation = 0
 
 
 class _TurnLedger:
@@ -110,25 +107,13 @@ class _TurnLedger:
         self.sites: dict[str, str] = {}
 
 
-def note_turn_boundary() -> None:
-    """Advance the fallback turn generation (a new user turn has started).
-
-    A no-op for requests that carry a real turn identity — those key off the
-    identity itself, which already changes per turn.
-    """
-    global _local_turn_generation
-    try:
-        with _lock:
-            _local_turn_generation += 1
-    except Exception:
-        pass
-
-
 def refuse_if_exhausted(args: Mapping[str, Any] | None) -> tuple[str, str] | None:
     """Return ``(error_code, message)`` when this turn's budget is spent.
 
-    ``None`` means "carry on". The caller must turn a returned pair into a
-    local failure envelope WITHOUT sending the request.
+    ``None`` means "carry on" — including whenever no trusted turn identity is
+    bound, which is the deliberate stand-down described in the module docstring.
+    The caller must turn a returned pair into a local failure envelope WITHOUT
+    sending the request.
     """
     try:
         if not isinstance(args, Mapping):
@@ -139,17 +124,18 @@ def refuse_if_exhausted(args: Mapping[str, Any] | None) -> tuple[str, str] | Non
             if not cap:
                 return None
             ledger = _ledger(create=False)
-            used = ledger.build_rounds if ledger is not None else 0
-            if used < cap:
+            if ledger is None or ledger.build_rounds < cap:
                 return None
-            return BUILD_BUDGET_CODE, _build_refusal(used, ledger)
+            return BUILD_BUDGET_CODE, _build_refusal(ledger.build_rounds, ledger)
         if action in PUBLISH_ACTIONS:
             cap = MAX_PUBLISHES_PER_APP_PER_TURN
             if not cap:
                 return None
-            scope = app_scope(args)
             ledger = _ledger(create=False)
-            used = ledger.publishes.get(scope or _UNSCOPED, 0) if ledger is not None else 0
+            if ledger is None:
+                return None
+            scope = app_scope(args)
+            used = ledger.publishes.get(scope or _UNSCOPED, 0)
             if used < cap:
                 return None
             return PUBLISH_BUDGET_CODE, _publish_refusal(scope, used, ledger)
@@ -228,69 +214,41 @@ def app_scope(args: Mapping[str, Any] | None) -> str:
     return ""
 
 
-def usage_summary(slug: str = "") -> str:
-    """One human line describing what this turn already spent, for a halt message."""
-    try:
-        ledger = _ledger(create=False)
-        if ledger is None:
-            return "本回合尚无平台记录"
-        name = _clean(slug)
-        if name and name in ledger.publishes:
-            published = ledger.publishes[name]
-        else:
-            published = sum(ledger.publishes.values())
-        parts = [f"本回合已提交新版本 {published} 次", f"编译 {ledger.build_rounds} 轮"]
-        site = site_hint(name) if name else ""
-        if not site and len(ledger.sites) == 1:
-            site = next(iter(ledger.sites.values()))
-        if site:
-            parts.append(f"现场在 {site}")
-        return "；".join(parts)
-    except Exception:
-        return "本回合尚无平台记录"
-
-
-def site_hint(slug: str) -> str:
-    """The directory ``prepare`` handed back for ``slug`` this turn, if known."""
-    try:
-        ledger = _ledger(create=False)
-        if ledger is None:
-            return ""
-        return ledger.sites.get(_clean(slug), "")
-    except Exception:
-        return ""
-
-
 def reset_all_for_tests() -> None:
     """Drop every ledger. Test-only; production clears by turn identity."""
-    global _local_turn_generation
     with _lock:
         _ledgers.clear()
-        _local_turn_generation += 1
 
 
 # ── internals ────────────────────────────────────────────────────────────
 
 
 def _turn_key() -> Any:
-    """The key a budget belongs to: the trusted turn binding when there is one."""
+    """The trusted turn this budget belongs to, or ``None`` when there is none.
+
+    ``None`` is not a fallback bucket: callers treat it as "stand down". See
+    the module docstring — a per-turn promise the platform cannot attest is
+    worse than no promise, because the model would be refused on a boundary
+    nobody drew.
+    """
     try:
         from gateway.session_context import current_turn_identity
 
         identity = current_turn_identity()
     except Exception:
-        identity = None
-    if identity is not None:
-        # (turn_id, opaque binding). The binding is minted per request by
-        # set_turn_vars, survives compression (same task context) and cannot be
-        # forged from client metadata. Never serialize it.
-        return identity
-    with _lock:
-        return ("hermes-local-turn", _local_turn_generation)
+        return None
+    if identity is None:
+        return None
+    # (turn_id, opaque binding). The binding is minted per request by
+    # set_turn_vars, survives compression (same task context) and cannot be
+    # forged from client metadata. Never serialize it.
+    return identity
 
 
 def _ledger(*, create: bool) -> _TurnLedger | None:
     key = _turn_key()
+    if key is None:
+        return None
     with _lock:
         ledger = _ledgers.get(key)
         if ledger is None:

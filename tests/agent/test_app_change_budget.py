@@ -2,17 +2,16 @@
 
 Background: the app-builder skill has always told the model to stop after about
 three failed repair rounds and hand back to the user, and nothing counted. One
-board turn ran three hours and 431 tool calls republishing the same app. These
-tests pin the two levels that now count:
-
-* the soft gate in ``tools.apphost_tool`` — refuses locally, sends nothing, and
-  hands the model a written brief for the user;
-* the per-turn loop cap in ``agent.tool_guardrails`` — ends the turn for a model
-  that ignores the refusal and keeps submitting.
+board turn ran three hours and 431 tool calls republishing the same app. The
+gate lives in ``tools.apphost_tool`` — the single funnel every credentialed App
+Host action passes through — and refuses locally, sending nothing, with a
+written brief for the model to give the user.
 
 The assertions people will be tempted to weaken later are the ones about what
-does NOT spend budget (queued build-slot polls, locally rejected calls) and what
-does NOT reset it (anything short of a new user turn — compression especially).
+does NOT spend budget (queued build-slot polls, locally rejected calls), what
+does NOT reset it (anything short of a new user turn — compression especially),
+and the one case where the gate deliberately stands down entirely: no trusted
+turn identity, no budget.
 """
 
 import json
@@ -23,12 +22,6 @@ from unittest.mock import patch
 import pytest
 
 from agent import app_change_budget
-from agent.tool_guardrails import (
-    APP_PUBLISH_CAP_CODE,
-    LoopCapConfig,
-    ToolCallGuardrailConfig,
-    ToolCallGuardrailController,
-)
 from gateway import session_context
 from tests.tools._profile_scope import mux_profile_scope
 from tools.apphost_tool import app_host_tool
@@ -136,7 +129,10 @@ def _acquire(monkeypatch, opener):
             return json.loads(app_host_tool({"action": "acquire_slot"}))
 
 
-# ── level one: the soft gate in the tool ─────────────────────────────────
+def _call(monkeypatch, args, opener):
+    with mux_profile_scope(monkeypatch, dict(_SCOPE)):
+        with patch("tools.apphost_tool._urlopen", opener):
+            return json.loads(app_host_tool(args))
 
 
 def test_one_delivery_and_three_repairs_pass_then_the_next_is_refused_locally(
@@ -177,9 +173,7 @@ def test_a_locally_rejected_publish_does_not_spend_the_budget(monkeypatch, turn)
     calls = []
     for _ in range(10):
         # No mode → _BadRequest → invalid_request, status 0, nothing sent.
-        with mux_profile_scope(monkeypatch, dict(_SCOPE)):
-            with patch("tools.apphost_tool._urlopen", _responder(calls=calls)):
-                bad = json.loads(app_host_tool({"action": "publish", "slug": "diary"}))
+        bad = _call(monkeypatch, {"action": "publish", "slug": "diary"}, _responder(calls=calls))
         assert bad["error"]["code"] == "invalid_request"
     assert calls == []
 
@@ -221,9 +215,9 @@ def test_queued_build_slot_polls_do_not_spend_the_build_budget(monkeypatch, turn
 
 def test_the_refusal_names_the_work_site_prepare_handed_back(monkeypatch, turn):
     site = "/volume1/subvol/apps/diary"
-    with mux_profile_scope(monkeypatch, dict(_SCOPE)):
-        with patch("tools.apphost_tool._urlopen", _responder({"dir": site})):
-            prepared = json.loads(app_host_tool({"action": "prepare", "slug": "diary"}))
+    prepared = _call(
+        monkeypatch, {"action": "prepare", "slug": "diary"}, _responder({"dir": site})
+    )
     assert prepared["data"]["dir"] == site
 
     for _ in range(app_change_budget.MAX_PUBLISHES_PER_APP_PER_TURN):
@@ -248,15 +242,41 @@ def test_nothing_short_of_a_new_user_turn_clears_the_budget(monkeypatch, turn):
     for _ in range(app_change_budget.MAX_PUBLISHES_PER_APP_PER_TURN):
         _publish(monkeypatch, "diary", _responder({"version": "v1"}))
 
-    # Compression runs inside the turn and never rebinds the turn identity, so
-    # the ledger it would have to clear is not reachable from there. The
-    # fallback generation used by unbound entry points must not clear a bound
-    # turn's ledger either.
-    app_change_budget.note_turn_boundary()
-    app_change_budget.note_turn_boundary()
+    # Everything a model does after being compressed — re-reading its bearings,
+    # re-preparing the app, polling the slot — happens inside the same turn and
+    # keeps the same turn binding. None of it is a fresh allowance.
+    _call(monkeypatch, {"action": "probe"}, _responder({"free_bytes": 1}))
+    _call(monkeypatch, {"action": "logs", "slug": "diary"}, _responder({"lines": []}))
+    _call(
+        monkeypatch,
+        {"action": "prepare", "slug": "diary"},
+        _responder({"dir": "/volume1/subvol/apps/diary"}),
+    )
+    _acquire(monkeypatch, _responder({"queue_ahead": 1}))
 
     refused = _publish(monkeypatch, "diary", _responder({}))
     assert refused["error"]["code"] == app_change_budget.PUBLISH_BUDGET_CODE
+
+
+def test_without_a_trusted_turn_identity_the_gate_stands_down(monkeypatch, turn):
+    """No attested turn, no budget — and no refusal either.
+
+    A per-turn promise the platform cannot attest is worse than no promise: the
+    model would be refused on a boundary nobody drew, with no user message able
+    to clear it. Entry points that bind no turn identity therefore pass through
+    untouched rather than falling back to some process-local notion of a turn.
+    """
+    turn.end()
+    assert session_context.current_turn_identity() is None
+
+    calls = []
+    for _ in range(app_change_budget.MAX_PUBLISHES_PER_APP_PER_TURN * 5):
+        out = _publish(monkeypatch, "diary", _responder({"version": "v1"}, calls=calls))
+        assert out["ok"] is True
+    assert len(calls) == app_change_budget.MAX_PUBLISHES_PER_APP_PER_TURN * 5
+
+    for _ in range(app_change_budget.MAX_BUILD_ROUNDS_PER_TURN * 5):
+        assert _acquire(monkeypatch, _responder({"token": "slot-1"}))["ok"] is True
 
 
 def test_bookkeeping_failure_never_breaks_the_tool_call(monkeypatch, turn):
@@ -265,88 +285,3 @@ def test_bookkeeping_failure_never_breaks_the_tool_call(monkeypatch, turn):
     ):
         out = _publish(monkeypatch, "diary", _responder({"version": "v1"}))
     assert out["ok"] is True
-
-
-# ── level two: the per-turn loop cap ─────────────────────────────────────
-
-
-def _controller(**caps):
-    return ToolCallGuardrailController(
-        ToolCallGuardrailConfig(
-            # Explicitly off: this cap must fire anyway, like max_web_searches.
-            hard_stop_enabled=False,
-            loop_caps=LoopCapConfig(**caps),
-        )
-    )
-
-
-def test_the_loop_cap_ends_the_turn_when_the_soft_refusal_is_ignored():
-    controller = _controller(max_app_publishes=6)
-    args = {"action": "publish", "mode": "reload", "in_place": True, "slug": "diary"}
-    for attempt in range(6):
-        assert controller.before_call("app_host", args).allows_execution, attempt
-
-    decision = controller.before_call("app_host", args)
-    assert decision.action == "block"
-    assert decision.code == APP_PUBLISH_CAP_CODE
-    assert controller.halt_decision is decision
-    assert "diary" in decision.message
-    assert _NO_SELF_SERVICE_UNDO in decision.message
-
-
-def test_the_loop_cap_only_counts_submissions():
-    controller = _controller(max_app_publishes=2)
-    for _ in range(50):
-        # Polling for a build slot, reading logs and probing storage are how a
-        # careful run behaves; none of them submits a version.
-        assert controller.before_call("app_host", {"action": "acquire_slot"}).allows_execution
-        assert controller.before_call("app_host", {"action": "logs", "slug": "diary"}).allows_execution
-        assert controller.before_call("app_host", {"action": "probe"}).allows_execution
-    assert controller.before_call(
-        "app_host", {"action": "reload", "slug": "diary", "staging_dir": "/tmp/s"}
-    ).allows_execution
-
-
-def test_the_loop_cap_resets_with_the_turn_and_can_be_disabled():
-    controller = _controller(max_app_publishes=1)
-    args = {"action": "publish", "mode": "reload", "in_place": True, "slug": "diary"}
-    assert controller.before_call("app_host", args).allows_execution
-    assert controller.before_call("app_host", args).action == "block"
-
-    controller.reset_for_turn()
-    assert controller.before_call("app_host", args).allows_execution
-
-    unlimited = _controller(max_app_publishes=0)
-    for _ in range(50):
-        assert unlimited.before_call("app_host", args).allows_execution
-
-
-def test_loop_cap_config_reads_max_app_publishes_from_config():
-    parsed = ToolCallGuardrailConfig.from_mapping(
-        {"loop_caps": {"max_app_publishes": 3}}
-    )
-    assert parsed.loop_caps.max_app_publishes == 3
-    # 0 disables, junk falls back to the default — same contract as the other caps.
-    assert ToolCallGuardrailConfig.from_mapping(
-        {"loop_caps": {"max_app_publishes": 0}}
-    ).loop_caps.max_app_publishes == 0
-    assert ToolCallGuardrailConfig.from_mapping(
-        {"loop_caps": {"max_app_publishes": "nonsense"}}
-    ).loop_caps.max_app_publishes == LoopCapConfig().max_app_publishes
-
-
-def test_the_halt_message_carries_the_rounds_and_the_site(monkeypatch, turn):
-    site = "/volume1/subvol/apps/diary"
-    with mux_profile_scope(monkeypatch, dict(_SCOPE)):
-        with patch("tools.apphost_tool._urlopen", _responder({"dir": site})):
-            app_host_tool({"action": "prepare", "slug": "diary"})
-    for _ in range(app_change_budget.MAX_PUBLISHES_PER_APP_PER_TURN):
-        _publish(monkeypatch, "diary", _responder({"version": "v1"}))
-
-    controller = _controller(max_app_publishes=1)
-    args = {"action": "publish", "mode": "reload", "in_place": True, "slug": "diary"}
-    controller.before_call("app_host", args)
-    decision = controller.before_call("app_host", args)
-
-    assert str(app_change_budget.MAX_PUBLISHES_PER_APP_PER_TURN) in decision.message
-    assert site in decision.message

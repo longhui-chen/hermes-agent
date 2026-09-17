@@ -512,12 +512,12 @@ def _fresh_app_change_budget():
     """Start every test on an empty per-turn app change budget.
 
     ``agent.app_change_budget`` is process-global on purpose: it counts what one
-    user turn has spent rebuilding / republishing an app, and it is cleared only
-    by the turn identity changing (gateway) or by ``build_turn_context`` (CLI).
-    A test that drives ``app_host`` directly does neither, so without this the
-    fifth publish of an entire test session — rather than of a turn — would be
-    refused, and the failure would land in whichever module happened to run
-    last. That is a test-harness artifact, not the behavior under test.
+    user turn has spent rebuilding / republishing an app, keyed on the trusted
+    turn identity, and a ledger only goes away when that identity changes. A
+    test that binds a turn identity of its own would otherwise inherit whatever
+    an earlier test left under the same key, and the failure would land in
+    whichever module happened to run last. That is a test-harness artifact, not
+    the behavior under test.
     """
     try:
         from agent import app_change_budget

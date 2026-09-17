@@ -1040,15 +1040,13 @@ def app_host_tool(args, **_kw):
     # the model provider as non-string content and gets rejected (same
     # contract as list_my_channels).
     args = args or {}
-    # Per-user-turn change budget (agent.app_change_budget). This is the
-    # platform's FIRST stop, and the reason it sits here rather than in
-    # local-server: compiling and self-testing run through `terminal` inside
-    # the app directory, so the server never sees a repair round as a round.
-    # Once a turn has spent its compile / publish budget on an app the refusal
-    # is produced locally and the request never leaves the tool — the model is
-    # handed a written brief to give the user instead of grinding on. The
-    # per-turn loop cap in agent.tool_guardrails is the backstop if it ignores
-    # this and keeps submitting.
+    # Per-user-turn change budget (agent.app_change_budget). The reason the
+    # count sits here rather than in local-server: compiling and self-testing
+    # run through `terminal` inside the app directory, so the server never sees
+    # a repair round as a round. Once a turn has spent its compile / publish
+    # budget on an app the refusal is produced locally and the request never
+    # leaves the tool — the model is handed a written brief to give the user
+    # instead of grinding on.
     refusal = app_change_budget.refuse_if_exhausted(args)
     if refusal is not None:
         refusal_code, refusal_message = refusal

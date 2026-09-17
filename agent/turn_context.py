@@ -39,7 +39,6 @@ from agent.conversation_compression import (
     conversation_history_after_compression,
     recover_rotated_compression_session,
 )
-from agent.app_change_budget import note_turn_boundary as _note_app_change_turn_boundary
 from agent.context_engine import automatic_compaction_status_message
 from agent.iteration_budget import IterationBudget
 from agent.memory_manager import build_memory_context_block
@@ -504,13 +503,6 @@ def build_turn_context(
     agent._unicode_sanitization_passes = 0
     agent._tool_guardrails.reset_for_turn()
     agent._tool_guardrail_halt_decision = None
-    # Per-user-turn app change budget. Requests that carry a trusted turn
-    # identity key off that identity and need nothing here; this advances the
-    # fallback generation for entry points that bind none (CLI, single-profile
-    # daemon). Compression never reaches this prologue — which is precisely why
-    # the budget survives it, and a compressed model cannot forget its way back
-    # to a fresh allowance.
-    _note_app_change_turn_boundary()
     _reset_consol = getattr(agent._memory_store, "reset_consolidation_failures", None)
     if callable(_reset_consol):
         _reset_consol()
