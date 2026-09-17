@@ -187,3 +187,26 @@ def test_idle_compaction_respects_anti_thrash_breaker(tmp_path: Path) -> None:
 
 
 
+
+
+def test_builtin_idle_trigger_uses_provider_usage_not_large_history(tmp_path):
+    from agent.context_compressor import ContextCompressor
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        for used in (0, 50000):
+            sid = f"IDLE_MEASURED_{used}"
+            db.create_session(sid, source="cli")
+            agent = _prep_idle_agent(db, sid)
+            comp = ContextCompressor(model="test", config_context_length=200000,
+                                     threshold_tokens_cap=100000, quiet_mode=True)
+            comp.update_from_response({"prompt_tokens": used})
+            agent.context_compressor = comp
+            history = _history()
+            history[0]["content"] = "资料" * 125000
+            with patch.object(agent, "_compress_context", return_value=(history, "SYSTEM")) as compact:
+                _run_prologue(agent, history)
+            assert compact.call_count == (1 if used else 0)
+            if used:
+                assert compact.call_args.kwargs["approx_tokens"] == used
+    finally:
+        db.close()

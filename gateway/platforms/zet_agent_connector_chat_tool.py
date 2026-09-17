@@ -131,6 +131,7 @@ def connector_chat_create_tool(args, **kw) -> str:
         "ok": True, "connection_id": result["connection_id"],
         "connection_status": str(result.get("connection_status") or ""),
         "template_id": str(result.get("template_id") or ""),
+        "session_ready": result.get("session_ready") is True,
         "verified": result.get("verified") is True,
     })
 
@@ -139,7 +140,7 @@ registry.register(
     name="connector_chat_create", toolset="zettlab_connectors",
     schema={
         "name": "connector_chat_create",
-        "description": "Probe current-Chat Connector creation availability, then create one published read-only Jira/GitLab API connection from the user's latest ordinary Chat reply. No shell and no automatic tool authorization.",
+        "description": "Probe current-Chat Connector creation availability, then create and enable one published read-only Jira/GitLab API connection for the next turn. No shell.",
         "parameters": {
             "type": "object", "additionalProperties": False,
             "properties": {

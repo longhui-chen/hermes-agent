@@ -82,7 +82,6 @@ class TestShouldCompress:
 class TestUpdateFromResponse:
     def test_updates_fields(self, compressor):
         compressor.awaiting_real_usage_after_compression = True
-        compressor.last_compression_rough_tokens = 90_000
         compressor.update_from_response({
             "prompt_tokens": 5000,
             "completion_tokens": 1000,
@@ -91,7 +90,6 @@ class TestUpdateFromResponse:
         assert compressor.last_prompt_tokens == 5000
         assert compressor.last_completion_tokens == 1000
         assert compressor.last_real_prompt_tokens == 5000
-        assert compressor.last_rough_tokens_when_real_prompt_fit == 90_000
         assert compressor.awaiting_real_usage_after_compression is False
 
     def test_missing_fields_default_zero(self, compressor):
@@ -100,12 +98,11 @@ class TestUpdateFromResponse:
 
 class TestPreflightDeferral:
 
-    def test_does_not_defer_when_rough_growth_is_large(self, compressor):
+    def test_large_rough_growth_still_waits_for_provider_usage(self, compressor):
         compressor.threshold_tokens = 85_000
         compressor.last_real_prompt_tokens = 50_000
-        compressor.last_rough_tokens_when_real_prompt_fit = 90_000
 
-        assert compressor.should_defer_preflight_to_real_usage(100_000) is False
+        assert compressor.should_defer_preflight_to_real_usage(100_000) is True
 
 
     def test_defers_immediately_after_compaction_with_stale_real_prompt(self, compressor):
@@ -170,10 +167,10 @@ class TestCompress:
         auto-compression could never fire. It now triggers at 85% of the
         window — high enough not to waste the small budget, below 100% so it
         actually fires."""
-        from agent.context_compressor import MINIMUM_CONTEXT_LENGTH
+        from agent.model_metadata import MINIMUM_CONTEXT_LENGTH
         t = ContextCompressor._compute_threshold_tokens(MINIMUM_CONTEXT_LENGTH, 0.50)
         assert t < MINIMUM_CONTEXT_LENGTH
-        assert t == 54400  # 85% of 64000
+        assert t == 32000  # Explicit 50% remains 50%; no hidden 64k floor.
 
 
 
@@ -1126,7 +1123,10 @@ class TestAbortOnSummaryFailure:
         c = self._make_compressor()
         c.bind_session_state(db, "s1")
         c._summary_failure_cooldown_until = 0.0
+        c.tail_token_budget = 32
         msgs = self._make_msgs()
+        for msg in msgs:
+            msg["content"] *= 2000  # A successful summary must actually shrink input.
 
         with patch("agent.context_compressor.call_llm", return_value=mock_response) as mock_llm:
             result = c.compress(msgs, current_tokens=999999)
@@ -1440,14 +1440,14 @@ class TestSummaryTargetRatio:
 
 
 
-    def test_default_threshold_floored_at_75_percent_below_512k(self):
-        """Sub-512K models get the 75% small-context threshold floor."""
+    def test_explicit_threshold_preserved_below_512k(self):
+        """A configured 50% trigger is not silently raised to 75%."""
         with patch("agent.context_compressor.get_model_context_length", return_value=100_000):
-            c = ContextCompressor(model="test", quiet_mode=True)
+            c = ContextCompressor(model="test", threshold_percent=0.50, quiet_mode=True)
             _ = c.context_length
-        assert c.threshold_percent == 0.75
+        assert c.threshold_percent == 0.50
         # 75% of 100K = 75K, above the 64K minimum floor
-        assert c.threshold_tokens == 75_000
+        assert c.threshold_tokens == 50_000
 
 
 
@@ -1588,7 +1588,7 @@ class TestTokenBudgetTailProtection:
         messages = []
         for i in range(9):
             role = "user" if i % 2 == 0 else "assistant"
-            messages.append({"role": role, "content": f"Message {i}"})
+            messages.append({"role": role, "content": f"Message {i} " * 200})
 
         # Should not early-return (needs > protect_first_n + 3 + 1 = 6)
         # Mock the summary generation to avoid real API call
@@ -1713,8 +1713,6 @@ class TestUpdateModelResetsCalibration:
         # Simulate a large-model session that proved a prompt fit.
         comp.last_prompt_tokens = 120_000
         comp.last_real_prompt_tokens = 120_000
-        comp.last_rough_tokens_when_real_prompt_fit = 130_000
-        comp.last_compression_rough_tokens = 130_000
         comp.awaiting_real_usage_after_compression = True
         comp._ineffective_compression_count = 2
 
@@ -1722,8 +1720,6 @@ class TestUpdateModelResetsCalibration:
 
         assert comp.last_prompt_tokens == 0
         assert comp.last_real_prompt_tokens == 0
-        assert comp.last_rough_tokens_when_real_prompt_fit == 0
-        assert comp.last_compression_rough_tokens == 0
         assert comp.awaiting_real_usage_after_compression is False
         assert comp._ineffective_compression_count == 0
 
@@ -1732,15 +1728,14 @@ class TestUpdateModelResetsCalibration:
         preflight on the new smaller model."""
         comp = self._comp()
         comp.last_real_prompt_tokens = 50_000
-        comp.last_rough_tokens_when_real_prompt_fit = 90_000
         # Before switch, a modest rough growth would defer.
         comp.threshold_tokens = 85_000
         assert comp.should_defer_preflight_to_real_usage(93_000) is True
 
         # After switching to a 65K model, the stale state is gone, so a rough
-        # estimate over the new threshold is NOT deferred — preflight will run.
+        # estimate on the new route must await a new provider measurement.
         comp.update_model("small-model", context_length=65_536)
-        assert comp.should_defer_preflight_to_real_usage(comp.threshold_tokens + 5_000) is False
+        assert comp.should_defer_preflight_to_real_usage(comp.threshold_tokens + 5_000) is True
 
 
 
@@ -1760,7 +1755,7 @@ class TestThresholdTokensCap:
         """Without a cap, the ratio-based threshold is used."""
         with patch("agent.context_compressor.get_model_context_length", return_value=1_000_000):
             comp = ContextCompressor(
-                "model-a", threshold_percent=0.50, quiet_mode=True,
+                "model-a", threshold_percent=0.50, quiet_mode=True, threshold_tokens_cap=None,
             )
             _ = comp.context_length
         assert comp.threshold_tokens == 500_000
@@ -1800,22 +1795,21 @@ class TestThresholdTokensCap:
         with patch("agent.context_compressor.get_model_context_length", return_value=1_000_000):
             comp = ContextCompressor(
                 "model-a", threshold_percent=0.50, quiet_mode=True,
-                threshold_tokens_cap=200_000,
+                threshold_tokens_cap=200_000, config_context_length=1_000_000,
             )
         # Ratio-based would be 500K; cap pulls the trigger down to 200K.
         assert comp.should_compress(150_000) is False   # below cap
         assert comp.should_compress(200_000) is True    # at cap (below 500K pct)
         assert comp.should_compress(250_000) is True    # above cap
 
-    def test_default_config_disabled_and_no_behavior_change(self):
-        """DEFAULT_CONFIG ships threshold_tokens=None (disabled) and both
-        None and 0 leave the ratio-based trigger byte-identical."""
+    def test_standard_cap_and_explicit_opt_out(self):
+        """The standard cap is explicit; None and 0 opt out of that cap."""
         from hermes_cli.config import DEFAULT_CONFIG
-        assert DEFAULT_CONFIG["compression"]["threshold_tokens"] is None
+        assert DEFAULT_CONFIG["compression"]["threshold_tokens"] == 244_800
 
         with patch("agent.context_compressor.get_model_context_length", return_value=1_000_000):
             baseline = ContextCompressor(
-                "model-a", threshold_percent=0.50, quiet_mode=True,
+                "model-a", threshold_percent=0.50, quiet_mode=True, threshold_tokens_cap=None,
             )
             comp_none = ContextCompressor(
                 "model-a", threshold_percent=0.50, quiet_mode=True,
@@ -2682,17 +2676,16 @@ class TestContextLengthSetterCoherence:
         assert c.threshold_tokens == 42_000
         assert c.tail_token_budget == 8_400
 
-    def test_new_value_assignment_refloors_and_invalidates(self):
+    def test_new_value_assignment_preserves_ratio_and_invalidates(self):
         with patch("agent.context_compressor.get_model_context_length", return_value=1_000_000):
-            c = ContextCompressor(model="test", quiet_mode=True)
+            c = ContextCompressor(model="test", threshold_percent=0.50, quiet_mode=True)
             _ = c.context_length
-        assert c.threshold_percent == 0.50  # 1M >= 512K: configured value
+        assert c.threshold_percent == 0.50  # configured value
         # Switch to a small window via direct assignment (codex path).
         c.context_length = 200_000
-        # Floor re-applied for the new window...
-        assert c.threshold_percent == 0.75
+        assert c.threshold_percent == 0.50
         # ...and budgets recompute from the same window+percent.
-        assert c.threshold_tokens == 150_000
+        assert c.threshold_tokens == 100_000
 
 
 

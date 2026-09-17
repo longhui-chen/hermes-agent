@@ -41,6 +41,10 @@ export function contextBar(percent: number | undefined, width = 10): string {
 }
 
 export function usageContextLabel(usage: UsageStats): string {
+  if (usage.context_measurement === 'unknown' && !(usage.context_used && usage.context_used > 0)) {
+    return '? tok'
+  }
+
   if (usage.context_max) {
     return `${compactNumber(usage.context_used ?? 0)}/${compactNumber(usage.context_max)}`
   }
@@ -49,6 +53,10 @@ export function usageContextLabel(usage: UsageStats): string {
 }
 
 export function contextBarLabel(usage: UsageStats): string {
+  if (usage.context_measurement === 'unknown' && !(usage.context_used && usage.context_used > 0)) {
+    return '?%'
+  }
+
   if (!usage.context_max) {
     return ''
   }

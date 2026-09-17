@@ -62,9 +62,7 @@ def _write_camera_runtime(tmp_path: Path) -> Path:
             "session_id": os.environ.get("HERMES_SESSION_ID", ""),
             "session_key": os.environ.get("HERMES_SESSION_KEY", ""),
             "action": secret("ZETTLAB_AGENT_ACTION_TOKEN"),
-            "hardware": secret("ZETTLAB_HARDWARE_EXECUTION_TOKEN"),
             "action_plain": os.environ.get("ZETTLAB_AGENT_ACTION_TOKEN", ""),
-            "hardware_plain": os.environ.get("ZETTLAB_HARDWARE_EXECUTION_TOKEN", ""),
         }, sort_keys=True))
         """
         ).lstrip(),
@@ -201,7 +199,6 @@ def test_camera_runtime_env_is_request_and_profile_scoped():
         assert build_camera_runtime_env() == {
             "ZET_AGENT_ID": "agent-1",
             "ZETTLAB_AGENT_ACTION_TOKEN": ACTION_TOKEN,
-            "ZETTLAB_HARDWARE_EXECUTION_TOKEN": HARDWARE_TOKEN,
             "HERMES_TURN_ID": "turn-1",
             "HERMES_SESSION_ID": "api-lineage-session-1",
             "HERMES_SESSION_KEY": "api-lineage-session-1",
@@ -254,9 +251,7 @@ def test_camera_runtime_direct_runner_flow_uses_secret_fds(monkeypatch, tmp_path
     assert payload["session_id"] == "api-lineage-session-1"
     assert payload["session_key"] == "api-lineage-session-1"
     assert payload["action"] == "[REDACTED]"
-    assert payload["hardware"] == "[REDACTED]"
     assert payload["action_plain"] == ""
-    assert payload["hardware_plain"] == ""
     assert (
         hashlib.sha256(script.read_bytes()).hexdigest()
         == (
@@ -290,9 +285,7 @@ def test_terminal_flow_routes_camera_to_trusted_direct_runner(monkeypatch, tmp_p
     payload = json.loads(result["output"])
     assert payload["argv"] == ["list"]
     assert payload["action"] == "[REDACTED]"
-    assert payload["hardware"] == "[REDACTED]"
     assert payload["action_plain"] == ""
-    assert payload["hardware_plain"] == ""
 
 
 def test_camera_runtime_flow_fails_closed_without_capability(monkeypatch, tmp_path):

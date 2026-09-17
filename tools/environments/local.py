@@ -2144,7 +2144,7 @@ AGENT_CREATOR_RUNTIME_ENV_KEYS: frozenset[str] = frozenset({
     "ZETTLAB_AGENT_ACTION_TOKEN",
 })
 HARDWARE_RUNTIME_ENV_KEYS: frozenset[str] = frozenset({
-    "ZETTLAB_HARDWARE_EXECUTION_TOKEN",
+    # zettlab-overlay(ac1015-bearer): retain only camera execution identifiers; upstream: none
     "ZETTLAB_CAMERA_JOB_ID",
     "ZETTLAB_CAMERA_EXECUTION_ID",
 })
@@ -2548,10 +2548,11 @@ def build_camera_semantic_runtime_env() -> dict[str, str]:
 
 
 def build_camera_runtime_env() -> dict[str, str]:
+    # zettlab-overlay(ac1015-bearer): remove hardware bearer from helper env; upstream: none
     """Build the exact request-scoped env for the trusted camera helper.
 
-    The helper receives the profile action token and the independently scoped
-    hardware capability plus turn/session correlation. Generic subprocesses
+    The helper receives the profile action token and turn/session correlation.
+    Generic subprocesses
     continue to have all of these values stripped by
     :func:`_apply_profile_secret_scope_env`.
     """
@@ -2567,21 +2568,23 @@ def build_camera_runtime_env() -> dict[str, str]:
         "ZETTLAB_AGENT_ACTION_TOKEN": str(
             frozen_receipt.get("ZETTLAB_AGENT_ACTION_TOKEN", "") or ""
         ).strip(),
-        "ZETTLAB_HARDWARE_EXECUTION_TOKEN": str(
-            frozen_receipt.get("ZETTLAB_HARDWARE_EXECUTION_TOKEN", "") or ""
-        ).strip(),
         "HERMES_TURN_ID": str(frozen_receipt.get("HERMES_TURN_ID", "") or "").strip(),
         "HERMES_SESSION_ID": session_id,
         # Keep the legacy alias for already deployed camsnap v0.1.x helpers.
         "HERMES_SESSION_KEY": session_id,
     }
+    # zettlab-overlay(ac1015-bearer): pass authenticated owner context; upstream: none
+    user_id = str(frozen_receipt.get("ZETTLAB_USER_ID", "") or "").strip()
+    if user_id:
+        env["ZETTLAB_USER_ID"] = user_id
     limits = {
         "ZET_AGENT_ID": 128,
         "ZETTLAB_AGENT_ACTION_TOKEN": 128,
-        "ZETTLAB_HARDWARE_EXECUTION_TOKEN": 128,
         "HERMES_TURN_ID": 256,
         "HERMES_SESSION_ID": 1024,
         "HERMES_SESSION_KEY": 1024,
+        # zettlab-overlay(ac1015-bearer): bound owner context size; upstream: none
+        "ZETTLAB_USER_ID": 768,
     }
     if any(
         not value
@@ -2595,6 +2598,7 @@ def build_camera_runtime_env() -> dict[str, str]:
 
 def build_printer3d_runtime_env() -> dict[str, str]:
     """Reuse the request-scoped receipt without exposing it to terminal."""
+    # zettlab-overlay(ac1015-bearer): printer env excludes legacy bearer; upstream: none
     try:
         from agent.zet_agent_response_mode import trusted_printer3d_runtime_receipt
 
@@ -2605,7 +2609,6 @@ def build_printer3d_runtime_env() -> dict[str, str]:
     env = {
         "ZET_AGENT_ID": str(frozen_receipt.get("ZET_AGENT_ID", "") or "").strip(),
         "ZETTLAB_AGENT_ACTION_TOKEN": str(frozen_receipt.get("ZETTLAB_AGENT_ACTION_TOKEN", "") or "").strip(),
-        "ZETTLAB_HARDWARE_EXECUTION_TOKEN": str(frozen_receipt.get("ZETTLAB_HARDWARE_EXECUTION_TOKEN", "") or "").strip(),
         "HERMES_TURN_ID": str(frozen_receipt.get("HERMES_TURN_ID", "") or "").strip(),
         "HERMES_SESSION_ID": session_id,
         "HERMES_SESSION_KEY": session_id,
@@ -2613,7 +2616,6 @@ def build_printer3d_runtime_env() -> dict[str, str]:
     limits = {
         "ZET_AGENT_ID": 128,
         "ZETTLAB_AGENT_ACTION_TOKEN": 128,
-        "ZETTLAB_HARDWARE_EXECUTION_TOKEN": 128,
         "HERMES_TURN_ID": 256,
         "HERMES_SESSION_ID": 1024,
         "HERMES_SESSION_KEY": 1024,
@@ -2625,6 +2627,7 @@ def build_printer3d_runtime_env() -> dict[str, str]:
 
 def build_smart_home_runtime_env() -> dict[str, str]:
     """Build the request-scoped receipt for the smart-home light helper."""
+    # zettlab-overlay(ac1015-bearer): smart-home env excludes legacy bearer; upstream: none
     try:
         from agent.zet_agent_response_mode import trusted_smart_home_runtime_receipt
 
@@ -2635,12 +2638,12 @@ def build_smart_home_runtime_env() -> dict[str, str]:
     env = {
         "ZET_AGENT_ID": str(frozen_receipt.get("ZET_AGENT_ID", "") or "").strip(),
         "ZETTLAB_AGENT_ACTION_TOKEN": str(frozen_receipt.get("ZETTLAB_AGENT_ACTION_TOKEN", "") or "").strip(),
-        "ZETTLAB_HARDWARE_EXECUTION_TOKEN": str(frozen_receipt.get("ZETTLAB_HARDWARE_EXECUTION_TOKEN", "") or "").strip(),
         "HERMES_TURN_ID": str(frozen_receipt.get("HERMES_TURN_ID", "") or "").strip(),
         "HERMES_SESSION_ID": session_id,
         "HERMES_SESSION_KEY": session_id,
     }
-    limits = {"ZET_AGENT_ID": 128, "ZETTLAB_AGENT_ACTION_TOKEN": 128, "ZETTLAB_HARDWARE_EXECUTION_TOKEN": 128, "HERMES_TURN_ID": 256, "HERMES_SESSION_ID": 1024, "HERMES_SESSION_KEY": 1024}
+    # zettlab-overlay(ac1015-bearer): validate bearer-free smart-home env; upstream: none
+    limits = {"ZET_AGENT_ID": 128, "ZETTLAB_AGENT_ACTION_TOKEN": 128, "HERMES_TURN_ID": 256, "HERMES_SESSION_ID": 1024, "HERMES_SESSION_KEY": 1024}
     if any(not value or "\x00" in value or len(value.encode("utf-8")) > limits[key] for key, value in env.items()):
         raise PermissionError("trusted smart-home execution receipt unavailable")
     return env
@@ -2648,6 +2651,7 @@ def build_smart_home_runtime_env() -> dict[str, str]:
 
 def build_plaud_runtime_env() -> dict[str, str]:
     """Build the exact request-scoped env for the trusted PLAUD helper."""
+    # zettlab-overlay(ac1015-bearer): PLAUD env excludes legacy bearer; upstream: none
     try:
         from agent.zet_agent_response_mode import trusted_plaud_runtime_receipt
 
@@ -2658,7 +2662,6 @@ def build_plaud_runtime_env() -> dict[str, str]:
     env = {
         "ZET_AGENT_ID": str(frozen_receipt.get("ZET_AGENT_ID", "") or "").strip(),
         "ZETTLAB_AGENT_ACTION_TOKEN": str(frozen_receipt.get("ZETTLAB_AGENT_ACTION_TOKEN", "") or "").strip(),
-        "ZETTLAB_HARDWARE_EXECUTION_TOKEN": str(frozen_receipt.get("ZETTLAB_HARDWARE_EXECUTION_TOKEN", "") or "").strip(),
         "HERMES_TURN_ID": str(frozen_receipt.get("HERMES_TURN_ID", "") or "").strip(),
         "HERMES_SESSION_ID": session_id,
         "HERMES_SESSION_KEY": session_id,
@@ -2666,14 +2669,13 @@ def build_plaud_runtime_env() -> dict[str, str]:
     limits = {
         "ZET_AGENT_ID": 128,
         "ZETTLAB_AGENT_ACTION_TOKEN": 128,
-        "ZETTLAB_HARDWARE_EXECUTION_TOKEN": 128,
         "HERMES_TURN_ID": 256,
         "HERMES_SESSION_ID": 1024,
         "HERMES_SESSION_KEY": 1024,
     }
     if any(
-        not value
-        or "\x00" in value
+        # zettlab-overlay(ac1015-bearer): reject malformed bearer-free env; upstream: none
+        not value or "\x00" in value
         or len(value.encode("utf-8")) > limits[key]
         for key, value in env.items()
     ):

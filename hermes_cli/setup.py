@@ -1675,7 +1675,7 @@ def _apply_default_agent_settings(config: dict):
     config.setdefault("display", {})["tool_progress"] = "all"
 
     config.setdefault("compression", {})["enabled"] = True
-    config["compression"]["threshold"] = 0.50
+    config["compression"]["threshold"] = 0.90
 
     # Default: never auto-reset sessions. This matches the gateway's own
     # default (SessionResetPolicy.mode = "none"); we still write it
@@ -1686,7 +1686,7 @@ def _apply_default_agent_settings(config: dict):
     print_success("Applied recommended defaults:")
     print_info("  Max iterations: 150")
     print_info("  Tool progress: all")
-    print_info("  Compression threshold: 0.50")
+    print_info("  Compression threshold: 0.90")
     print_info("  Session reset: never (use /reset or compression)")
     print_info("  Run `hermes setup agent` later to customize.")
 
@@ -1754,17 +1754,17 @@ def setup_agent_settings(config: dict):
 
     config.setdefault("compression", {})["enabled"] = True
 
-    current_threshold = cfg_get(config, "compression", "threshold", default=0.50)
-    threshold_str = prompt("Compression threshold (0.5-0.95)", str(current_threshold))
+    current_threshold = cfg_get(config, "compression", "threshold", default=0.90)
+    threshold_str = prompt("Compression threshold (0.5-0.90)", str(current_threshold))
     try:
         threshold = float(threshold_str)
-        if 0.5 <= threshold <= 0.95:
+        if 0.5 <= threshold <= 0.90:
             config["compression"]["threshold"] = threshold
     except ValueError:
         pass
 
     print_success(
-        f"Context compression threshold set to {config['compression'].get('threshold', 0.50)}"
+        f"Context compression threshold set to {config['compression'].get('threshold', 0.90)}"
     )
 
     # ── Session Reset Policy ──

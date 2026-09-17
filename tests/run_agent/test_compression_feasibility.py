@@ -95,12 +95,8 @@ def test_auto_corrects_threshold_when_aux_context_below_threshold(mock_get_clien
     assert "config.yaml" in messages[0]
     assert "auxiliary:" in messages[0]
     assert "compression:" in messages[0]
-    # 200K main is under the 512K small-context limit and 80K/200K = 40% sits
-    # below the 75% floor — a `threshold:` suggestion would be raised back to
-    # 75% and ignored (#67422), so the message must not offer one and must
-    # explain the recomputed trigger instead (0.75 * 200K = 150K).
-    assert "threshold:" not in messages[0]
-    assert "150,000" in messages[0]
+    # No hidden 75% floor: the suggested 40% really yields the 80k trigger.
+    assert "threshold: 0.40" in messages[0]
     # Warning stored for gateway replay
     assert agent._compression_warning is not None
     # Threshold on the live compressor was actually lowered to aux_context.

@@ -1244,6 +1244,7 @@ class TestMoAContextLength:
                 base_url="http://127.0.0.1/v1",
                 provider="moa",
                 threshold_percent=0.50,
+                threshold_tokens_cap=None,
                 quiet_mode=True,
             )
 
