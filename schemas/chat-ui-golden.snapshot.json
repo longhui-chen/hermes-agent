@@ -1,7 +1,7 @@
 {
   "snapshot_version": 2,
-  "root_commit": "837f2d27942c6c40b687810e711f7e3f0601eb7b",
-  "sha256": "cdec855b1eb3ab571972ae9ebd71ae6b6caa68e9879990291c385ee1dd692da6",
+  "root_commit": "8d74f38b1cdf4cae060571dfbd40cdc4d8c6a85d",
+  "sha256": "2c40b63a1e2530e19cbf9eb2649aa77b58352453d7aed4ea00b1904793f02985",
   "payload": {
     "golden": {
       "events": {
@@ -1939,6 +1939,212 @@
       "http": {
         "session-history.delta": {
           "agent_id": "agent_demo_0001",
+          "session_id": "zettlab:owner:agent_demo_0001:sess_demo_0001",
+          "snapshot_seq": 100,
+          "messages": [
+            {
+              "started_at": 1756972800000,
+              "completed_at": 1756972820000,
+              "id": 1001,
+              "row_key": "m:1001",
+              "turn_id": "turn_demo_0001",
+              "role": "user",
+              "content": "hello",
+              "updated_seq": 2,
+              "visible": true,
+              "status": "done"
+            },
+            {
+              "started_at": 1756972800000,
+              "completed_at": 1756972820000,
+              "id": 1002,
+              "row_key": "m:1002",
+              "turn_id": "turn_demo_0001",
+              "role": "assistant",
+              "content": "host",
+              "updated_seq": 2,
+              "visible": true,
+              "status": "done"
+            }
+          ],
+          "activities": [
+            {
+              "started_at": 1756972801000,
+              "finished_at": 1756972802000,
+              "activity_id": 40,
+              "call_id": "01996f2e-7b6a-7c31-9f8e-4a3d6c1b2e90",
+              "item_id": "01996f2e-7b6a-7c31-9f8e-4a3d6c1b2e90",
+              "item_index": 0,
+              "turn_id": "turn_demo_0001",
+              "kind": "thinking",
+              "content": "用户要剪 vlog，先确认时间范围。",
+              "created_seq": 40,
+              "updated_seq": 50,
+              "last_fanout_seq": 60,
+              "status": "done"
+            },
+            {
+              "started_at": 1756972802000,
+              "finished_at": 1756972803000,
+              "activity_id": 41,
+              "call_id": "01996f2e-7b6a-7000-8000-000000000002",
+              "item_id": "01996f2e-7b6a-7000-8000-000000000002",
+              "item_index": 1,
+              "turn_id": "turn_demo_0001",
+              "kind": "text",
+              "content": "Done",
+              "created_seq": 41,
+              "updated_seq": 51,
+              "last_fanout_seq": 61,
+              "status": "done"
+            },
+            {
+              "started_at": 1756972803000,
+              "finished_at": 1756972804000,
+              "source": {
+                "kind": "builtin",
+                "id": "file_search",
+                "label": "Search demo files"
+              },
+              "display_args": {
+                "args_summary": "query=demo"
+              },
+              "display_result": {
+                "summary": "Found demo files",
+                "content_type": "text",
+                "truncated": false,
+                "bytes": 16
+              },
+              "activity_id": 42,
+              "call_id": "hp_t_demo_0001",
+              "name": "file_search",
+              "label": "Search demo files",
+              "item_id": "01996f2e-7b6a-7000-8000-000000000003",
+              "item_index": 2,
+              "turn_id": "turn_demo_0001",
+              "kind": "tool",
+              "created_seq": 42,
+              "updated_seq": 52,
+              "last_fanout_seq": 62,
+              "status": "done"
+            },
+            {
+              "started_at": 1756972804000,
+              "finished_at": 1756972805000,
+              "todo_list": {
+                "items": [
+                  {
+                    "id": "todo_demo_1",
+                    "content": "Find demo files",
+                    "status": "completed"
+                  }
+                ],
+                "summary": {
+                  "total": 1,
+                  "pending": 0,
+                  "in_progress": 0,
+                  "completed": 1,
+                  "cancelled": 0
+                }
+              },
+              "v": 2,
+              "activity_id": 43,
+              "call_id": "01996f2e-7b6a-7000-8000-000000000004",
+              "item_id": "01996f2e-7b6a-7000-8000-000000000004",
+              "item_index": 3,
+              "turn_id": "turn_demo_0001",
+              "kind": "todo_update",
+              "created_seq": 43,
+              "updated_seq": 53,
+              "last_fanout_seq": 63,
+              "status": "done"
+            },
+            {
+              "started_at": 1756972805000,
+              "finished_at": 1756972806000,
+              "v": 1,
+              "preview": "Found demo files",
+              "activity_id": 44,
+              "call_id": "01996f2e-7b6a-7000-8000-000000000005",
+              "item_id": "01996f2e-7b6a-7000-8000-000000000005",
+              "item_index": 4,
+              "turn_id": "turn_demo_0001",
+              "kind": "subagent",
+              "created_seq": 44,
+              "updated_seq": 54,
+              "last_fanout_seq": 64,
+              "status": "done"
+            },
+            {
+              "started_at": 1756972806000,
+              "finished_at": 1756972807000,
+              "canonical_omitted": true,
+              "activity_id": 45,
+              "call_id": "01996f2e-7b6a-7000-8000-000000000006",
+              "item_id": "01996f2e-7b6a-7000-8000-000000000006",
+              "item_index": 5,
+              "turn_id": "turn_demo_0001",
+              "kind": "text",
+              "content": "Done",
+              "created_seq": 45,
+              "updated_seq": 55,
+              "last_fanout_seq": 65,
+              "status": "done"
+            },
+            {
+              "started_at": 1756972807000,
+              "finished_at": 1756972808000,
+              "activity_id": 46,
+              "call_id": "ia_demo_0002",
+              "item_index": 6,
+              "turn_id": "turn_demo_0001",
+              "kind": "clarify",
+              "created_seq": 46,
+              "updated_seq": 56,
+              "last_fanout_seq": 66,
+              "status": "done"
+            },
+            {
+              "started_at": 1756972808000,
+              "finished_at": 1756972809000,
+              "activity_id": 47,
+              "call_id": "context",
+              "item_index": 7,
+              "turn_id": "turn_demo_0001",
+              "kind": "context_compaction",
+              "created_seq": 47,
+              "updated_seq": 57,
+              "last_fanout_seq": 67,
+              "status": "done"
+            },
+            {
+              "started_at": 1756972809000,
+              "finished_at": 1756972810000,
+              "activity_id": 48,
+              "call_id": "plan_preview",
+              "item_index": 8,
+              "turn_id": "turn_demo_0001",
+              "kind": "plan_preview",
+              "created_seq": 48,
+              "updated_seq": 58,
+              "last_fanout_seq": 68,
+              "status": "done"
+            },
+            {
+              "activity_id": 49,
+              "call_id": "legacy-tool",
+              "name": "legacy_search",
+              "turn_id": "turn_demo_0001",
+              "kind": "tool",
+              "created_seq": 49,
+              "updated_seq": 59,
+              "last_fanout_seq": 69,
+              "status": "done"
+            }
+          ]
+        },
+        "session-history.delta.pagination": {
+          "agent_id": "agent_demo_0001",
           "session_id": "sess_demo_0001",
           "snapshot_seq": 44,
           "next_since": {
@@ -1958,240 +2164,186 @@
               "updated_seq": 44,
               "visible": false,
               "turn_id": "turn_demo_0001"
+            },
+            {
+              "id": 7,
+              "row_key": "m:7",
+              "turn_id": "turn_demo_0001",
+              "role": "assistant",
+              "content": "Done",
+              "status": "done",
+              "visible": true,
+              "updated_seq": 44,
+              "started_at": 1756972800000,
+              "completed_at": 1756972810000
             }
           ],
-          "activities": [
-            {
-              "activity_id": 40,
-              "item_id": "01996f2e-7b6a-7c31-9f8e-4a3d6c1b2e90",
-              "turn_id": "turn_demo_0001",
-              "kind": "thinking",
-              "status": "streaming",
-              "updated_seq": 44,
-              "last_fanout_seq": 9
-            },
-            {
-              "activity_id": 41,
-              "call_id": "hp_t_demo_0001",
-              "item_id": "01996f2e-7b6a-7c31-9f8e-4a3d6c1b2e91",
-              "turn_id": "turn_demo_0001",
-              "kind": "tool",
-              "name": "file_search",
-              "label": "Search demo files",
-              "status": "running",
-              "created_seq": 41,
-              "updated_seq": 44,
-              "last_fanout_seq": 9,
-              "source": {
-                "kind": "builtin",
-                "id": "file_search",
-                "label": "Search demo files"
-              },
-              "display_args": {
-                "args_summary": "query=demo",
-                "truncated": false
-              },
-              "display_result": {
-                "summary": "Found demo files",
-                "content_type": "text",
-                "truncated": false,
-                "bytes": 16
-              }
-            },
-            {
-              "activity_id": 42,
-              "turn_id": "turn_demo_0001",
-              "kind": "todo_update",
-              "status": "done",
-              "item_id": "01996f2e-7b6a-7c31-9f8e-4a3d6c1b2e92",
-              "item_index": 0,
-              "v": 2,
-              "todo_list": {
-                "items": [
-                  {
-                    "id": "todo_demo_1",
-                    "content": "Find demo files",
-                    "status": "completed"
-                  }
-                ],
-                "summary": {
-                  "total": 1,
-                  "pending": 0,
-                  "in_progress": 0,
-                  "completed": 1,
-                  "cancelled": 0
-                }
-              }
-            },
-            {
-              "activity_id": 43,
-              "turn_id": "turn_demo_0001",
-              "kind": "text",
-              "status": "done",
-              "item_id": "01996f2e-7b6a-7c31-9f8e-4a3d6c1b2e93",
-              "item_index": 3,
-              "canonical_omitted": true
-            },
-            {
-              "activity_id": 44,
-              "turn_id": "turn_demo_0001",
-              "kind": "subagent",
-              "status": "done",
-              "item_id": "01996f2e-7b6a-7c31-9f8e-4a3d6c1b2e94",
-              "item_index": 4,
-              "v": 1,
-              "preview": "Found demo files"
-            },
-            {
-              "turn_id": "turn_demo_0001",
-              "kind": "clarify",
-              "status": "done",
-              "item_index": 6,
-              "activity_id": 45,
-              "call_id": "ia_demo_0002"
-            },
-            {
-              "turn_id": "turn_demo_0001",
-              "kind": "context",
-              "status": "done",
-              "item_index": 8,
-              "activity_id": 46,
-              "call_id": "context"
-            },
-            {
-              "turn_id": "turn_demo_0001",
-              "kind": "plan_preview",
-              "status": "done",
-              "item_index": 9,
-              "activity_id": 47,
-              "call_id": "plan_preview"
-            }
-          ],
+          "activities": [],
           "truncated": false
         },
         "session-history.tail": {
           "agent_id": "agent_demo_0001",
-          "session_id": "sess_demo_0001",
-          "next_since": {
-            "updated_seq": 41,
-            "row_key": "ma:7"
-          },
-          "active_turn": {
-            "turn_id": "turn_demo_0001",
-            "live_seq": 7,
-            "phase": "tool",
-            "tool_name": "search_files",
-            "unsettled": false,
-            "started_at": 1756972800000
-          },
+          "session_id": "zettlab:owner:agent_demo_0001:sess_demo_0001",
           "messages": [
             {
-              "id": 7,
+              "started_at": 1756972800000,
+              "completed_at": 1756972820000,
+              "id": 1001,
+              "seq": 1,
               "turn_id": "turn_demo_0001",
-              "role": "assistant",
-              "content": "好的，我先找出上周末的视频。",
-              "status": "streaming",
-              "last_fanout_seq": 2
+              "role": "user",
+              "content": "hello",
+              "status": "done"
             },
             {
-              "id": 7,
-              "turn_id": "turn_demo_0001",
-              "role": "assistant",
-              "content": "",
-              "reasoning": "用户要剪 vlog，先确认时间范围。",
-              "status": "streaming",
+              "call_id": "01996f2e-7b6a-7c31-9f8e-4a3d6c1b2e90",
+              "started_at": 1756972801000,
+              "finished_at": 1756972802000,
+              "id": 1002,
+              "seq": 2,
               "item_id": "01996f2e-7b6a-7c31-9f8e-4a3d6c1b2e90",
-              "last_fanout_seq": 3
-            },
-            {
-              "id": 7,
+              "item_index": 0,
+              "last_fanout_seq": 60,
               "turn_id": "turn_demo_0001",
               "role": "assistant",
               "content": "",
-              "kind": "todo_update",
-              "item_id": "01996f2e-7b6a-7c31-9f8e-4a3d6c1b2e92",
-              "item_index": 0,
-              "todo_list": {
-                "items": [
-                  {
-                    "id": "todo_demo_1",
-                    "content": "Find demo files",
-                    "status": "completed"
-                  }
-                ],
-                "summary": {
-                  "total": 1,
-                  "pending": 0,
-                  "in_progress": 0,
-                  "completed": 1,
-                  "cancelled": 0
-                },
-                "v": 2
-              }
+              "status": "done",
+              "reasoning": "用户要剪 vlog，先确认时间范围。"
             },
             {
-              "id": 7,
+              "call_id": "01996f2e-7b6a-7000-8000-000000000002",
+              "started_at": 1756972802000,
+              "finished_at": 1756972803000,
+              "id": 1002,
+              "seq": 2,
+              "item_id": "01996f2e-7b6a-7000-8000-000000000002",
+              "item_index": 1,
+              "last_fanout_seq": 61,
+              "turn_id": "turn_demo_0001",
+              "role": "assistant",
+              "content": "Done",
+              "status": "done",
+              "kind": "text"
+            },
+            {
+              "id": 1002,
+              "seq": 2,
+              "last_fanout_seq": 62,
               "turn_id": "turn_demo_0001",
               "role": "tool",
               "content": "",
-              "item_id": "01996f2e-7b6a-7c31-9f8e-4a3d6c1b2e91",
-              "item_index": 1,
               "tool_call": {
+                "label": "Search demo files",
                 "name": "file_search",
                 "call_id": "hp_t_demo_0001",
-                "status": "running",
+                "status": "success",
+                "item_id": "01996f2e-7b6a-7000-8000-000000000003",
+                "item_index": 2,
                 "source": {
                   "kind": "builtin",
                   "id": "file_search",
                   "label": "Search demo files"
                 },
                 "display_args": {
-                  "args_summary": "query=demo",
-                  "truncated": false
+                  "args_summary": "query=demo"
                 },
                 "display_result": {
                   "summary": "Found demo files",
                   "content_type": "text",
                   "truncated": false,
                   "bytes": 16
+                },
+                "started_at": 1756972803000,
+                "finished_at": 1756972804000
+              }
+            },
+            {
+              "call_id": "01996f2e-7b6a-7000-8000-000000000004",
+              "v": 2,
+              "started_at": 1756972804000,
+              "finished_at": 1756972805000,
+              "id": 1002,
+              "seq": 2,
+              "item_id": "01996f2e-7b6a-7000-8000-000000000004",
+              "item_index": 3,
+              "last_fanout_seq": 63,
+              "turn_id": "turn_demo_0001",
+              "role": "assistant",
+              "content": "",
+              "status": "done",
+              "kind": "todo_update",
+              "todo_list": {
+                "v": 2,
+                "items": [
+                  {
+                    "id": "todo_demo_1",
+                    "content": "Find demo files",
+                    "status": "completed"
+                  }
+                ],
+                "summary": {
+                  "total": 1,
+                  "pending": 0,
+                  "in_progress": 0,
+                  "completed": 1,
+                  "cancelled": 0
                 }
               }
             },
             {
-              "id": 7,
-              "turn_id": "turn_demo_0001",
-              "role": "assistant",
-              "kind": "text",
-              "content": "",
-              "item_id": "01996f2e-7b6a-7c31-9f8e-4a3d6c1b2e93",
-              "item_index": 3,
-              "canonical_omitted": true
-            },
-            {
-              "id": 7,
-              "turn_id": "turn_demo_0001",
-              "role": "assistant",
-              "kind": "subagent",
-              "content": "",
-              "item_id": "01996f2e-7b6a-7c31-9f8e-4a3d6c1b2e94",
+              "call_id": "01996f2e-7b6a-7000-8000-000000000005",
+              "v": 1,
+              "preview": "Found demo files",
+              "started_at": 1756972805000,
+              "finished_at": 1756972806000,
+              "id": 1002,
+              "seq": 2,
+              "item_id": "01996f2e-7b6a-7000-8000-000000000005",
               "item_index": 4,
+              "last_fanout_seq": 64,
+              "turn_id": "turn_demo_0001",
+              "role": "assistant",
+              "content": "",
+              "status": "done",
+              "kind": "subagent",
               "subagent": {
-                "item_id": "01996f2e-7b6a-7c31-9f8e-4a3d6c1b2e94",
+                "item_id": "01996f2e-7b6a-7000-8000-000000000005",
                 "item_index": 4,
                 "v": 1,
-                "kind": "subagent",
                 "status": "done",
+                "subagent_id": "sub_demo_0001",
                 "preview": "Found demo files"
               }
             },
             {
+              "call_id": "01996f2e-7b6a-7000-8000-000000000006",
+              "started_at": 1756972806000,
+              "finished_at": 1756972807000,
+              "id": 1002,
+              "seq": 2,
+              "item_id": "01996f2e-7b6a-7000-8000-000000000006",
+              "item_index": 5,
+              "canonical_omitted": true,
+              "last_fanout_seq": 65,
               "turn_id": "turn_demo_0001",
-              "kind": "clarify",
+              "role": "assistant",
+              "content": "Done",
               "status": "done",
+              "kind": "text"
+            },
+            {
+              "call_id": "ia_demo_0002",
+              "started_at": 1756972807000,
+              "finished_at": 1756972808000,
+              "id": 1002,
+              "seq": 2,
               "item_index": 6,
-              "id": 7,
+              "last_fanout_seq": 66,
+              "turn_id": "turn_demo_0001",
               "role": "assistant",
               "content": "",
+              "status": "done",
+              "kind": "clarify",
               "clarify_id": "ia_demo_0002",
               "clarify": {
                 "clarify_id": "ia_demo_0002",
@@ -2204,28 +2356,38 @@
               }
             },
             {
+              "call_id": "context",
+              "started_at": 1756972808000,
+              "finished_at": 1756972809000,
+              "id": 1002,
+              "seq": 2,
+              "item_index": 7,
+              "last_fanout_seq": 67,
               "turn_id": "turn_demo_0001",
-              "kind": "context",
-              "status": "done",
-              "item_index": 8,
-              "id": 7,
               "role": "assistant",
               "content": "",
+              "status": "done",
+              "kind": "context_compaction",
               "context_compaction": {
-                "state": "done",
+                "state": "succeeded",
                 "message": "上下文已压缩",
                 "old_session_id": "sess_demo_0001",
                 "new_session_id": "sess_demo_0002"
               }
             },
             {
+              "call_id": "plan_preview",
+              "started_at": 1756972809000,
+              "finished_at": 1756972810000,
+              "id": 1002,
+              "seq": 2,
+              "item_index": 8,
+              "last_fanout_seq": 68,
               "turn_id": "turn_demo_0001",
-              "kind": "plan_preview",
-              "status": "done",
-              "item_index": 9,
-              "id": 7,
               "role": "assistant",
               "content": "",
+              "status": "done",
+              "kind": "plan_preview",
               "plan_preview": {
                 "title": "剪辑 vlog",
                 "groups": [
@@ -2239,11 +2401,26 @@
                   }
                 ],
                 "plan_id": "plan_demo_0001",
-                "status": "pending",
-                "revision_requested": false
+                "status": "pending"
+              }
+            },
+            {
+              "id": 1002,
+              "seq": 2,
+              "last_fanout_seq": 69,
+              "turn_id": "turn_demo_0001",
+              "role": "tool",
+              "content": "",
+              "tool_call": {
+                "name": "legacy_search",
+                "call_id": "legacy-tool",
+                "status": "success"
               }
             }
-          ]
+          ],
+          "oldest_id": 1001,
+          "newest_id": 1002,
+          "snapshot_seq": 100
         },
         "session-history.tail.live-seq-zero": {
           "agent_id": "agent_demo_0001",
@@ -2267,6 +2444,23 @@
               "status": "streaming"
             }
           ]
+        },
+        "session-history.tail.pagination": {
+          "agent_id": "agent_demo_0001",
+          "session_id": "sess_demo_0001",
+          "next_since": {
+            "updated_seq": 41,
+            "row_key": "ma:7"
+          },
+          "active_turn": {
+            "turn_id": "turn_demo_0001",
+            "live_seq": 7,
+            "phase": "tool",
+            "tool_name": "search_files",
+            "unsettled": false,
+            "started_at": 1756972800000
+          },
+          "messages": []
         },
         "session-history.tail.registry-evicted": {
           "agent_id": "agent_demo_0001",
@@ -2295,52 +2489,68 @@
         "session-history.turn-activities": {
           "activities": [
             {
+              "started_at": 1756972801000,
+              "finished_at": 1756972802000,
               "activity_id": 40,
-              "call_id": "thinking:0",
+              "call_id": "01996f2e-7b6a-7c31-9f8e-4a3d6c1b2e90",
               "item_id": "01996f2e-7b6a-7c31-9f8e-4a3d6c1b2e90",
+              "item_index": 0,
               "turn_id": "turn_demo_0001",
               "kind": "thinking",
-              "status": "done",
+              "content": "用户要剪 vlog，先确认时间范围。",
               "created_seq": 40,
-              "updated_seq": 45,
-              "last_fanout_seq": 9
+              "updated_seq": 50,
+              "last_fanout_seq": 60,
+              "status": "done"
             },
             {
+              "started_at": 1756972802000,
+              "finished_at": 1756972803000,
               "activity_id": 41,
-              "call_id": "hp_t_demo_0001",
-              "item_id": "01996f2e-7b6a-7c31-9f8e-4a3d6c1b2e91",
+              "call_id": "01996f2e-7b6a-7000-8000-000000000002",
+              "item_id": "01996f2e-7b6a-7000-8000-000000000002",
+              "item_index": 1,
               "turn_id": "turn_demo_0001",
-              "kind": "tool",
-              "name": "file_search",
-              "label": "Search demo files",
-              "status": "success",
+              "kind": "text",
+              "content": "Done",
               "created_seq": 41,
-              "updated_seq": 45,
-              "last_fanout_seq": 9,
+              "updated_seq": 51,
+              "last_fanout_seq": 61,
+              "status": "done"
+            },
+            {
+              "started_at": 1756972803000,
+              "finished_at": 1756972804000,
               "source": {
                 "kind": "builtin",
                 "id": "file_search",
                 "label": "Search demo files"
               },
               "display_args": {
-                "args_summary": "query=demo",
-                "truncated": false
+                "args_summary": "query=demo"
               },
               "display_result": {
                 "summary": "Found demo files",
                 "content_type": "text",
                 "truncated": false,
                 "bytes": 16
-              }
+              },
+              "activity_id": 42,
+              "call_id": "hp_t_demo_0001",
+              "name": "file_search",
+              "label": "Search demo files",
+              "item_id": "01996f2e-7b6a-7000-8000-000000000003",
+              "item_index": 2,
+              "turn_id": "turn_demo_0001",
+              "kind": "tool",
+              "created_seq": 42,
+              "updated_seq": 52,
+              "last_fanout_seq": 62,
+              "status": "done"
             },
             {
-              "activity_id": 42,
-              "turn_id": "turn_demo_0001",
-              "kind": "todo_update",
-              "status": "done",
-              "item_id": "01996f2e-7b6a-7c31-9f8e-4a3d6c1b2e92",
-              "item_index": 0,
-              "v": 2,
+              "started_at": 1756972804000,
+              "finished_at": 1756972805000,
               "todo_list": {
                 "items": [
                   {
@@ -2356,53 +2566,102 @@
                   "completed": 1,
                   "cancelled": 0
                 }
-              }
-            },
-            {
+              },
+              "v": 2,
               "activity_id": 43,
-              "turn_id": "turn_demo_0001",
-              "kind": "text",
-              "status": "done",
-              "item_id": "01996f2e-7b6a-7c31-9f8e-4a3d6c1b2e93",
+              "call_id": "01996f2e-7b6a-7000-8000-000000000004",
+              "item_id": "01996f2e-7b6a-7000-8000-000000000004",
               "item_index": 3,
-              "canonical_omitted": true
+              "turn_id": "turn_demo_0001",
+              "kind": "todo_update",
+              "created_seq": 43,
+              "updated_seq": 53,
+              "last_fanout_seq": 63,
+              "status": "done"
             },
             {
+              "started_at": 1756972805000,
+              "finished_at": 1756972806000,
+              "v": 1,
+              "preview": "Found demo files",
               "activity_id": 44,
+              "call_id": "01996f2e-7b6a-7000-8000-000000000005",
+              "item_id": "01996f2e-7b6a-7000-8000-000000000005",
+              "item_index": 4,
               "turn_id": "turn_demo_0001",
               "kind": "subagent",
-              "status": "done",
-              "item_id": "01996f2e-7b6a-7c31-9f8e-4a3d6c1b2e94",
-              "item_index": 4,
-              "v": 1,
-              "preview": "Found demo files"
+              "created_seq": 44,
+              "updated_seq": 54,
+              "last_fanout_seq": 64,
+              "status": "done"
             },
             {
+              "started_at": 1756972806000,
+              "finished_at": 1756972807000,
+              "canonical_omitted": true,
+              "activity_id": 45,
+              "call_id": "01996f2e-7b6a-7000-8000-000000000006",
+              "item_id": "01996f2e-7b6a-7000-8000-000000000006",
+              "item_index": 5,
+              "turn_id": "turn_demo_0001",
+              "kind": "text",
+              "content": "Done",
+              "created_seq": 45,
+              "updated_seq": 55,
+              "last_fanout_seq": 65,
+              "status": "done"
+            },
+            {
+              "started_at": 1756972807000,
+              "finished_at": 1756972808000,
+              "activity_id": 46,
+              "call_id": "ia_demo_0002",
+              "item_index": 6,
               "turn_id": "turn_demo_0001",
               "kind": "clarify",
-              "status": "done",
-              "item_index": 6,
-              "activity_id": 45,
-              "call_id": "ia_demo_0002"
+              "created_seq": 46,
+              "updated_seq": 56,
+              "last_fanout_seq": 66,
+              "status": "done"
             },
             {
+              "started_at": 1756972808000,
+              "finished_at": 1756972809000,
+              "activity_id": 47,
+              "call_id": "context",
+              "item_index": 7,
               "turn_id": "turn_demo_0001",
-              "kind": "context",
-              "status": "done",
-              "item_index": 8,
-              "activity_id": 46,
-              "call_id": "context"
+              "kind": "context_compaction",
+              "created_seq": 47,
+              "updated_seq": 57,
+              "last_fanout_seq": 67,
+              "status": "done"
             },
             {
+              "started_at": 1756972809000,
+              "finished_at": 1756972810000,
+              "activity_id": 48,
+              "call_id": "plan_preview",
+              "item_index": 8,
               "turn_id": "turn_demo_0001",
               "kind": "plan_preview",
-              "status": "done",
-              "item_index": 9,
-              "activity_id": 47,
-              "call_id": "plan_preview"
+              "created_seq": 48,
+              "updated_seq": 58,
+              "last_fanout_seq": 68,
+              "status": "done"
+            },
+            {
+              "activity_id": 49,
+              "call_id": "legacy-tool",
+              "name": "legacy_search",
+              "turn_id": "turn_demo_0001",
+              "kind": "tool",
+              "created_seq": 49,
+              "updated_seq": 59,
+              "last_fanout_seq": 69,
+              "status": "done"
             }
-          ],
-          "truncated": false
+          ]
         }
       }
     },
@@ -4644,6 +4903,10 @@
             "required": false,
             "type": "string"
           },
+          "canonical_omitted": {
+            "required": false,
+            "type": "boolean"
+          },
           "content": {
             "required": false,
             "type": "string"
@@ -4653,9 +4916,27 @@
             "type": "number",
             "integer": true
           },
+          "display_args": {
+            "required": false,
+            "type": "object"
+          },
+          "display_result": {
+            "required": false,
+            "type": "object"
+          },
+          "finished_at": {
+            "required": false,
+            "type": "number",
+            "integer": true
+          },
           "item_id": {
             "required": false,
             "type": "string"
+          },
+          "item_index": {
+            "required": false,
+            "type": "number",
+            "integer": true
           },
           "kind": {
             "required": true,
@@ -4674,6 +4955,19 @@
             "required": false,
             "type": "string"
           },
+          "preview": {
+            "required": false,
+            "type": "string"
+          },
+          "source": {
+            "required": false,
+            "type": "object"
+          },
+          "started_at": {
+            "required": false,
+            "type": "number",
+            "integer": true
+          },
           "status": {
             "required": true,
             "type": "string",
@@ -4688,6 +4982,10 @@
               "accepted"
             ]
           },
+          "todo_list": {
+            "required": false,
+            "type": "object"
+          },
           "turn_id": {
             "required": true,
             "type": "string"
@@ -4697,47 +4995,27 @@
             "type": "number",
             "integer": true
           },
-          "item_index": {
-            "required": false,
-            "type": "number",
-            "integer": true
-          },
           "v": {
             "required": false,
             "type": "number",
             "integer": true
-          },
-          "source": {
-            "required": false,
-            "type": "object"
-          },
-          "display_args": {
-            "required": false,
-            "type": "object"
-          },
-          "display_result": {
-            "required": false,
-            "type": "object"
-          },
-          "canonical_omitted": {
-            "required": false,
-            "type": "boolean"
-          },
-          "preview": {
-            "required": false,
-            "type": "string"
-          },
-          "todo_list": {
-            "required": false,
-            "type": "object"
           }
         }
       },
       "message_row": {
         "fields": {
+          "completed_at": {
+            "required": false,
+            "type": "number",
+            "integer": true
+          },
           "content": {
             "required": false,
             "type": "string"
+          },
+          "error": {
+            "required": false,
+            "type": "object"
           },
           "id": {
             "required": true,
@@ -4756,6 +5034,11 @@
           "row_key": {
             "required": false,
             "type": "string"
+          },
+          "started_at": {
+            "required": false,
+            "type": "number",
+            "integer": true
           },
           "status": {
             "required": false,
@@ -4947,6 +5230,14 @@
             "required": false,
             "type": "object"
           },
+          "call_id": {
+            "required": false,
+            "type": "string"
+          },
+          "canonical_omitted": {
+            "required": false,
+            "type": "boolean"
+          },
           "chat_attachments": {
             "required": false,
             "type": "array"
@@ -4958,6 +5249,11 @@
           "clarify_id": {
             "required": false,
             "type": "string"
+          },
+          "completed_at": {
+            "required": false,
+            "type": "number",
+            "integer": true
           },
           "content": {
             "required": true,
@@ -4971,9 +5267,22 @@
             "required": false,
             "type": "object"
           },
+          "display_args": {
+            "required": false,
+            "type": "object"
+          },
+          "display_result": {
+            "required": false,
+            "type": "object"
+          },
           "error": {
             "required": false,
             "type": "object"
+          },
+          "finished_at": {
+            "required": false,
+            "type": "number",
+            "integer": true
           },
           "goal_id": {
             "required": false,
@@ -4993,7 +5302,16 @@
             "required": false,
             "type": "string"
           },
+          "item_index": {
+            "required": false,
+            "type": "number",
+            "integer": true
+          },
           "kind": {
+            "required": false,
+            "type": "string"
+          },
+          "label": {
             "required": false,
             "type": "string"
           },
@@ -5006,9 +5324,17 @@
             "required": false,
             "type": "array"
           },
+          "name": {
+            "required": false,
+            "type": "string"
+          },
           "plan_preview": {
             "required": false,
             "type": "object"
+          },
+          "preview": {
+            "required": false,
+            "type": "string"
           },
           "produced_files": {
             "required": false,
@@ -5047,6 +5373,15 @@
             "required": false,
             "type": "string"
           },
+          "source": {
+            "required": false,
+            "type": "object"
+          },
+          "started_at": {
+            "required": false,
+            "type": "number",
+            "integer": true
+          },
           "status": {
             "required": false,
             "type": "string",
@@ -5058,6 +5393,10 @@
             ]
           },
           "steer": {
+            "required": false,
+            "type": "object"
+          },
+          "subagent": {
             "required": false,
             "type": "object"
           },
@@ -5077,18 +5416,10 @@
             "required": false,
             "type": "any"
           },
-          "canonical_omitted": {
-            "required": false,
-            "type": "boolean"
-          },
-          "item_index": {
+          "v": {
             "required": false,
             "type": "number",
             "integer": true
-          },
-          "subagent": {
-            "required": false,
-            "type": "object"
           }
         }
       }
@@ -5379,6 +5710,174 @@
               "pointer": "/activities/0"
             }
           ]
+        }
+      ]
+    },
+    "activity_rows_fixture": {
+      "version": 1,
+      "turn": {
+        "turn_id": "turn_demo_0001",
+        "session_id": "zettlab:owner:agent_demo_0001:sess_demo_0001",
+        "agent_id": "agent_demo_0001",
+        "started_at": 1756972800000,
+        "completed_at": 1756972820000,
+        "status": "completed"
+      },
+      "activities": [
+        {
+          "id": 40,
+          "kind": "thinking",
+          "call_id": "01996f2e-7b6a-7c31-9f8e-4a3d6c1b2e90",
+          "name": "",
+          "status": "done",
+          "text": "用户要剪 vlog，先确认时间范围。",
+          "started_at": 1756972801000,
+          "completed_at": 1756972802000,
+          "created_seq": 40,
+          "updated_seq": 50,
+          "last_fanout_seq": 60,
+          "item_index": 0,
+          "item_id": "01996f2e-7b6a-7c31-9f8e-4a3d6c1b2e90",
+          "metadata_json": "{}"
+        },
+        {
+          "id": 41,
+          "kind": "text",
+          "call_id": "01996f2e-7b6a-7000-8000-000000000002",
+          "name": "",
+          "status": "done",
+          "text": "Done",
+          "started_at": 1756972802000,
+          "completed_at": 1756972803000,
+          "created_seq": 41,
+          "updated_seq": 51,
+          "last_fanout_seq": 61,
+          "item_index": 1,
+          "item_id": "01996f2e-7b6a-7000-8000-000000000002",
+          "metadata_json": "{\"canonical_omitted\":false}"
+        },
+        {
+          "id": 42,
+          "kind": "tool",
+          "call_id": "hp_t_demo_0001",
+          "name": "file_search",
+          "status": "done",
+          "text": "",
+          "started_at": 1756972803000,
+          "completed_at": 1756972804000,
+          "created_seq": 42,
+          "updated_seq": 52,
+          "last_fanout_seq": 62,
+          "item_index": 2,
+          "item_id": "01996f2e-7b6a-7000-8000-000000000003",
+          "metadata_json": "{\"source\":{\"kind\":\"builtin\",\"id\":\"file_search\",\"label\":\"Search demo files\"},\"display_args\":{\"args_summary\":\"query=demo\",\"truncated\":false},\"display_result\":{\"summary\":\"Found demo files\",\"content_type\":\"text\",\"truncated\":false,\"bytes\":16},\"label\":\"Search demo files\"}"
+        },
+        {
+          "id": 43,
+          "kind": "todo_update",
+          "call_id": "01996f2e-7b6a-7000-8000-000000000004",
+          "name": "",
+          "status": "done",
+          "text": "",
+          "started_at": 1756972804000,
+          "completed_at": 1756972805000,
+          "created_seq": 43,
+          "updated_seq": 53,
+          "last_fanout_seq": 63,
+          "item_index": 3,
+          "item_id": "01996f2e-7b6a-7000-8000-000000000004",
+          "metadata_json": "{\"todos\":[{\"id\":\"todo_demo_1\",\"content\":\"Find demo files\",\"status\":\"completed\"}],\"summary\":{\"total\":1,\"pending\":0,\"in_progress\":0,\"completed\":1,\"cancelled\":0},\"v\":2}"
+        },
+        {
+          "id": 44,
+          "kind": "subagent",
+          "call_id": "01996f2e-7b6a-7000-8000-000000000005",
+          "name": "",
+          "status": "done",
+          "text": "",
+          "started_at": 1756972805000,
+          "completed_at": 1756972806000,
+          "created_seq": 44,
+          "updated_seq": 54,
+          "last_fanout_seq": 64,
+          "item_index": 4,
+          "item_id": "01996f2e-7b6a-7000-8000-000000000005",
+          "metadata_json": "{\"v\":1,\"preview\":\"Found demo files\",\"subagent_id\":\"sub_demo_0001\",\"status\":\"done\"}"
+        },
+        {
+          "id": 45,
+          "kind": "text",
+          "call_id": "01996f2e-7b6a-7000-8000-000000000006",
+          "name": "",
+          "status": "done",
+          "text": "Done",
+          "started_at": 1756972806000,
+          "completed_at": 1756972807000,
+          "created_seq": 45,
+          "updated_seq": 55,
+          "last_fanout_seq": 65,
+          "item_index": 5,
+          "item_id": "01996f2e-7b6a-7000-8000-000000000006",
+          "metadata_json": "{\"canonical_omitted\":true}"
+        },
+        {
+          "id": 46,
+          "kind": "clarify",
+          "call_id": "ia_demo_0002",
+          "name": "",
+          "status": "done",
+          "text": "",
+          "started_at": 1756972807000,
+          "completed_at": 1756972808000,
+          "created_seq": 46,
+          "updated_seq": 56,
+          "last_fanout_seq": 66,
+          "item_index": 6,
+          "metadata_json": "{\"clarify_id\":\"ia_demo_0002\",\"question\":\"周末指哪两天？\",\"choices_offered\":[\"上周末\",\"本周末\"],\"expires_at_ms\":1756973100000}"
+        },
+        {
+          "id": 47,
+          "kind": "context_compaction",
+          "call_id": "context",
+          "name": "",
+          "status": "done",
+          "text": "",
+          "started_at": 1756972808000,
+          "completed_at": 1756972809000,
+          "created_seq": 47,
+          "updated_seq": 57,
+          "last_fanout_seq": 67,
+          "item_index": 7,
+          "metadata_json": "{\"state\":\"succeeded\",\"message\":\"上下文已压缩\",\"old_session_id\":\"sess_demo_0001\",\"new_session_id\":\"sess_demo_0002\"}"
+        },
+        {
+          "id": 48,
+          "kind": "plan_preview",
+          "call_id": "plan_preview",
+          "name": "",
+          "status": "done",
+          "text": "",
+          "started_at": 1756972809000,
+          "completed_at": 1756972810000,
+          "created_seq": 48,
+          "updated_seq": 58,
+          "last_fanout_seq": 68,
+          "item_index": 8,
+          "metadata_json": "{\"title\":\"剪辑 vlog\",\"groups\":[{\"icon\":\"🎬\",\"label\":\"素材\",\"count\":1,\"items\":[\"挑选 4 段\"]}],\"plan_id\":\"plan_demo_0001\",\"status\":\"pending\",\"revision_requested\":false}"
+        },
+        {
+          "id": 49,
+          "kind": "tool",
+          "call_id": "legacy-tool",
+          "name": "legacy_search",
+          "status": "done",
+          "text": "",
+          "metadata_json": "{}",
+          "started_at": 0,
+          "completed_at": 0,
+          "created_seq": 49,
+          "updated_seq": 59,
+          "last_fanout_seq": 69
         }
       ]
     }
