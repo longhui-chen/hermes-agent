@@ -14,7 +14,7 @@ def _env() -> dict[str, str]:
     }
 
 
-def test_connector_chat_create_probe_and_create_keep_secret_out_of_result(monkeypatch):
+def test_connector_chat_create_full_capability_flow_keeps_secret_out_of_result(monkeypatch):
     monkeypatch.setattr(connector_tool, "_runtime_env", _env)
     seen = []
 
@@ -25,7 +25,7 @@ def test_connector_chat_create_probe_and_create_keep_secret_out_of_result(monkey
             return {"result": {"tools": [{"name": "connector.create_readonly_template"}]}}
         return {"result": {
             "connection_id": "conn-1", "connection_status": "active",
-            "template_id": "jira-data-center-pat-api", "session_ready": True,
+            "template_id": "dify-workflow-api", "session_ready": True,
             "verified": False,
             "secret": "synthetic-pat-not-real",
         }}
@@ -35,18 +35,19 @@ def test_connector_chat_create_probe_and_create_keep_secret_out_of_result(monkey
     assert probe == {"available": True, "ok": True}
 
     created = json.loads(connector_tool.connector_chat_create_tool({
-        "action": "create", "template_id": "jira-data-center-pat-api",
-        "template_version": 1, "variables": {"base_url": "http://192.168.31.33"},
-        "secret": "synthetic-pat-not-real", "insecure_transport_confirmed": True,
-        "idempotency_key": "chat-create-jira-0123456789",
+        "action": "create", "template_id": "dify-workflow-api",
+        "template_version": 1, "variables": {},
+        "secret": "synthetic-pat-not-real",
+        "idempotency_key": "chat-create-dify-0123456789",
     }))
     assert created == {
         "ok": True, "connection_id": "conn-1", "connection_status": "active",
-        "template_id": "jira-data-center-pat-api", "session_ready": True,
+        "template_id": "dify-workflow-api", "session_ready": True,
         "verified": False,
     }
     assert "synthetic-pat-not-real" not in json.dumps(created)
     assert seen[1][1]["params"]["arguments"]["secret"] == "synthetic-pat-not-real"
+    assert seen[1][1]["params"]["arguments"]["template_id"] == "dify-workflow-api"
     for request, _, _ in seen:
         assert request.get_header("X-zettlab-agent-action-token") == "profile-action-token"
         assert request.get_header("X-zettlab-connector-session-id") == "chat-1"
@@ -59,6 +60,16 @@ def test_connector_chat_create_rejects_external_url_and_missing_turn(monkeypatch
         **_env(), "ZETTLAB_CONNECTORS_URL": "https://api.example.com/rpc",
     })
     assert json.loads(connector_tool.connector_chat_create_tool({"action": "probe"}))["available"] is False
+
+
+def test_connector_chat_create_rejects_invalid_template_identifier(monkeypatch):
+    monkeypatch.setattr(connector_tool, "_runtime_env", _env)
+    result = json.loads(connector_tool.connector_chat_create_tool({
+        "action": "create", "template_id": "../untrusted-template",
+        "template_version": 1, "variables": {}, "secret": "synthetic",
+        "idempotency_key": "chat-create-invalid-0123456789",
+    }))
+    assert result == {"code": "connector_chat_create_invalid_request", "ok": False}
     monkeypatch.setattr(connector_tool, "_runtime_env", lambda: {
         **_env(), "ZETTLAB_TURN_ID": "",
     })
@@ -74,7 +85,9 @@ def test_connector_chat_create_tool_reachable_in_zet_agent_catalog(monkeypatch):
     monkeypatch.setattr(connector_tool, "_runtime_env", _env)
     definition = connector_tool.registry.get_definitions({"connector_chat_create"}, quiet=True)[0]
     description = definition["function"]["description"]
-    assert "for the next turn" in description
+    assert "next turn" in description
+    assert "published Connector template" in description
+    assert "read-only Jira/GitLab" not in description
     assert "no automatic tool authorization" not in description.lower()
 
 

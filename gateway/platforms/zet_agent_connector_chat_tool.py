@@ -10,9 +10,7 @@ from tools.registry import registry
 
 
 _CREATE_TOOL = "connector.create_readonly_template"
-_READ_ONLY_TEMPLATES = {
-    "jira-data-center-pat-api", "gitlab-com-pat-api", "gitlab-self-managed-pat-api",
-}
+_TEMPLATE_ID_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*\Z")
 _KEY_RE = re.compile(r"[A-Za-z0-9._:-]{16,128}\Z")
 
 
@@ -105,7 +103,9 @@ def connector_chat_create_tool(args, **kw) -> str:
     variables = args.get("variables")
     secret = args.get("secret")
     key = args.get("idempotency_key")
-    if (template not in _READ_ONLY_TEMPLATES or args.get("template_version") != 1
+    if (not isinstance(template, str) or len(template) > 128
+            or _TEMPLATE_ID_RE.fullmatch(template) is None
+            or args.get("template_version") != 1
             or not isinstance(variables, dict) or len(variables) > 16
             or any(not isinstance(k, str) or not isinstance(v, str) or len(v) > 512
                    for k, v in variables.items())
@@ -140,12 +140,13 @@ registry.register(
     name="connector_chat_create", toolset="zettlab_connectors",
     schema={
         "name": "connector_chat_create",
-        "description": "Probe current-Chat Connector creation availability, then create and enable one published read-only Jira/GitLab API connection for the next turn. No shell.",
+        "description": "Probe current-Chat Connector creation availability, then create and enable one published Connector template with its declared tools available next turn. Write and destructive tools retain policy and confirmation gates. No shell.",
         "parameters": {
             "type": "object", "additionalProperties": False,
             "properties": {
                 "action": {"type": "string", "enum": ["probe", "create"]},
-                "template_id": {"type": "string", "enum": sorted(_READ_ONLY_TEMPLATES)},
+                "template_id": {"type": "string", "minLength": 1, "maxLength": 128,
+                                "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$"},
                 "template_version": {"type": "integer"},
                 "variables": {"type": "object", "additionalProperties": {"type": "string"}},
                 "secret": {"type": "string"},
