@@ -7,6 +7,7 @@ from importlib.resources import files
 from typing import Any
 
 from .item_sequencer import ItemSequencer
+from .zet_agent_metrics import item_frame_count
 from .tool_display import build_tool_result_display, build_tool_start_display
 
 projection_context: ContextVar[WriterProjection] = ContextVar("bt_writer_projection")
@@ -29,30 +30,34 @@ class WriterProjection:
     def __init__(self, turn_id: str | None = None, identities: dict[str, str] | None = None):
         self.sequencer = ItemSequencer(turn_id=turn_id, identity_fields=identity_fields() if identities is None else identities)
 
+    def _count(self, name: str) -> None:
+        self.sequencer._count(name)
+        item_frame_count(name)
+
     def project(self, item: Any) -> list[Any]:
         if isinstance(item, str):
             return self._project_text(item)
         if not isinstance(item, tuple) or len(item) != 2:
-            self.sequencer._count("item_frame_unclassified")
+            self._count("item_frame_unclassified")
             return [item]
         tag, payload = item
         if tag == "__hermes_error__" and isinstance(payload, dict):
             return [item]
         if tag != "__tool_progress__" or not isinstance(payload, dict):
-            self.sequencer._count("item_frame_unclassified")
+            self._count("item_frame_unclassified")
             return [item]
         # Tool progress has no type discriminator in the registered wire dialect.
         tool = not payload.get("type") and isinstance(payload.get("tool"), str)
         frame = dict(payload)
         if not tool and not isinstance(frame.get("type"), str):
-            self.sequencer._count("item_frame_unclassified")
+            self._count("item_frame_unclassified")
             return [item]
         if tool:
             frame["type"] = "tool.result" if frame.get("status") == "completed" else "tool.start"
         rejected_before = self.sequencer.counters.get("item_frame_rejected{reason:unregistered}", 0)
         frames = self.sequencer.process(frame)
         if self.sequencer.counters.get("item_frame_rejected{reason:unregistered}", 0) > rejected_before:
-            self.sequencer._count("item_frame_unregistered")
+            self._count("item_frame_unregistered")
         if frames == [frame] and "item_id" not in frame and "index" not in frame:
             return [item]  # rejected producer input retains the existing fallback
         result = []
@@ -85,6 +90,7 @@ class WriterProjection:
     def count_stranded(self, count: int) -> None:
         if count:
             self.sequencer.counters["item_frame_stranded"] = count
+            item_frame_count("item_frame_stranded", count)
 
 
 def tool_callbacks(stream_q, timing=None):
