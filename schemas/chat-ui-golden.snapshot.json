@@ -1,7 +1,7 @@
 {
   "snapshot_version": 2,
-  "root_commit": "dbc1e323be76baff8ce9d7699f059f1b052cc635",
-  "sha256": "75fd79e3b86c90977f3421ab85f46f94e9312057c3eaae37ae4fc94b2a57651c",
+  "root_commit": "393a7e2bf4fb9b60dc3f6650cf1e2a015d272054",
+  "sha256": "82f85c40f496eede0fc8b20b5a81e58f8a89a29fa0769133d65677e8f447bb13",
   "payload": {
     "golden": {
       "events": {
@@ -1982,7 +1982,66 @@
               "status": "running",
               "created_seq": 41,
               "updated_seq": 44,
-              "last_fanout_seq": 9
+              "last_fanout_seq": 9,
+              "source": {
+                "kind": "builtin",
+                "id": "file_search",
+                "label": "Search demo files"
+              },
+              "display_args": {
+                "args_summary": "query=demo",
+                "truncated": false
+              },
+              "display_result": {
+                "summary": "Found demo files",
+                "content_type": "text",
+                "truncated": false,
+                "bytes": 16
+              }
+            },
+            {
+              "activity_id": 42,
+              "turn_id": "turn_demo_0001",
+              "kind": "todo_update",
+              "status": "done",
+              "item_id": "01996f2e-7b6a-7c31-9f8e-4a3d6c1b2e92",
+              "item_index": 0,
+              "v": 2,
+              "todo_list": {
+                "items": [
+                  {
+                    "id": "todo_demo_1",
+                    "content": "Find demo files",
+                    "status": "completed"
+                  }
+                ],
+                "summary": {
+                  "total": 1,
+                  "pending": 0,
+                  "in_progress": 0,
+                  "completed": 1,
+                  "cancelled": 0
+                }
+              }
+            },
+            {
+              "activity_id": 43,
+              "turn_id": "turn_demo_0001",
+              "kind": "text",
+              "status": "done",
+              "item_id": "01996f2e-7b6a-7c31-9f8e-4a3d6c1b2e93",
+              "item_index": 3,
+              "canonical_omitted": true
+            },
+            {
+              "activity_id": 44,
+              "turn_id": "turn_demo_0001",
+              "kind": "subagent",
+              "status": "done",
+              "item_id": "01996f2e-7b6a-7c31-9f8e-4a3d6c1b2e94",
+              "item_index": 4,
+              "v": 1,
+              "preview": "Found demo files"
             }
           ],
           "truncated": false
@@ -2020,6 +2079,87 @@
               "status": "streaming",
               "item_id": "01996f2e-7b6a-7c31-9f8e-4a3d6c1b2e90",
               "last_fanout_seq": 3
+            },
+            {
+              "id": 7,
+              "turn_id": "turn_demo_0001",
+              "role": "assistant",
+              "content": "",
+              "kind": "todo_update",
+              "item_id": "01996f2e-7b6a-7c31-9f8e-4a3d6c1b2e92",
+              "item_index": 0,
+              "todo_list": {
+                "items": [
+                  {
+                    "id": "todo_demo_1",
+                    "content": "Find demo files",
+                    "status": "completed"
+                  }
+                ],
+                "summary": {
+                  "total": 1,
+                  "pending": 0,
+                  "in_progress": 0,
+                  "completed": 1,
+                  "cancelled": 0
+                },
+                "v": 2
+              }
+            },
+            {
+              "id": 7,
+              "turn_id": "turn_demo_0001",
+              "role": "tool",
+              "content": "",
+              "item_id": "01996f2e-7b6a-7c31-9f8e-4a3d6c1b2e91",
+              "item_index": 1,
+              "tool_call": {
+                "name": "file_search",
+                "call_id": "hp_t_demo_0001",
+                "status": "running",
+                "source": {
+                  "kind": "builtin",
+                  "id": "file_search",
+                  "label": "Search demo files"
+                },
+                "display_args": {
+                  "args_summary": "query=demo",
+                  "truncated": false
+                },
+                "display_result": {
+                  "summary": "Found demo files",
+                  "content_type": "text",
+                  "truncated": false,
+                  "bytes": 16
+                }
+              }
+            },
+            {
+              "id": 7,
+              "turn_id": "turn_demo_0001",
+              "role": "assistant",
+              "kind": "text",
+              "content": "",
+              "item_id": "01996f2e-7b6a-7c31-9f8e-4a3d6c1b2e93",
+              "item_index": 3,
+              "canonical_omitted": true
+            },
+            {
+              "id": 7,
+              "turn_id": "turn_demo_0001",
+              "role": "assistant",
+              "kind": "subagent",
+              "content": "",
+              "item_id": "01996f2e-7b6a-7c31-9f8e-4a3d6c1b2e94",
+              "item_index": 4,
+              "subagent": {
+                "item_id": "01996f2e-7b6a-7c31-9f8e-4a3d6c1b2e94",
+                "item_index": 4,
+                "v": 1,
+                "kind": "subagent",
+                "status": "done",
+                "preview": "Found demo files"
+              }
             }
           ]
         },
@@ -2094,7 +2234,66 @@
               "status": "success",
               "created_seq": 41,
               "updated_seq": 45,
-              "last_fanout_seq": 9
+              "last_fanout_seq": 9,
+              "source": {
+                "kind": "builtin",
+                "id": "file_search",
+                "label": "Search demo files"
+              },
+              "display_args": {
+                "args_summary": "query=demo",
+                "truncated": false
+              },
+              "display_result": {
+                "summary": "Found demo files",
+                "content_type": "text",
+                "truncated": false,
+                "bytes": 16
+              }
+            },
+            {
+              "activity_id": 42,
+              "turn_id": "turn_demo_0001",
+              "kind": "todo_update",
+              "status": "done",
+              "item_id": "01996f2e-7b6a-7c31-9f8e-4a3d6c1b2e92",
+              "item_index": 0,
+              "v": 2,
+              "todo_list": {
+                "items": [
+                  {
+                    "id": "todo_demo_1",
+                    "content": "Find demo files",
+                    "status": "completed"
+                  }
+                ],
+                "summary": {
+                  "total": 1,
+                  "pending": 0,
+                  "in_progress": 0,
+                  "completed": 1,
+                  "cancelled": 0
+                }
+              }
+            },
+            {
+              "activity_id": 43,
+              "turn_id": "turn_demo_0001",
+              "kind": "text",
+              "status": "done",
+              "item_id": "01996f2e-7b6a-7c31-9f8e-4a3d6c1b2e93",
+              "item_index": 3,
+              "canonical_omitted": true
+            },
+            {
+              "activity_id": 44,
+              "turn_id": "turn_demo_0001",
+              "kind": "subagent",
+              "status": "done",
+              "item_id": "01996f2e-7b6a-7c31-9f8e-4a3d6c1b2e94",
+              "item_index": 4,
+              "v": 1,
+              "preview": "Found demo files"
             }
           ],
           "truncated": false
@@ -4396,6 +4595,35 @@
             "required": false,
             "type": "number",
             "integer": true
+          },
+          "v": {
+            "required": false,
+            "type": "number",
+            "integer": true
+          },
+          "source": {
+            "required": false,
+            "type": "object"
+          },
+          "display_args": {
+            "required": false,
+            "type": "object"
+          },
+          "display_result": {
+            "required": false,
+            "type": "object"
+          },
+          "canonical_omitted": {
+            "required": false,
+            "type": "boolean"
+          },
+          "preview": {
+            "required": false,
+            "type": "string"
+          },
+          "todo_list": {
+            "required": false,
+            "type": "object"
           }
         }
       },
