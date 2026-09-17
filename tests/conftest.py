@@ -508,6 +508,30 @@ def _isolate_hermes_home(_hermetic_environment):
 
 
 @pytest.fixture(autouse=True)
+def _fresh_app_change_budget():
+    """Start every test on an empty per-turn app change budget.
+
+    ``agent.app_change_budget`` is process-global on purpose: it counts what one
+    user turn has spent rebuilding / republishing an app, and it is cleared only
+    by the turn identity changing (gateway) or by ``build_turn_context`` (CLI).
+    A test that drives ``app_host`` directly does neither, so without this the
+    fifth publish of an entire test session — rather than of a turn — would be
+    refused, and the failure would land in whichever module happened to run
+    last. That is a test-harness artifact, not the behavior under test.
+    """
+    try:
+        from agent import app_change_budget
+    except Exception:
+        yield
+        return
+    app_change_budget.reset_all_for_tests()
+    try:
+        yield
+    finally:
+        app_change_budget.reset_all_for_tests()
+
+
+@pytest.fixture(autouse=True)
 def _neutralize_webbrowser(monkeypatch):
     """Record browser-open attempts instead of opening real browser windows."""
     import webbrowser as _webbrowser

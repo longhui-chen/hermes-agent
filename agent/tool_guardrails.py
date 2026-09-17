@@ -14,7 +14,23 @@ from dataclasses import dataclass, field
 from typing import Any, Mapping
 
 from utils import safe_json_loads
+from agent import app_change_budget
 from agent.tool_result_classification import file_mutation_result_landed
+
+
+# App Host actions that submit a new version of a generated app. Sourced from
+# the budget module so the soft gate (which refuses locally, in the tool) and
+# this hard backstop can never drift apart on what counts as a submission.
+APP_PUBLISH_ACTIONS = app_change_budget.PUBLISH_ACTIONS
+APP_PUBLISH_CAP_CODE = "loop_app_publish_cap"
+
+# Halt codes whose ``message`` is written FOR THE USER and must reach them
+# verbatim. Runtime code that renders a controlled halt (see
+# ``_toolguard_controlled_halt_response``) replaces the message with a generic
+# English "I stopped retrying X" sentence, which would turn a deliberate
+# hand-off — the app name, the rounds already spent, where the work site is
+# left — into a silent failure.
+TOOLGUARD_VERBATIM_HALT_CODES = frozenset({APP_PUBLISH_CAP_CODE})
 
 
 IDEMPOTENT_TOOL_NAMES = frozenset(
@@ -134,6 +150,11 @@ class ToolCallGuardrailConfig:
 # pathological, so the defaults are deliberately low.
 _DEFAULT_MAX_WEB_SEARCHES_PER_TURN = 50
 _DEFAULT_MAX_SUBAGENTS_PER_TURN = 50
+# Submitting a new version of one generated app. The soft gate in
+# tools.apphost_tool stops at 4 per app per turn (one delivery + three repair
+# rounds) and explains itself; this is the ceiling for a model that ignores
+# that refusal and keeps calling, so it is deliberately only a little higher.
+_DEFAULT_MAX_APP_PUBLISHES_PER_TURN = 6
 
 
 @dataclass(frozen=True)
@@ -156,6 +177,7 @@ class LoopCapConfig:
 
     max_web_searches: int = _DEFAULT_MAX_WEB_SEARCHES_PER_TURN
     max_subagents: int = _DEFAULT_MAX_SUBAGENTS_PER_TURN
+    max_app_publishes: int = _DEFAULT_MAX_APP_PUBLISHES_PER_TURN
 
     @classmethod
     def from_mapping(cls, data: Mapping[str, Any] | None) -> "LoopCapConfig":
@@ -169,6 +191,9 @@ class LoopCapConfig:
             ),
             max_subagents=_non_negative_int(
                 data.get("max_subagents"), defaults.max_subagents
+            ),
+            max_app_publishes=_non_negative_int(
+                data.get("max_app_publishes"), defaults.max_app_publishes
             ),
         )
 
@@ -287,6 +312,7 @@ class ToolCallGuardrailController:
         # single agent loop rather than accumulating across the session.
         self._turn_web_search_count = 0
         self._turn_subagent_count = 0
+        self._turn_app_publish_count = 0
 
     @property
     def halt_decision(self) -> ToolGuardrailDecision | None:
@@ -504,6 +530,45 @@ class ToolCallGuardrailController:
             self._turn_subagent_count += spawn_count
             return None
 
+        if tool_name == "app_host":
+            # Second-level backstop for the per-turn app change budget. The
+            # first stop is in tools.apphost_tool: it refuses the call locally
+            # (nothing is sent) and hands the model a written hand-off for the
+            # user. Those refused calls still pass through here, so a model
+            # that ignores the refusal and keeps submitting runs out a little
+            # later and has its turn ended. Like the caps above, this fires
+            # regardless of ``hard_stop_enabled``.
+            cap = caps.max_app_publishes
+            if not cap:
+                return None
+            app_action = str(args.get("action") or "").strip()
+            if app_action not in APP_PUBLISH_ACTIONS:
+                return None
+            if self._turn_app_publish_count >= cap:
+                slug = str(args.get("slug") or "").strip()
+                who = f"「{slug}」" if slug else "这个应用"
+                decision = ToolGuardrailDecision(
+                    action="block",
+                    code=APP_PUBLISH_CAP_CODE,
+                    message=(
+                        f"已强制结束本回合：这一个用户回合内给{who}提交新版本已达 "
+                        f"{cap} 次上限（含平台已经拒绝过的那几次）——"
+                        f"{_app_change_usage(slug)}。\n"
+                        "不要再改代码、不要再编译、不要再发布，"
+                        "也不许自行回滚或删除——撤销和删除只能由用户发起。\n"
+                        "现在如实告诉用户这四件事：卡在哪（最后一次失败的真实报错原文）、"
+                        "这几轮各改了什么、现场（应用目录 / 工作区）留在哪、"
+                        "你建议接着修还是先放弃。"
+                    ),
+                    tool_name=tool_name,
+                    count=self._turn_app_publish_count,
+                    signature=signature,
+                )
+                self._halt_decision = decision
+                return decision
+            self._turn_app_publish_count += 1
+            return None
+
         return None
 
 
@@ -548,6 +613,19 @@ def _tool_failure_recovery_hint(tool_name: str, count: int) -> str:
         "or a different tool that can make progress. If the blocker is external, report "
         "the blocker after one diagnostic attempt instead of repeating the same failing path."
     )
+
+
+def _app_change_usage(slug: str) -> str:
+    """One line about what this turn already spent on app changes.
+
+    Reading the budget ledger is the only place this otherwise side-effect-free
+    module reaches outside itself, and it is strictly a read: the halt message
+    is useless to the user without the app's real numbers and work site.
+    """
+    try:
+        return app_change_budget.usage_summary(slug)
+    except Exception:
+        return "本回合的平台记录不可用"
 
 
 def _coerce_args(args: Mapping[str, Any] | None) -> Mapping[str, Any]:

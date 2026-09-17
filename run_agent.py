@@ -201,6 +201,7 @@ from agent.codex_responses_adapter import (
     _summarize_user_message_for_log,  # also used by _sync_external_memory_for_turn (memory boundary)
 )
 from agent.tool_guardrails import (
+    TOOLGUARD_VERBATIM_HALT_CODES,
     ToolGuardrailDecision,
     append_toolguard_guidance,
     toolguard_synthetic_result,
@@ -7673,6 +7674,13 @@ class AIAgent:
             self._tool_guardrail_halt_decision = decision
 
     def _toolguard_controlled_halt_response(self, decision: ToolGuardrailDecision) -> str:
+        # A few guardrails write their halt message FOR THE USER — the app
+        # change budget names the app, the rounds already spent and where the
+        # work site is left, and tells the model what to report. Overwriting
+        # that with the generic sentence below would make a deliberate
+        # hand-off indistinguishable from the turn dying on its own.
+        if decision.code in TOOLGUARD_VERBATIM_HALT_CODES and decision.message:
+            return decision.message
         tool = decision.tool_name or "a tool"
         return (
             f"I stopped retrying {tool} because it hit the tool-call guardrail "
