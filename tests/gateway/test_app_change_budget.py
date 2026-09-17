@@ -21,7 +21,7 @@ from unittest.mock import patch
 
 import pytest
 
-from agent import app_change_budget
+from gateway import app_change_budget
 from gateway import session_context
 from tests.tools._profile_scope import mux_profile_scope
 from tools.apphost_tool import app_host_tool

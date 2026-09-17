@@ -22,9 +22,9 @@ import urllib.error
 import urllib.request
 from urllib.parse import quote, urlsplit
 
-from agent import app_change_budget
 from agent.credential_broker import request_app_auto_refresh_token
 from agent.secret_scope import get_secret
+from gateway import app_change_budget
 
 _ACTION_TOKEN_HEADER = "X-Zettlab-Agent-Action-Token"
 _AGENT_ID_SECRET = "ZET_AGENT_ID"
@@ -1040,7 +1040,7 @@ def app_host_tool(args, **_kw):
     # the model provider as non-string content and gets rejected (same
     # contract as list_my_channels).
     args = args or {}
-    # Per-user-turn change budget (agent.app_change_budget). The reason the
+    # Per-user-turn change budget (gateway.app_change_budget). The reason the
     # count sits here rather than in local-server: compiling and self-testing
     # run through `terminal` inside the app directory, so the server never sees
     # a repair round as a round. Once a turn has spent its compile / publish

@@ -511,7 +511,7 @@ def _isolate_hermes_home(_hermetic_environment):
 def _fresh_app_change_budget():
     """Start every test on an empty per-turn app change budget.
 
-    ``agent.app_change_budget`` is process-global on purpose: it counts what one
+    ``gateway.app_change_budget`` is process-global on purpose: it counts what one
     user turn has spent rebuilding / republishing an app, keyed on the trusted
     turn identity, and a ledger only goes away when that identity changes. A
     test that binds a turn identity of its own would otherwise inherit whatever
@@ -520,7 +520,7 @@ def _fresh_app_change_budget():
     the behavior under test.
     """
     try:
-        from agent import app_change_budget
+        from gateway import app_change_budget
     except Exception:
         yield
         return

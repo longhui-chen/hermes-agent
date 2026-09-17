@@ -12,6 +12,14 @@ now states the limit is platform-enforced, not a convention.
 
 Where the gate sits, and why here
 ---------------------------------
+It lives under ``gateway/`` rather than ``agent/`` because ``agent/**`` is
+upstream core (HR8 overlay gate, ``scripts/test-harness/overlay_gate.json``):
+Zettlab business logic belongs outside the kernel so upstream merges stay
+clean. Nothing here imports Hermes internals — only stdlib — so the module
+sits next to the other process-global ledgers (``delivery_ledger``,
+``lifecycle_ledger``) and ``tools.apphost_tool`` imports it the same way it
+already imports ``gateway.session_context``.
+
 In hermes, not in local-server. Writing source, compiling, self-testing and
 health-checking all happen through ``terminal`` inside the app's own directory,
 so local-server only ever witnesses the tail of a round (``acquire_slot`` /
