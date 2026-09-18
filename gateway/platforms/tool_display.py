@@ -176,7 +176,9 @@ def _terminal_args_summary(command: str) -> tuple[str, bool]:
 def _args_summary_source(tool_id: str, arguments: Any) -> tuple[Any, bool]:
     """Select one human-useful field per known tool before redaction."""
     if not isinstance(arguments, Mapping):
-        return arguments, False
+        # 同 D1：非字典的 arguments 只有本身是字符串时才算「人读短语」，
+        # list / 数字等一律空着，绝不落到 `_display_text` 渲染成 JSON。
+        return (arguments.strip() if isinstance(arguments, str) else ""), False
     if tool_id == "read_file":
         path = arguments.get("path")
         if isinstance(path, str):
@@ -199,7 +201,27 @@ def _args_summary_source(tool_id: str, arguments: Any) -> tuple[Any, bool]:
             value = arguments.get(key)
             if isinstance(value, str):
                 return value, False
-    return arguments, False
+    # D1 兜底：其它工具（skill / delegation / 自定义 MCP …）取**第一个非空字符串型
+    # 参数值**；一个都没有就返回空串，客户端据此不显示 chip。
+    #
+    # ⛔ 不要把整个 `arguments` 丢下去 —— 它会被 `_display_text` 渲染成原始 JSON 摆到
+    # 用户面前（AC-1379：skill 行显示 `{"file_path":"","name":"command-execution"}`）。
+    # 「做了什么」要么是人读短语，要么空着，没有第三种。
+    for key, value in arguments.items():
+        if not isinstance(value, str):
+            continue
+        # 敏感键一律跳过，用既有的 `_SECRET_KEYS` 判据（HR9：这条判断只有一处）。
+        # 按键名脱敏只在遍历 mapping 时生效，直接返回裸串会绕过它。
+        if isinstance(key, str) and _SECRET_KEYS.search(key):
+            continue
+        text = value.strip()
+        if not text:
+            continue
+        # 路径型字段与 read_file 同口径取 basename，别把整条绝对路径摆上屏。
+        if key in {"path", "file_path", "filepath"}:
+            return text.replace("\\", "/").rsplit("/", 1)[-1], False
+        return text, False
+    return "", False
 
 
 def args_summary(arguments: Any, *, tool_id: str = "") -> dict[str, Any]:

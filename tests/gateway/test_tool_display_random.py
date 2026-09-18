@@ -20,6 +20,50 @@ def test_random_redaction_and_utf8_bounds():
         assert "/Users/alice" not in result["display"]["summary"]
 
 
+def test_fallback_args_summary_is_never_structured_and_may_be_empty():
+    """D1 兜底：其它工具取第一个非空字符串参数值，没有就空 —— 永不是 JSON。
+
+    AC-1379：兜底原来直接把整个 arguments 丢下去，skill 行于是显示
+    `{"file_path":"","name":"command-execution"}`。「做了什么」要么是人读短语、
+    要么空着（客户端据此不显示 chip），没有第三种。
+    """
+    cases = [
+        # skill：file_path 为空 ⇒ 落到 name
+        ({"file_path": "", "name": "command-execution"}, "command-execution"),
+        # 路径型字段与 read_file 同口径取 basename
+        ({"file_path": "/skills/a/Skill.md", "name": "x"}, "Skill.md"),
+        # 一个字符串参数都没有 ⇒ 空串
+        ({"n": 1, "ok": False, "items": [1, 2]}, ""),
+        ({}, ""),
+        # 只有空白字符串也算没有
+        ({"a": "   ", "b": ""}, ""),
+        # 敏感键跳过，不因为「第一个字符串」就把 token 摆上屏
+        ({"api_key": "sk-live-xxx", "name": "deploy"}, "deploy"),
+        ({"password": "pw"}, ""),
+    ]
+    # 非字典 arguments 同理：字符串原样，其余空着
+    assert build_tool_start_display("t", "跑一下构建", None)["display"]["args_summary"] == "跑一下构建"
+    for weird in ([1, 2, 3], 42, None, True):
+        assert build_tool_start_display("t", weird, None)["display"]["args_summary"] == "", weird
+    for arguments, expected in cases:
+        summary = build_tool_start_display("some.unknown.tool", arguments, None)["display"]["args_summary"]
+        assert summary == expected, (arguments, summary)
+        assert not summary.startswith("{"), summary
+        assert not summary.startswith("["), summary
+
+    # 随机结构也不许渲染成 JSON
+    rng = random.Random(1379)
+    for _ in range(50):
+        arguments = {
+            "flag": rng.choice([True, False]),
+            "count": rng.randint(0, 10),
+            "nested": {"deep": rng.randint(0, 5)},
+            "items": [rng.randint(0, 3) for _ in range(3)],
+        }
+        summary = build_tool_start_display("another.unknown.tool", arguments, None)["display"]["args_summary"]
+        assert summary == "", summary
+
+
 def test_error_always_uses_error_content_type_and_exact_bytes():
     display = build_tool_result_display({"ignored": True}, error="token=bad")['display']
     assert display["content_type"] == "error"
