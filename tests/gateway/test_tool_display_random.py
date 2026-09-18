@@ -177,6 +177,16 @@ def test_args_summary_is_derived_by_tool_type(tool_id, arguments, expected):
     assert display == {"args_summary": expected, "truncated": False}
 
 
+def test_terminal_args_summary_scans_only_display_budget():
+    class NoSplitLines(str):
+        def splitlines(self, *args, **kwargs):
+            raise AssertionError("terminal display must not materialize every line")
+
+    command = NoSplitLines("first\n" + ("short\n" * 100) + "x" * 512)
+    display = build_tool_start_display("terminal", {"command": command})["display"]
+    assert display == {"args_summary": "[TRUNCATED]", "truncated": True}
+
+
 @pytest.mark.parametrize(
     ("tool_id", "arguments"),
     [
