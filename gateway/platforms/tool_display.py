@@ -10,6 +10,7 @@ import re
 from collections.abc import Mapping
 from itertools import islice
 from typing import Any
+from urllib.parse import urlsplit
 
 from agent.redact import redact_sensitive_text
 
@@ -144,8 +145,39 @@ def source_from_registration(tool_id: str, registration: Mapping[str, Any] | Non
     return {"kind": kind, "id": _display_text(source_id, _SOURCE_MAX_BYTES)[0], "label": _display_text(label, _SOURCE_MAX_BYTES)[0]}
 
 
-def args_summary(arguments: Any) -> dict[str, Any]:
-    text, truncated, _ = _display_text(arguments, ARGS_MAX_BYTES)
+def _args_summary_source(tool_id: str, arguments: Any) -> Any:
+    """Select one human-useful field per known tool before redaction."""
+    if not isinstance(arguments, Mapping):
+        return arguments
+    if tool_id == "read_file":
+        path = arguments.get("path")
+        if isinstance(path, str):
+            return path.replace("\\", "/").rsplit("/", 1)[-1]
+    elif tool_id == "terminal":
+        command = arguments.get("command")
+        if isinstance(command, str):
+            lines = [line.strip() for line in command.splitlines() if line.strip()]
+            if lines:
+                return lines[0] if len(lines) == 1 else f"{lines[0]} + {len(lines) - 1}"
+    elif tool_id.startswith("browser_"):
+        url = arguments.get("url")
+        if isinstance(url, str):
+            try:
+                host = urlsplit(url).hostname
+            except ValueError:
+                host = ""
+            if host:
+                return host
+    elif tool_id in {"search_files", "nas_search"}:
+        for key in ("query", "pattern"):
+            value = arguments.get(key)
+            if isinstance(value, str):
+                return value
+    return arguments
+
+
+def args_summary(arguments: Any, *, tool_id: str = "") -> dict[str, Any]:
+    text, truncated, _ = _display_text(_args_summary_source(tool_id, arguments), ARGS_MAX_BYTES)
     return {"args_summary": text, "truncated": truncated}
 
 
@@ -419,7 +451,7 @@ def result_display(output: Any = None, *, error: Any = None, content_type: str |
 
 
 def build_tool_start_display(tool_id: str, arguments: Any, registration: Mapping[str, Any] | None = None) -> dict[str, Any]:
-    return {"source": source_from_registration(tool_id, registration), "display": args_summary(arguments)}
+    return {"source": source_from_registration(tool_id, registration), "display": args_summary(arguments, tool_id=tool_id)}
 
 
 def build_tool_result_display(output: Any = None, *, error: Any = None, content_type: str | None = None, tool_id: str = "", arguments: Any = None) -> dict[str, Any]:

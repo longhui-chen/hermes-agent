@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import random
 
+import pytest
+
 from gateway.platforms.tool_display import ARGS_MAX_BYTES, SUMMARY_MAX_BYTES, build_tool_result_display, build_tool_start_display, result_display
 
 
@@ -159,3 +161,34 @@ def test_mcp_uses_server_identity_and_server_display_name():
         "server_label": "Search Server", "label": "Query tool",
     })
     assert source == {"kind": "mcp", "id": "search_server", "label": "Search Server"}
+
+@pytest.mark.parametrize(
+    ("tool_id", "arguments", "expected"),
+    [
+        ("read_file", {"path": "/Users/alice/notes.txt"}, "notes.txt"),
+        ("terminal", {"command": "git status\nnpm test\necho done"}, "git status + 2"),
+        ("browser_navigate", {"url": "https://example.com/a/path?x=1"}, "example.com"),
+        ("search_files", {"pattern": "landing page"}, "landing page"),
+        ("nas_search", {"query": "海边照片"}, "海边照片"),
+    ],
+)
+def test_args_summary_is_derived_by_tool_type(tool_id, arguments, expected):
+    display = build_tool_start_display(tool_id, arguments)["display"]
+    assert display == {"args_summary": expected, "truncated": False}
+
+
+@pytest.mark.parametrize(
+    ("tool_id", "arguments"),
+    [
+        ("read_file", {"path": "/Users/alice/token=secret.txt"}),
+        ("terminal", {"command": "curl token=secret\ntrue"}),
+        ("browser_navigate", {"url": "https://token:secret@example.com/path"}),
+        ("search_files", {"pattern": "token=secret"}),
+        ("nas_search", {"query": "/Users/alice/document"}),
+    ],
+)
+def test_derived_args_summary_is_redacted(tool_id, arguments):
+    display = build_tool_start_display(tool_id, arguments)["display"]
+    assert "secret" not in display["args_summary"]
+    assert "alice" not in display["args_summary"]
+    assert len(display["args_summary"].encode()) <= ARGS_MAX_BYTES

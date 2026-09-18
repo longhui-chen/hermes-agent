@@ -352,7 +352,8 @@ Fields from `contracts/chat-ui/v1/golden/hermes/tool-frame.running.json` (do not
 | `item_id` | string | `"01996f2e-7b6a-7c33-9f8e-4a3d6c1b2e90"` |
 | `index` | number | `2` |
 | `source` | object | `{"kind":"mcp","id":"search","label":"Search"}` |
-| `display` | object | `{"args_summary":"query=demo","truncated":false}` |
+| `display` | object | `{"args_summary":"demo","truncated":false}` |
+| `pattern` | string | `"demo"` |
 <!-- generated:end tool-frame.running -->
 
 <!-- generated:begin tool-frame.completed -->
