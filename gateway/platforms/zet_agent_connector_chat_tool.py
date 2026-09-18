@@ -12,6 +12,10 @@ from tools.registry import registry
 _CREATE_TOOL = "connector.create_readonly_template"
 _TEMPLATE_ID_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*\Z")
 _KEY_RE = re.compile(r"[A-Za-z0-9._:-]{16,128}\Z")
+# tools/list enumerates every published provider tool. On AC that is 338 tools
+# and ~383KB, so the historic 64KB read cut the JSON mid-string and every probe
+# failed with a swallowed JSONDecodeError even though the cloud was healthy.
+_MAX_RPC_RESPONSE_BYTES = 1 << 20
 
 
 def _runtime_env() -> dict[str, str]:
@@ -52,7 +56,11 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 def _rpc(request: urllib.request.Request, timeout: float) -> dict:
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
     with opener.open(request, timeout=timeout) as response:
-        raw = response.read(64 << 10)
+        # Read one byte past the cap so an over-budget body fails as a parse
+        # error instead of silently truncating into invalid JSON.
+        raw = response.read(_MAX_RPC_RESPONSE_BYTES + 1)
+    if len(raw) > _MAX_RPC_RESPONSE_BYTES:
+        raise ValueError("connector rpc response exceeds read budget")
     parsed = json.loads(raw)
     return parsed if isinstance(parsed, dict) else {}
 
@@ -90,7 +98,9 @@ def connector_chat_create_tool(args, **kw) -> str:
         return json.dumps({"ok": False, "available": False, "code": "connector_chat_create_unavailable"})
     if action == "probe":
         try:
-            response = _call(env, "tools/list", {}, 5.0)
+            # One local->cloud roundtrip; the cross-region invoke leg measures
+            # 3-16s on AC, so sub-10s budgets cancelled in-flight probes.
+            response = _call(env, "tools/list", {}, 20.0)
             tools = (response.get("result") or {}).get("tools")
             available = isinstance(tools, list) and any(
                 isinstance(tool, dict) and tool.get("name") == _CREATE_TOOL for tool in tools

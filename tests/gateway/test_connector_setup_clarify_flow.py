@@ -25,7 +25,7 @@ def test_old_client_fails_before_publishing_an_input_request():
     runtime = adapter()
     stream = queue.Queue()
     callback = runtime._make_clarify_cb(stream, "s")
-    result = clarify_tool("ignored", connector_setup={"resource_kind": "camera"}, callback=callback)
+    result = clarify_tool("ignored", connector_setup={"resource_kind": "camera", "live": {"camera_id": "cam-1"}}, callback=callback)
     assert "connector_setup_unavailable" in result
     assert stream.empty()
     assert not runtime._clarify_queues
@@ -81,7 +81,7 @@ async def test_setup_uses_existing_pending_and_response_flow(status, observation
     callback = runtime._make_clarify_cb(stream, "s", connector_input_capable=True, camera_observation_input_capable=observation)
     setup = {"resource_kind": "camera", "observation": {
         "camera_id": "cam-1", "duration_seconds": 60, "subject_kind": "person", "predicate": "appears",
-    }} if observation else {"resource_kind": "tv"}
+    }} if observation else {"resource_kind": "camera", "live": {"camera_id": "cam-1"}}
     if observation == "recording":
         setup = {"resource_kind": "camera", "recording": {"camera_id": "cam-1"}}
     app = web.Application()
@@ -143,6 +143,6 @@ def test_ordinary_clarify_cannot_impersonate_a_secure_input_flow(capable, questi
         question,
         callback=callback,
     )
-    assert 'connector_setup_required' in result
+    assert 'connector_chat_turn_required' in result
     assert stream.empty()
     assert not runtime._clarify_queues
