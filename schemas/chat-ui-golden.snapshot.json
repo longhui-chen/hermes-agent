@@ -1,7 +1,7 @@
 {
   "snapshot_version": 2,
-  "root_commit": "8d74f38b1cdf4cae060571dfbd40cdc4d8c6a85d",
-  "sha256": "2c40b63a1e2530e19cbf9eb2649aa77b58352453d7aed4ea00b1904793f02985",
+  "root_commit": "8ff4ae7ade1e0615677e904bed09d156c4a32038",
+  "sha256": "21664d186e232c3f6f78d00719a1a27160855c3055ef1a47d9633c4f956775cb",
   "payload": {
     "golden": {
       "events": {
@@ -1066,8 +1066,7 @@
             "name": "search_files",
             "label": "搜索素材",
             "arguments": {
-              "target": "nas",
-              "query": "上周末 公园 视频"
+              "pattern": "上周末 公园 视频"
             },
             "item_id": "01996f2e-7b6a-7c33-9f8e-4a3d6c1b2e90",
             "index": 2,
@@ -1077,7 +1076,7 @@
               "label": "Search files"
             },
             "display": {
-              "args_summary": "target=nas query=demo",
+              "args_summary": "上周末 公园 视频",
               "truncated": false
             }
           }
@@ -1094,8 +1093,7 @@
             "name": "search_files",
             "label": "搜索素材",
             "arguments": {
-              "target": "nas",
-              "query": "上周末 公园 视频"
+              "pattern": "上周末 公园 视频"
             },
             "item_id": "01996f2e-7b6a-7c33-9f8e-4a3d6c1b2e90",
             "index": 2,
@@ -1105,7 +1103,7 @@
               "label": "Search"
             },
             "display": {
-              "args_summary": "query=上周末视频",
+              "args_summary": "上周末 公园 视频",
               "truncated": false
             }
           }
@@ -1931,9 +1929,10 @@
             "label": "Search"
           },
           "display": {
-            "args_summary": "query=demo",
+            "args_summary": "demo",
             "truncated": false
-          }
+          },
+          "pattern": "demo"
         }
       },
       "http": {
