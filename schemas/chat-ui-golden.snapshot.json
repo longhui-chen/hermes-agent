@@ -1,7 +1,7 @@
 {
   "snapshot_version": 2,
-  "root_commit": "3a3841b0fbb89a86e9caabbc9e8d8da8c8ed0ca9",
-  "sha256": "4313756824eb0d6930b175198155dba9efd57258cd6855513644616fca3afc33",
+  "root_commit": "6417e3aada9893ccd0570fa55b8606c637166e35",
+  "sha256": "9098a64acdbfd57c3eea6f10bee00e4b9bd1b9137e65e45cdd440c342fd76fa3",
   "payload": {
     "golden": {
       "events": {
@@ -2130,17 +2130,6 @@
               "status": "done"
             },
             {
-              "activity_id": 49,
-              "call_id": "legacy-tool",
-              "name": "legacy_search",
-              "turn_id": "turn_demo_0001",
-              "kind": "tool",
-              "created_seq": 49,
-              "updated_seq": 59,
-              "last_fanout_seq": 69,
-              "status": "done"
-            },
-            {
               "started_at": 1756972810000,
               "finished_at": 1756972811000,
               "source": {
@@ -2163,6 +2152,17 @@
               "label": "Search files",
               "item_id": "01996f2e-7b6a-7000-8000-000000000007",
               "item_index": 9,
+              "turn_id": "turn_demo_0001",
+              "kind": "tool",
+              "created_seq": 49,
+              "updated_seq": 59,
+              "last_fanout_seq": 69,
+              "status": "done"
+            },
+            {
+              "activity_id": 49,
+              "call_id": "legacy-tool",
+              "name": "legacy_search",
               "turn_id": "turn_demo_0001",
               "kind": "tool",
               "created_seq": 50,
@@ -2436,7 +2436,7 @@
             {
               "id": 1002,
               "seq": 2,
-              "last_fanout_seq": 70,
+              "last_fanout_seq": 69,
               "turn_id": "turn_demo_0001",
               "role": "tool",
               "content": "",
@@ -2468,7 +2468,7 @@
             {
               "id": 1002,
               "seq": 2,
-              "last_fanout_seq": 69,
+              "last_fanout_seq": 70,
               "turn_id": "turn_demo_0001",
               "role": "tool",
               "content": "",
@@ -2712,17 +2712,6 @@
               "status": "done"
             },
             {
-              "activity_id": 49,
-              "call_id": "legacy-tool",
-              "name": "legacy_search",
-              "turn_id": "turn_demo_0001",
-              "kind": "tool",
-              "created_seq": 49,
-              "updated_seq": 59,
-              "last_fanout_seq": 69,
-              "status": "done"
-            },
-            {
               "started_at": 1756972810000,
               "finished_at": 1756972811000,
               "source": {
@@ -2745,6 +2734,17 @@
               "label": "Search files",
               "item_id": "01996f2e-7b6a-7000-8000-000000000007",
               "item_index": 9,
+              "turn_id": "turn_demo_0001",
+              "kind": "tool",
+              "created_seq": 49,
+              "updated_seq": 59,
+              "last_fanout_seq": 69,
+              "status": "done"
+            },
+            {
+              "activity_id": 49,
+              "call_id": "legacy-tool",
+              "name": "legacy_search",
               "turn_id": "turn_demo_0001",
               "kind": "tool",
               "created_seq": 50,
@@ -5965,9 +5965,9 @@
           "text": "",
           "started_at": 1756972810000,
           "completed_at": 1756972811000,
-          "created_seq": 50,
-          "updated_seq": 60,
-          "last_fanout_seq": 70,
+          "created_seq": 49,
+          "updated_seq": 59,
+          "last_fanout_seq": 69,
           "item_index": 9,
           "item_id": "01996f2e-7b6a-7000-8000-000000000007",
           "metadata_json": "{\"pattern\":\"上周末 公园 视频\",\"source\":{\"kind\":\"builtin\",\"id\":\"search_files\",\"label\":\"Search files\"},\"display_args\":{\"args_summary\":\"上周末 公园 视频\",\"truncated\":false},\"display_result\":{\"summary\":\"Found weekend park videos\",\"content_type\":\"text\",\"truncated\":false,\"bytes\":25},\"label\":\"Search files\"}"
@@ -5982,9 +5982,9 @@
           "metadata_json": "{}",
           "started_at": 0,
           "completed_at": 0,
-          "created_seq": 49,
-          "updated_seq": 59,
-          "last_fanout_seq": 69
+          "created_seq": 50,
+          "updated_seq": 60,
+          "last_fanout_seq": 70
         }
       ]
     }
