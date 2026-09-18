@@ -53,8 +53,10 @@ def test_camera_scope_error_survives_real_execution_middleware(monkeypatch):
     assert result["authorization_status"] == "not_checked"
     assert isinstance(result["error"], str)
     execute.assert_not_called()
-    set_halt.assert_called_once()
-    assert set_halt.call_args.args[0].code == "camera_task_scope_missing"
+    # The model must see this recoverable scope error and load camsnap before
+    # retrying. Repeated identical terminal calls remain covered by the generic
+    # tool-loop guardrail; this first rejection must not terminate the turn.
+    set_halt.assert_not_called()
     # Preserve the existing event contract while making the tool payload precise.
     assert post.call_args.kwargs["error_type"] == "zet_agent_plan_mode_block"
 

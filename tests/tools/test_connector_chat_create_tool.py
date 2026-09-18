@@ -1,6 +1,9 @@
 """The Agent connector-create path uses a direct scoped RPC, never shell argv."""
 
 import json
+import urllib.request
+
+import pytest
 
 from gateway.platforms import zet_agent_connector_chat_tool as connector_tool
 
@@ -12,6 +15,54 @@ def _env() -> dict[str, str]:
         "ZETTLAB_CONNECTOR_SESSION_ID": "chat-1",
         "ZETTLAB_TURN_ID": "turn-1",
     }
+
+
+class _FakeResponse:
+    def __init__(self, body: bytes):
+        self._body = body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def read(self, n: int = -1) -> bytes:
+        return self._body[:n] if n > 0 else self._body
+
+
+def _fake_transport(monkeypatch, body: bytes):
+    holder = {"timeout": None}
+
+    class _FakeOpener:
+        def open(self, request, timeout):
+            holder["timeout"] = timeout
+            return _FakeResponse(body)
+
+    monkeypatch.setattr(urllib.request, "build_opener", lambda *a, **k: _FakeOpener())
+    return holder
+
+
+def test_connector_rpc_parses_tools_list_within_read_budget(monkeypatch):
+    holder = _fake_transport(monkeypatch, json.dumps({
+        "result": {"tools": [{"name": "connector.create_readonly_template"}]},
+    }).encode())
+    monkeypatch.setattr(connector_tool, "_runtime_env", _env)
+
+    response = connector_tool._call(_env(), "tools/list", {}, 20.0)
+    assert response["result"]["tools"][0]["name"] == "connector.create_readonly_template"
+    assert holder["timeout"] == 20.0
+
+
+def test_connector_rpc_fails_closed_when_response_exceeds_read_budget(monkeypatch):
+    # AC publishes 338 tools (~383KB); the historic 64KB read silently
+    # truncated the JSON mid-string. An over-budget body must surface as an
+    # error, never as a swallowed parse failure on truncated bytes.
+    _fake_transport(monkeypatch, b"x" * (connector_tool._MAX_RPC_RESPONSE_BYTES + 10))
+    monkeypatch.setattr(connector_tool, "_runtime_env", _env)
+
+    with pytest.raises(ValueError):
+        connector_tool._call(_env(), "tools/list", {}, 20.0)
 
 
 def test_connector_chat_create_full_capability_flow_keeps_secret_out_of_result(monkeypatch):
