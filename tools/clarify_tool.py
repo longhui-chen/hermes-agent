@@ -167,11 +167,13 @@ def clarify_tool(
         try:
             intent = normalize_connector_setup(connector_setup)
             if choices or multi_select or "connector_setup" not in inspect.signature(callback).parameters:
+                # zettlab-overlay(connector-chat-cleanup): point software setup at ordinary Chat turns; upstream: none
                 return tool_error("connector_setup_unavailable: software Connector setup belongs in ordinary Chat turns, not clarify")
             raw_response = callback("Connector setup", None, connector_setup=intent)
             return connector_setup_result(raw_response)
         except Exception:
             # Neither callback errors nor arbitrary responses may echo credentials.
+            # zettlab-overlay(connector-chat-cleanup): same Chat-turn guidance on the failure path; upstream: none
             return tool_error("connector_setup_unavailable: software Connector setup belongs in ordinary Chat turns, not clarify")
 
     try:
