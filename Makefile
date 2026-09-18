@@ -127,6 +127,7 @@ ZPK_ROOT_EXCLUDES := \
 	--exclude=./.claude \
 	--exclude=./.codex \
 	--exclude=./.agents \
+	--exclude=./.gitnexus \
 	--exclude=./AGENTS.md \
 	--exclude=./CLAUDE.md \
 	--exclude=./build \
