@@ -1,7 +1,7 @@
 {
   "snapshot_version": 2,
-  "root_commit": "8ff4ae7ade1e0615677e904bed09d156c4a32038",
-  "sha256": "21664d186e232c3f6f78d00719a1a27160855c3055ef1a47d9633c4f956775cb",
+  "root_commit": "3a3841b0fbb89a86e9caabbc9e8d8da8c8ed0ca9",
+  "sha256": "4313756824eb0d6930b175198155dba9efd57258cd6855513644616fca3afc33",
   "payload": {
     "golden": {
       "events": {
@@ -2139,6 +2139,36 @@
               "updated_seq": 59,
               "last_fanout_seq": 69,
               "status": "done"
+            },
+            {
+              "started_at": 1756972810000,
+              "finished_at": 1756972811000,
+              "source": {
+                "kind": "builtin",
+                "id": "search_files",
+                "label": "Search files"
+              },
+              "display_args": {
+                "args_summary": "上周末 公园 视频"
+              },
+              "display_result": {
+                "summary": "Found weekend park videos",
+                "content_type": "text",
+                "truncated": false,
+                "bytes": 25
+              },
+              "activity_id": 50,
+              "call_id": "hp_t_demo_0002",
+              "name": "search_files",
+              "label": "Search files",
+              "item_id": "01996f2e-7b6a-7000-8000-000000000007",
+              "item_index": 9,
+              "turn_id": "turn_demo_0001",
+              "kind": "tool",
+              "created_seq": 50,
+              "updated_seq": 60,
+              "last_fanout_seq": 70,
+              "status": "done"
             }
           ]
         },
@@ -2406,6 +2436,38 @@
             {
               "id": 1002,
               "seq": 2,
+              "last_fanout_seq": 70,
+              "turn_id": "turn_demo_0001",
+              "role": "tool",
+              "content": "",
+              "tool_call": {
+                "label": "Search files",
+                "name": "search_files",
+                "call_id": "hp_t_demo_0002",
+                "status": "success",
+                "item_id": "01996f2e-7b6a-7000-8000-000000000007",
+                "item_index": 9,
+                "source": {
+                  "kind": "builtin",
+                  "id": "search_files",
+                  "label": "Search files"
+                },
+                "display_args": {
+                  "args_summary": "上周末 公园 视频"
+                },
+                "display_result": {
+                  "summary": "Found weekend park videos",
+                  "content_type": "text",
+                  "truncated": false,
+                  "bytes": 25
+                },
+                "started_at": 1756972810000,
+                "finished_at": 1756972811000
+              }
+            },
+            {
+              "id": 1002,
+              "seq": 2,
               "last_fanout_seq": 69,
               "turn_id": "turn_demo_0001",
               "role": "tool",
@@ -2658,6 +2720,36 @@
               "created_seq": 49,
               "updated_seq": 59,
               "last_fanout_seq": 69,
+              "status": "done"
+            },
+            {
+              "started_at": 1756972810000,
+              "finished_at": 1756972811000,
+              "source": {
+                "kind": "builtin",
+                "id": "search_files",
+                "label": "Search files"
+              },
+              "display_args": {
+                "args_summary": "上周末 公园 视频"
+              },
+              "display_result": {
+                "summary": "Found weekend park videos",
+                "content_type": "text",
+                "truncated": false,
+                "bytes": 25
+              },
+              "activity_id": 50,
+              "call_id": "hp_t_demo_0002",
+              "name": "search_files",
+              "label": "Search files",
+              "item_id": "01996f2e-7b6a-7000-8000-000000000007",
+              "item_index": 9,
+              "turn_id": "turn_demo_0001",
+              "kind": "tool",
+              "created_seq": 50,
+              "updated_seq": 60,
+              "last_fanout_seq": 70,
               "status": "done"
             }
           ]
@@ -5863,6 +5955,22 @@
           "last_fanout_seq": 68,
           "item_index": 8,
           "metadata_json": "{\"title\":\"剪辑 vlog\",\"groups\":[{\"icon\":\"🎬\",\"label\":\"素材\",\"count\":1,\"items\":[\"挑选 4 段\"]}],\"plan_id\":\"plan_demo_0001\",\"status\":\"pending\",\"revision_requested\":false}"
+        },
+        {
+          "id": 50,
+          "kind": "tool",
+          "call_id": "hp_t_demo_0002",
+          "name": "search_files",
+          "status": "done",
+          "text": "",
+          "started_at": 1756972810000,
+          "completed_at": 1756972811000,
+          "created_seq": 50,
+          "updated_seq": 60,
+          "last_fanout_seq": 70,
+          "item_index": 9,
+          "item_id": "01996f2e-7b6a-7000-8000-000000000007",
+          "metadata_json": "{\"pattern\":\"上周末 公园 视频\",\"source\":{\"kind\":\"builtin\",\"id\":\"search_files\",\"label\":\"Search files\"},\"display_args\":{\"args_summary\":\"上周末 公园 视频\",\"truncated\":false},\"display_result\":{\"summary\":\"Found weekend park videos\",\"content_type\":\"text\",\"truncated\":false,\"bytes\":25},\"label\":\"Search files\"}"
         },
         {
           "id": 49,

@@ -145,20 +145,46 @@ def source_from_registration(tool_id: str, registration: Mapping[str, Any] | Non
     return {"kind": kind, "id": _display_text(source_id, _SOURCE_MAX_BYTES)[0], "label": _display_text(label, _SOURCE_MAX_BYTES)[0]}
 
 
-def _args_summary_source(tool_id: str, arguments: Any) -> Any:
+def _terminal_args_summary(command: str) -> tuple[str, bool]:
+    """Scan only the display budget; never materialize every input line."""
+    first = ""
+    current: list[str] = []
+    count = 0
+    scanned = 0
+    for char in islice(command, ARGS_MAX_BYTES + 1):
+        scanned += 1
+        if char in {"\r", "\n"}:
+            if current:
+                count += 1
+                if not first:
+                    first = "".join(current)
+                current.clear()
+            continue
+        if len(current) < ARGS_MAX_BYTES:
+            current.append(char)
+    if current:
+        count += 1
+        if not first:
+            first = "".join(current)
+    if scanned > ARGS_MAX_BYTES:
+        return "[TRUNCATED]", True
+    if count == 0:
+        return command, False
+    return first if count == 1 else f"{first} + {count - 1}", False
+
+
+def _args_summary_source(tool_id: str, arguments: Any) -> tuple[Any, bool]:
     """Select one human-useful field per known tool before redaction."""
     if not isinstance(arguments, Mapping):
-        return arguments
+        return arguments, False
     if tool_id == "read_file":
         path = arguments.get("path")
         if isinstance(path, str):
-            return path.replace("\\", "/").rsplit("/", 1)[-1]
+            return path.replace("\\", "/").rsplit("/", 1)[-1], False
     elif tool_id == "terminal":
         command = arguments.get("command")
         if isinstance(command, str):
-            lines = [line.strip() for line in command.splitlines() if line.strip()]
-            if lines:
-                return lines[0] if len(lines) == 1 else f"{lines[0]} + {len(lines) - 1}"
+            return _terminal_args_summary(command)
     elif tool_id.startswith("browser_"):
         url = arguments.get("url")
         if isinstance(url, str):
@@ -167,18 +193,19 @@ def _args_summary_source(tool_id: str, arguments: Any) -> Any:
             except ValueError:
                 host = ""
             if host:
-                return host
+                return host, False
     elif tool_id in {"search_files", "nas_search"}:
         for key in ("query", "pattern"):
             value = arguments.get(key)
             if isinstance(value, str):
-                return value
-    return arguments
+                return value, False
+    return arguments, False
 
 
 def args_summary(arguments: Any, *, tool_id: str = "") -> dict[str, Any]:
-    text, truncated, _ = _display_text(_args_summary_source(tool_id, arguments), ARGS_MAX_BYTES)
-    return {"args_summary": text, "truncated": truncated}
+    source, source_cut = _args_summary_source(tool_id, arguments)
+    text, truncated, _ = _display_text(source, ARGS_MAX_BYTES)
+    return {"args_summary": text, "truncated": source_cut or truncated}
 
 
 # Bound JSON parsing and line inspection independently of the emitted summary.
