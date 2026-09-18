@@ -300,12 +300,17 @@ async def test_bt_counters_reach_existing_health_from_request_writers(monkeypatc
     monkeypatch.setattr("gateway.status.read_runtime_status", lambda: {})
     monkeypatch.setattr("gateway.run._resolve_gateway_model", lambda: "test/model")
     monkeypatch.setattr(api_server, "collect_runtime_readiness", lambda **kwargs: {"status": "ok"})
+    route_table = adapter._http_route_table()
+    assert ("GET", "/health/detailed", adapter._handle_health_detailed) in route_table
+    assert not any(path == "/internal/hermes/health/detailed" for _, path, _ in route_table)
     app = web.Application()
     app.router.add_get("/health/detailed", adapter._handle_health_detailed)
     async with TestClient(TestServer(app)) as client:
         response = await client.get("/health/detailed")
         assert response.status == 200
-        actual = (await response.json())["interaction_metrics"]
+        body = await response.json()
+        assert body["version"]
+        actual = body["interaction_metrics"]
     assert actual == {
         "item_frame_stranded": 2,
         "item_frame_unregistered": 2,
