@@ -2,17 +2,8 @@
 
 import pytest
 
-from gateway.platforms.api_server import (
-    _extract_requested_execution_policy,
-    _extract_plan_ack,
-    _extract_plan_auto_execute,
-    _extract_response_mode,
-    _extract_turn_id,
-    MAX_CANONICAL_FINAL_TURN_ID_LEN,
-    MAX_TURN_ID_LEN,
-    _normalize_chat_content,
-    _resolve_plan_auto_execute,
-)
+from gateway.platforms.zet_agent import _extract_requested_execution_policy, _extract_turn_id, MAX_CANONICAL_FINAL_TURN_ID_LEN, MAX_TURN_ID_LEN
+from gateway.platforms.api_server import _extract_plan_ack, _extract_plan_auto_execute, _extract_response_mode, _normalize_chat_content, _resolve_plan_auto_execute
 class TestExtractExecutionPolicy:
     def test_requested_policy_is_only_an_explicit_transport_signal(self):
         assert _extract_requested_execution_policy({}) == ""

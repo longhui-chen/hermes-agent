@@ -71,6 +71,8 @@ Fields from `contracts/chat-ui/v1/golden/hermes/reasoning.delta.json` (do not ed
 | `type` | string | `"reasoning.delta"` |
 | `turn_id` | string | `"turn_demo_0001"` |
 | `text` | string | `"用户要剪 vlog，先确认时间范围。"` |
+| `item_id` | string | `"01996f2e-7b6a-7c31-9f8e-4a3d6c1b2e90"` |
+| `index` | number | `0` |
 <!-- generated:end reasoning.delta -->
 
 | Field | Type | Req | Meaning |
@@ -90,6 +92,7 @@ Fields from `contracts/chat-ui/v1/golden/hermes/conversation.title.json` (do not
 | `type` | string | `"conversation.title"` |
 | `turn_id` | string | `"turn_demo_0001"` |
 | `title` | string | `"周末公园 vlog"` |
+| `index` | number | `10` |
 <!-- generated:end conversation.title -->
 
 | Field | Type | Req | Meaning |
@@ -117,6 +120,8 @@ Fields from `contracts/chat-ui/v1/golden/hermes/context.compaction.json` (do not
 | `after_messages` | number | `12` |
 | `after_tokens` | number | `6000` |
 | `error` | string | `""` |
+| `index` | number | `8` |
+| `context_measurement` | string | `"unknown"` |
 <!-- generated:end context.compaction -->
 
 | Field | Type | Req | Meaning |
@@ -136,8 +141,11 @@ Fields from `contracts/chat-ui/v1/golden/hermes/steer_dropped.json` (do not edit
 | Field | Wire type | Golden sample |
 |---|---|---|
 | `type` | string | `"steer_dropped"` |
+| `steer_id` | string | `"01998f2d-7c00-7000-8000-000000000001"` |
 | `turn_id` | string | `"turn_demo_0001"` |
 | `text` | string | `"顺便加上字幕"` |
+| `reason` | string | `"unconsumed"` |
+| `index` | number | `11` |
 <!-- generated:end steer_dropped -->
 
 | Field | Type | Req | Meaning |
@@ -163,9 +171,10 @@ Fields from `contracts/chat-ui/v1/golden/hermes/hermes.approval.json` (do not ed
 | `command` | string | `"rm -rf /sandbox/demo/tmp"` |
 | `description` | string | `"清理临时目录"` |
 | `pattern_key` | string | `"rm"` |
-| `pattern_keys` | array | `["rm", "rm -rf"]` |
+| `pattern_keys` | array | `["rm","rm -rf"]` |
 | `expires_at_ms` | number | `1756973100000` |
 | `validation_target` | string | `"terminal"` |
+| `index` | number | `7` |
 <!-- generated:end hermes.approval -->
 
 | Field | Type | Req | Meaning |
@@ -198,10 +207,12 @@ Fields from `contracts/chat-ui/v1/golden/hermes/hermes.clarify.json` (do not edi
 | `interaction_id` | string | `"ia_demo_0002"` |
 | `interaction_generation` | number | `2` |
 | `interaction_delivery_version` | number | `1` |
-| `question` | string | `"周末指哪两天？"` |
-| `choices_offered` | array | `["上周末", "本周末"]` |
+| `question` | string | `"Connector setup"` |
+| `choices_offered` | array | `[]` |
 | `expires_at_ms` | number | `1756973100000` |
 | `turn_id` | string | `"turn_demo_0001"` |
+| `connector_setup` | object | `{"resource_kind":"camera"}` |
+| `index` | number | `6` |
 <!-- generated:end hermes.clarify -->
 
 | Field | Type | Req | Meaning |
@@ -224,8 +235,11 @@ Fields from `contracts/chat-ui/v1/golden/hermes/hermes.todo.json` (do not edit; 
 |---|---|---|
 | `type` | string | `"hermes.todo"` |
 | `turn_id` | string | `"turn_demo_0001"` |
-| `todos` | array | `[{"id": "todo_1", "content": "挑选 4 段素材", "status": "in_progr` |
-| `summary` | object | `{"total": 3, "pending": 2, "in_progress": 1, "completed": 0,` |
+| `todos` | array | `[{"id":"todo_1","content":"挑选 4 段素材","status":"in_progress","group_index":0,"plan_id":"plan_demo_0001"}]` |
+| `summary` | object | `{"total":3,"pending":2,"in_progress":1,"completed":0,"cancelled":0}` |
+| `item_id` | string | `"01996f2e-7b6a-7c34-9f8e-4a3d6c1b2e90"` |
+| `index` | number | `3` |
+| `v` | number | `1` |
 <!-- generated:end hermes.todo -->
 
 | Field | Type | Req | Meaning |
@@ -244,8 +258,9 @@ Fields from `contracts/chat-ui/v1/golden/hermes/hermes.plan.json` (do not edit; 
 | `turn_id` | string | `"turn_demo_0001"` |
 | `plan_id` | string | `"plan_demo_0001"` |
 | `title` | string | `"剪辑 vlog"` |
-| `groups` | array | `[{"icon": "🎬", "label": "素材", "count": 1, "items": ["挑选 4 段"` |
+| `groups` | array | `[{"icon":"🎬","label":"素材","count":1,"items":["挑选 4 段"]}]` |
 | `auto_execute` | boolean | `false` |
+| `index` | number | `9` |
 <!-- generated:end hermes.plan -->
 
 | Field | Type | Req | Meaning |
@@ -267,7 +282,8 @@ Fields from `contracts/chat-ui/v1/golden/hermes/hermes.attachment.json` (do not 
 |---|---|---|
 | `type` | string | `"hermes.attachment"` |
 | `turn_id` | string | `"turn_demo_0001"` |
-| `attachment` | object | `{"id": "mc-turn_demo_0001", "kind": "memory.citations", "v":` |
+| `attachment` | object | `{"id":"mc-turn_demo_0001","kind":"memory.citations","v":1,"state":"active","payload":{"items":[{"id":"mem_demo_0001","title":"用户偏好：vlog 风格轻快","snippet":"上次剪辑选择了轻快风格"}]}}` |
+| `index` | number | `5` |
 <!-- generated:end hermes.attachment -->
 
 | Field | Type | Req | Meaning |
@@ -303,6 +319,9 @@ Fields from `contracts/chat-ui/v1/golden/hermes/hermes.delegation.progress.json`
 | `parent_id` | string | `"sub_demo_root"` |
 | `depth` | number | `1` |
 | `exit_reason` | string | `""` |
+| `item_id` | string | `"01996f2e-7b6a-7c35-9f8e-4a3d6c1b2e90"` |
+| `index` | number | `4` |
+| `v` | number | `1` |
 <!-- generated:end hermes.delegation.progress -->
 
 | Field | Type | Req | Meaning |
@@ -331,6 +350,11 @@ Fields from `contracts/chat-ui/v1/golden/hermes/tool-frame.running.json` (do not
 | `label` | string | `"搜索素材"` |
 | `toolCallId` | string | `"call_demo_0001"` |
 | `status` | string | `"running"` |
+| `item_id` | string | `"01996f2e-7b6a-7c33-9f8e-4a3d6c1b2e90"` |
+| `index` | number | `2` |
+| `source` | object | `{"kind":"mcp","id":"search","label":"Search"}` |
+| `display` | object | `{"args_summary":"demo","truncated":false}` |
+| `pattern` | string | `"demo"` |
 <!-- generated:end tool-frame.running -->
 
 <!-- generated:begin tool-frame.completed -->
@@ -342,10 +366,13 @@ Fields from `contracts/chat-ui/v1/golden/hermes/tool-frame.completed.json` (do n
 | `toolCallId` | string | `"call_demo_0002"` |
 | `status` | string | `"completed"` |
 | `outcome` | string | `"success"` |
-| `output` | object | `{"success": true, "host_image": "/sandbox/demo/agent_output/` |
-| `ui_hint` | object | `{"type": "takeover_browser", "agent_id": "agent_demo_0001", ` |
-| `browserState` | object | `{"url": "https://example.invalid/"}` |
-| `browserContentEvidence` | object | `{"text": "demo"}` |
+| `output` | object | `{"success":true,"host_image":"/sandbox/demo/agent_output/sess_demo_0001/cover.png"}` |
+| `ui_hint` | object | `{"type":"takeover_browser","agent_id":"agent_demo_0001","browser_session_id":"bs_demo_0001","tab_id":"tab_demo_0001"}` |
+| `browserState` | object | `{"url":"https://example.invalid/"}` |
+| `browserContentEvidence` | object | `{"text":"demo"}` |
+| `item_id` | string | `"01996f2e-7b6a-7c33-9f8e-4a3d6c1b2e90"` |
+| `index` | number | `2` |
+| `display` | object | `{"summary":"Result: Generated cover image","content_type":"text","truncated":false}` |
 <!-- generated:end tool-frame.completed -->
 
 <!-- generated:begin tool-frame.error -->
@@ -361,8 +388,11 @@ Fields from `contracts/chat-ui/v1/golden/hermes/tool-frame.error.json` (do not e
 | `errorCode` | string | `"unauthorized"` |
 | `statusCode` | number | `401` |
 | `provider` | string | `"google_drive"` |
-| `connector_error` | object | `{"provider": "google_drive", "status": 401, "code": "unautho` |
-| `output` | object | `{"success": false}` |
+| `connector_error` | object | `{"provider":"google_drive","status":401,"code":"unauthorized","message":"token expired","nextAction":"reconnect"}` |
+| `output` | object | `{"success":false}` |
+| `item_id` | string | `"01996f2e-7b6a-7c33-9f8e-4a3d6c1b2e90"` |
+| `index` | number | `2` |
+| `display` | object | `{"summary":"Error: connector returned 401","content_type":"error","truncated":false,"bytes":22}` |
 <!-- generated:end tool-frame.error -->
 
 Built by upstream `api_server.py` (`_on_tool_start` / `_on_tool_complete`
@@ -428,3 +458,50 @@ finish chunk as confirmation.
 `metadata.turn_id` (video_edit workflow key), `X-Zettlab-Turn-Id` outside
 agent-search, `tool.result.output.ui_hint`, `goal.status`,
 `message.appended` outside clarify, `attachment.action.ack`.
+
+
+## BT item lifecycle and content identity
+
+The request-local writer assigns `index` after queue ordering. New identities use a strictly increasing index; updates reuse their original index. Text and reasoning carry `item.started` / `item.completed`; tool frames reuse `toolCallId`, and delegation uses `subagent_id` from `_DELEGATION_PROGRESS_FIELDS`. Todo and delegation versions increase per item. Content chunks carry the projection-owned `hermes.item_id` and `hermes.index`. Canonical finalization follows queued content and transformed suffixes before the terminal chunk.
+
+<!-- generated:begin item.started -->
+Fields from `contracts/chat-ui/v1/golden/hermes/item.started.json` (do not edit; regenerated by the manifest test):
+
+| Field | Wire type | Golden sample |
+|---|---|---|
+| `type` | string | `"item.started"` |
+| `turn_id` | string | `"turn_demo_0001"` |
+| `kind` | string | `"reasoning"` |
+| `item_id` | string | `"01996f2e-7b6a-7c31-9f8e-4a3d6c1b2e90"` |
+| `index` | number | `0` |
+| `started_at` | number | `1756972800000` |
+<!-- generated:end item.started -->
+
+<!-- generated:begin item.completed -->
+Fields from `contracts/chat-ui/v1/golden/hermes/item.completed.json` (do not edit; regenerated by the manifest test):
+
+| Field | Wire type | Golden sample |
+|---|---|---|
+| `type` | string | `"item.completed"` |
+| `turn_id` | string | `"turn_demo_0001"` |
+| `kind` | string | `"reasoning"` |
+| `item_id` | string | `"01996f2e-7b6a-7c31-9f8e-4a3d6c1b2e90"` |
+| `index` | number | `0` |
+| `text` | string | `"思考片段"` |
+| `finished_at` | number | `1756972801000` |
+| `snapshot_omitted` | boolean | `false` |
+| `canonical` | boolean | `false` |
+<!-- generated:end item.completed -->
+
+<!-- generated:begin content-chunk -->
+Fields from `contracts/chat-ui/v1/golden/hermes/content-chunk.json` (do not edit; regenerated by the manifest test):
+
+| Field | Wire type | Golden sample |
+|---|---|---|
+| `id` | string | `"chatcmpl_demo_0001"` |
+| `object` | string | `"chat.completion.chunk"` |
+| `created` | number | `1756972800` |
+| `model` | string | `"demo-model"` |
+| `choices` | array | `[{"index":0,"delta":{"content":"答复片段"},"finish_reason":null}]` |
+| `hermes` | object | `{"item_id":"01996f2e-7b6a-7c32-9f8e-4a3d6c1b2e90","index":1}` |
+<!-- generated:end content-chunk -->

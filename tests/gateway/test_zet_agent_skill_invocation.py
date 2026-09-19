@@ -26,7 +26,7 @@ from aiohttp.test_utils import TestClient, TestServer
 import agent.skill_commands as skill_commands
 from gateway.config import PlatformConfig
 from gateway.platforms.api_server import APIServerAdapter
-from gateway.platforms.api_server import _strip_skill_display_token
+from gateway.platforms.zet_agent import _strip_skill_display_token
 from gateway.platforms.zet_agent import ZetAgentAdapter
 
 

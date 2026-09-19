@@ -1,7 +1,7 @@
 {
   "snapshot_version": 2,
-  "root_commit": "c009eaea1def79b90063f98aa9f11a5e72e05214",
-  "sha256": "aa5720235cbb40c63d95e353625727b1f04c156b6fdbcddb3f72cb459dab8b56",
+  "root_commit": "2e705f270e3364f3976a326619cd67321b949515",
+  "sha256": "7781ecd6da1d9ebdd9ac5019c1b36d98eda74bd8f1d81ea5c468278c8863bac1",
   "payload": {
     "golden": {
       "events": {
@@ -60,7 +60,8 @@
             "validation_target": "terminal",
             "expires_at_ms": 1756973100000,
             "state": "cancelled",
-            "state_reason": "delivery_failed"
+            "state_reason": "delivery_failed",
+            "index": 7
           }
         },
         "approval.cancelled.session_reset": {
@@ -82,7 +83,8 @@
             "validation_target": "terminal",
             "expires_at_ms": 1756973100000,
             "state": "cancelled",
-            "state_reason": "session_reset"
+            "state_reason": "session_reset",
+            "index": 7
           }
         },
         "approval.cancelled.turn_interrupted": {
@@ -104,7 +106,8 @@
             "validation_target": "terminal",
             "expires_at_ms": 1756973100000,
             "state": "cancelled",
-            "state_reason": "turn_interrupted"
+            "state_reason": "turn_interrupted",
+            "index": 7
           }
         },
         "approval.expired.timeout": {
@@ -126,7 +129,8 @@
             "validation_target": "terminal",
             "expires_at_ms": 1756973100000,
             "state": "expired",
-            "state_reason": "timeout"
+            "state_reason": "timeout",
+            "index": 7
           }
         },
         "approval": {
@@ -148,7 +152,8 @@
             "validation_target": "terminal",
             "expires_at_ms": 1756973100000,
             "state": "",
-            "state_reason": ""
+            "state_reason": "",
+            "index": 7
           }
         },
         "approval.runtime_lost.gateway_restart": {
@@ -170,7 +175,8 @@
             "validation_target": "terminal",
             "expires_at_ms": 1756973100000,
             "state": "runtime_lost",
-            "state_reason": "gateway_restart"
+            "state_reason": "gateway_restart",
+            "index": 7
           }
         },
         "approval.runtime_lost.request_unknown": {
@@ -192,7 +198,8 @@
             "validation_target": "terminal",
             "expires_at_ms": 1756973100000,
             "state": "runtime_lost",
-            "state_reason": "request_unknown"
+            "state_reason": "request_unknown",
+            "index": 7
           }
         },
         "attachment.action.ack": {
@@ -219,7 +226,7 @@
           "backend": "hermes",
           "data": {
             "attachment": {
-              "id": "cg-proposal_demo_0001",
+              "id": "mc-turn_demo_0001",
               "category": "interactive",
               "kind": "connector.connect",
               "v": 1,
@@ -251,7 +258,8 @@
               },
               "dedup_key": "connector:notion",
               "fallback_text": "连接 Notion 以继续"
-            }
+            },
+            "index": 5
           }
         },
         "capabilities": {
@@ -266,7 +274,8 @@
             "steer": true,
             "multiple_quotes": false,
             "delegation": true,
-            "attachments": true
+            "attachments": true,
+            "contract_version": 1
           }
         },
         "chat.send.ack": {
@@ -314,7 +323,7 @@
           "ts": 1756972800000,
           "backend": "hermes",
           "data": {
-            "clarify_id": "clr_demo_0001",
+            "clarify_id": "ia_demo_0002",
             "question": "周末指哪两天？",
             "choices_offered": [
               "上周末",
@@ -323,7 +332,8 @@
             "expires_at_ms": 1756973100000,
             "state": "cancelled",
             "state_reason": "delivery_failed",
-            "connector_setup": null
+            "connector_setup": null,
+            "index": 6
           }
         },
         "clarify.cancelled.session_reset": {
@@ -334,7 +344,7 @@
           "ts": 1756972800000,
           "backend": "hermes",
           "data": {
-            "clarify_id": "clr_demo_0001",
+            "clarify_id": "ia_demo_0002",
             "question": "周末指哪两天？",
             "choices_offered": [
               "上周末",
@@ -343,7 +353,8 @@
             "expires_at_ms": 1756973100000,
             "state": "cancelled",
             "state_reason": "session_reset",
-            "connector_setup": null
+            "connector_setup": null,
+            "index": 6
           }
         },
         "clarify.cancelled.turn_interrupted": {
@@ -354,7 +365,7 @@
           "ts": 1756972800000,
           "backend": "hermes",
           "data": {
-            "clarify_id": "clr_demo_0001",
+            "clarify_id": "ia_demo_0002",
             "question": "周末指哪两天？",
             "choices_offered": [
               "上周末",
@@ -363,7 +374,8 @@
             "expires_at_ms": 1756973100000,
             "state": "cancelled",
             "state_reason": "turn_interrupted",
-            "connector_setup": null
+            "connector_setup": null,
+            "index": 6
           }
         },
         "clarify.connector-setup": {
@@ -374,7 +386,7 @@
           "ts": 1756972800000,
           "backend": "hermes",
           "data": {
-            "clarify_id": "clr_demo_0001",
+            "clarify_id": "ia_demo_0002",
             "question": "Connector setup",
             "choices_offered": [],
             "expires_at_ms": 1756973100000,
@@ -382,7 +394,8 @@
             "state_reason": "",
             "connector_setup": {
               "resource_kind": "camera"
-            }
+            },
+            "index": 6
           }
         },
         "clarify.expired.timeout": {
@@ -393,7 +406,7 @@
           "ts": 1756972800000,
           "backend": "hermes",
           "data": {
-            "clarify_id": "clr_demo_0001",
+            "clarify_id": "ia_demo_0002",
             "question": "周末指哪两天？",
             "choices_offered": [
               "上周末",
@@ -402,7 +415,8 @@
             "expires_at_ms": 1756973100000,
             "state": "expired",
             "state_reason": "timeout",
-            "connector_setup": null
+            "connector_setup": null,
+            "index": 6
           }
         },
         "clarify": {
@@ -413,7 +427,7 @@
           "ts": 1756972800000,
           "backend": "hermes",
           "data": {
-            "clarify_id": "clr_demo_0001",
+            "clarify_id": "ia_demo_0002",
             "question": "周末指哪两天？",
             "choices_offered": [
               "上周末",
@@ -422,7 +436,8 @@
             "expires_at_ms": 1756973100000,
             "state": "",
             "state_reason": "",
-            "connector_setup": null
+            "connector_setup": null,
+            "index": 6
           }
         },
         "clarify.runtime_lost.gateway_restart": {
@@ -433,7 +448,7 @@
           "ts": 1756972800000,
           "backend": "hermes",
           "data": {
-            "clarify_id": "clr_demo_0001",
+            "clarify_id": "ia_demo_0002",
             "question": "周末指哪两天？",
             "choices_offered": [
               "上周末",
@@ -442,7 +457,8 @@
             "expires_at_ms": 1756973100000,
             "state": "runtime_lost",
             "state_reason": "gateway_restart",
-            "connector_setup": null
+            "connector_setup": null,
+            "index": 6
           }
         },
         "clarify.runtime_lost.request_unknown": {
@@ -453,7 +469,7 @@
           "ts": 1756972800000,
           "backend": "hermes",
           "data": {
-            "clarify_id": "clr_demo_0001",
+            "clarify_id": "ia_demo_0002",
             "question": "周末指哪两天？",
             "choices_offered": [
               "上周末",
@@ -462,7 +478,8 @@
             "expires_at_ms": 1756973100000,
             "state": "runtime_lost",
             "state_reason": "request_unknown",
-            "connector_setup": null
+            "connector_setup": null,
+            "index": 6
           }
         },
         "context.compaction": {
@@ -476,7 +493,8 @@
             "state": "done",
             "message": "上下文已压缩",
             "old_session_id": "sess_demo_0001",
-            "new_session_id": "sess_demo_0002"
+            "new_session_id": "sess_demo_0002",
+            "index": 8
           }
         },
         "conversation.title": {
@@ -485,7 +503,8 @@
           "backend": "hermes",
           "data": {
             "title": "周末公园 vlog",
-            "session_id": "sess_demo_0001"
+            "session_id": "sess_demo_0001",
+            "index": 10
           }
         },
         "delegation.status": {
@@ -509,7 +528,10 @@
             "tool": "terminal",
             "preview": "ls /sandbox/demo",
             "status": "running",
-            "duration_seconds": 3.5
+            "duration_seconds": 3.5,
+            "item_id": "01996f2e-7b6a-7c35-9f8e-4a3d6c1b2e90",
+            "index": 4,
+            "v": 1
           }
         },
         "delegation.summary": {
@@ -615,6 +637,99 @@
             "revision_requested": false
           }
         },
+        "item.completed": {
+          "type": "item.completed",
+          "turn_id": "turn_demo_0001",
+          "seq": 40,
+          "fanout_seq": 40,
+          "ts": 1756972800000,
+          "backend": "hermes",
+          "data": {
+            "kind": "reasoning",
+            "item_id": "01996f2e-7b6a-7c31-9f8e-4a3d6c1b2e90",
+            "index": 0,
+            "text": "思考片段",
+            "finished_at": 1756972801000,
+            "snapshot_omitted": false,
+            "canonical": false
+          }
+        },
+        "item.completed.reasoning": {
+          "type": "item.completed",
+          "turn_id": "turn_demo_0001",
+          "seq": 40,
+          "fanout_seq": 40,
+          "ts": 1756972800000,
+          "backend": "hermes",
+          "data": {
+            "kind": "reasoning",
+            "item_id": "01996f2e-7b6a-7c31-9f8e-4a3d6c1b2e90",
+            "index": 0,
+            "text": "思考片段",
+            "finished_at": 1756972801000,
+            "snapshot_omitted": false,
+            "canonical": false
+          }
+        },
+        "item.completed.text": {
+          "type": "item.completed",
+          "turn_id": "turn_demo_0001",
+          "seq": 41,
+          "fanout_seq": 41,
+          "ts": 1756972800000,
+          "backend": "hermes",
+          "data": {
+            "kind": "text",
+            "item_id": "01996f2e-7b6a-7c32-9f8e-4a3d6c1b2e90",
+            "index": 1,
+            "text": "答复片段",
+            "finished_at": 1756972801000,
+            "snapshot_omitted": false,
+            "canonical": true
+          }
+        },
+        "item.started": {
+          "type": "item.started",
+          "turn_id": "turn_demo_0001",
+          "seq": 40,
+          "fanout_seq": 40,
+          "ts": 1756972800000,
+          "backend": "hermes",
+          "data": {
+            "kind": "reasoning",
+            "item_id": "01996f2e-7b6a-7c31-9f8e-4a3d6c1b2e90",
+            "index": 0,
+            "started_at": 1756972800000
+          }
+        },
+        "item.started.reasoning": {
+          "type": "item.started",
+          "turn_id": "turn_demo_0001",
+          "seq": 40,
+          "fanout_seq": 40,
+          "ts": 1756972800000,
+          "backend": "hermes",
+          "data": {
+            "kind": "reasoning",
+            "item_id": "01996f2e-7b6a-7c31-9f8e-4a3d6c1b2e90",
+            "index": 0,
+            "started_at": 1756972800000
+          }
+        },
+        "item.started.text": {
+          "type": "item.started",
+          "turn_id": "turn_demo_0001",
+          "seq": 41,
+          "fanout_seq": 41,
+          "ts": 1756972800000,
+          "backend": "hermes",
+          "data": {
+            "kind": "text",
+            "item_id": "01996f2e-7b6a-7c32-9f8e-4a3d6c1b2e90",
+            "index": 1,
+            "started_at": 1756972800000
+          }
+        },
         "media.ref": {
           "type": "media.ref",
           "turn_id": "turn_demo_0001",
@@ -682,7 +797,8 @@
             ],
             "plan_id": "plan_demo_0001",
             "status": "pending",
-            "revision_requested": false
+            "revision_requested": false,
+            "index": 9
           }
         },
         "reasoning.delta": {
@@ -694,7 +810,8 @@
           "backend": "hermes",
           "data": {
             "text": "用户要剪 vlog，先确认时间范围。",
-            "item_id": "01996f2e-7b6a-7c31-9f8e-4a3d6c1b2e90"
+            "item_id": "01996f2e-7b6a-7c31-9f8e-4a3d6c1b2e90",
+            "index": 0
           }
         },
         "search.result": {
@@ -752,7 +869,8 @@
           "data": {
             "steer_id": "01998f2d-7c00-7000-8000-000000000001",
             "text": "顺便加上字幕",
-            "reason": "unconsumed"
+            "reason": "unconsumed",
+            "index": 11
           }
         },
         "steer": {
@@ -764,7 +882,8 @@
           "backend": "hermes",
           "data": {
             "steer_id": "01998f2d-7c00-7000-8000-000000000001",
-            "text": "顺便加上字幕"
+            "text": "顺便加上字幕",
+            "index": 11
           }
         },
         "text.delta": {
@@ -775,7 +894,9 @@
           "ts": 1756972800000,
           "backend": "hermes",
           "data": {
-            "text": "好的，我先找出上周末的视频。"
+            "text": "好的，我先找出上周末的视频。",
+            "item_id": "01996f2e-7b6a-7c32-9f8e-4a3d6c1b2e90",
+            "index": 1
           }
         },
         "text.reset": {
@@ -810,6 +931,87 @@
               "in_progress": 1,
               "completed": 0,
               "cancelled": 0
+            },
+            "item_id": "01996f2e-7b6a-7c34-9f8e-4a3d6c1b2e90",
+            "index": 3,
+            "v": 1
+          }
+        },
+        "tool.result.display.error": {
+          "type": "tool.result",
+          "turn_id": "turn_demo_0001",
+          "seq": 106,
+          "fanout_seq": 6,
+          "ts": 1756972800000,
+          "backend": "hermes",
+          "data": {
+            "call_id": "call_demo_0001",
+            "status": "error",
+            "duration_s": 1.25,
+            "output": {
+              "total_count": 0
+            },
+            "error": "search backend unavailable",
+            "error_code": "tool_error",
+            "component_id": "browser-runtime",
+            "reference_id": "ref_demo_0001",
+            "provider": "demo-provider",
+            "status_code": 503,
+            "connector_error": {
+              "code": "connector_unavailable"
+            },
+            "browser_state": {
+              "url": "https://example.invalid/"
+            },
+            "browser_content_evidence": {
+              "text": "demo"
+            },
+            "item_id": "01996f2e-7b6a-7c33-9f8e-4a3d6c1b2e90",
+            "index": 2,
+            "display": {
+              "summary": "Error: search backend unavailable",
+              "content_type": "error",
+              "truncated": false,
+              "bytes": 26
+            }
+          }
+        },
+        "tool.result.display.truncated": {
+          "type": "tool.result",
+          "turn_id": "turn_demo_0001",
+          "seq": 106,
+          "fanout_seq": 6,
+          "ts": 1756972800000,
+          "backend": "hermes",
+          "data": {
+            "call_id": "call_demo_0001",
+            "status": "error",
+            "duration_s": 1.25,
+            "output": {
+              "total_count": 0
+            },
+            "error": "search backend unavailable",
+            "error_code": "tool_error",
+            "component_id": "browser-runtime",
+            "reference_id": "ref_demo_0001",
+            "provider": "demo-provider",
+            "status_code": 503,
+            "connector_error": {
+              "code": "connector_unavailable"
+            },
+            "browser_state": {
+              "url": "https://example.invalid/"
+            },
+            "browser_content_evidence": {
+              "text": "demo"
+            },
+            "item_id": "01996f2e-7b6a-7c33-9f8e-4a3d6c1b2e90",
+            "index": 2,
+            "display": {
+              "summary": "Error: search backend unavailable",
+              "content_type": "error",
+              "truncated": true,
+              "bytes": 26
             }
           }
         },
@@ -841,6 +1043,41 @@
             },
             "browser_content_evidence": {
               "text": "demo"
+            },
+            "item_id": "01996f2e-7b6a-7c33-9f8e-4a3d6c1b2e90",
+            "index": 2,
+            "display": {
+              "summary": "Error: search backend unavailable",
+              "content_type": "error",
+              "truncated": false,
+              "bytes": 26
+            }
+          }
+        },
+        "tool.start.display": {
+          "type": "tool.start",
+          "turn_id": "turn_demo_0001",
+          "seq": 105,
+          "fanout_seq": 5,
+          "ts": 1756972800000,
+          "backend": "hermes",
+          "data": {
+            "call_id": "call_demo_0001",
+            "name": "search_files",
+            "label": "搜索素材",
+            "arguments": {
+              "pattern": "上周末 公园 视频"
+            },
+            "item_id": "01996f2e-7b6a-7c33-9f8e-4a3d6c1b2e90",
+            "index": 2,
+            "source": {
+              "kind": "builtin",
+              "id": "search_files",
+              "label": "Search files"
+            },
+            "display": {
+              "args_summary": "上周末 公园 视频",
+              "truncated": false
             }
           }
         },
@@ -856,9 +1093,46 @@
             "name": "search_files",
             "label": "搜索素材",
             "arguments": {
-              "target": "nas",
-              "query": "上周末 公园 视频"
+              "pattern": "上周末 公园 视频"
+            },
+            "item_id": "01996f2e-7b6a-7c33-9f8e-4a3d6c1b2e90",
+            "index": 2,
+            "source": {
+              "kind": "mcp",
+              "id": "search",
+              "label": "Search"
+            },
+            "display": {
+              "args_summary": "上周末 公园 视频",
+              "truncated": false
             }
+          }
+        },
+        "tool.start.label-absent": {
+          "type": "tool.start",
+          "turn_id": "turn_demo_0001",
+          "seq": 205,
+          "fanout_seq": 7,
+          "ts": 1756972800000,
+          "backend": "hermes",
+          "data": {
+            "call_id": "call_demo_0001",
+            "name": "search_files",
+            "arguments": {
+              "pattern": "上周末 公园 视频"
+            },
+            "item_id": "01996f2e-7b6a-7c33-9f8e-4a3d6c1b2e90",
+            "index": 2,
+            "source": {
+              "kind": "builtin",
+              "id": "search_files",
+              "label": "Search files"
+            },
+            "display": {
+              "args_summary": "上周末 公园 视频",
+              "truncated": false
+            },
+            "label": ""
           }
         },
         "turn.end": {
@@ -1223,6 +1497,25 @@
         }
       },
       "hermes": {
+        "content-chunk": {
+          "id": "chatcmpl_demo_0001",
+          "object": "chat.completion.chunk",
+          "created": 1756972800,
+          "model": "demo-model",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "content": "答复片段"
+              },
+              "finish_reason": null
+            }
+          ],
+          "hermes": {
+            "item_id": "01996f2e-7b6a-7c32-9f8e-4a3d6c1b2e90",
+            "index": 1
+          }
+        },
         "context.compaction": {
           "type": "context.compaction",
           "turn_id": "turn_demo_0001",
@@ -1234,12 +1527,15 @@
           "before_tokens": 18000,
           "after_messages": 12,
           "after_tokens": 6000,
-          "error": ""
+          "error": "",
+          "index": 8,
+          "context_measurement": "unknown"
         },
         "conversation.title": {
           "type": "conversation.title",
           "turn_id": "turn_demo_0001",
-          "title": "周末公园 vlog"
+          "title": "周末公园 vlog",
+          "index": 10
         },
         "finish-chunk": {
           "id": "chatcmpl_demo_0001",
@@ -1302,7 +1598,8 @@
           "expires_at_ms": 1756973100000,
           "validation_target": "terminal",
           "state": "cancelled",
-          "state_reason": "delivery_failed"
+          "state_reason": "delivery_failed",
+          "index": 7
         },
         "hermes.approval.cancelled.session_reset": {
           "type": "hermes.approval",
@@ -1321,7 +1618,8 @@
           "expires_at_ms": 1756973100000,
           "validation_target": "terminal",
           "state": "cancelled",
-          "state_reason": "session_reset"
+          "state_reason": "session_reset",
+          "index": 7
         },
         "hermes.approval.cancelled.turn_interrupted": {
           "type": "hermes.approval",
@@ -1340,7 +1638,8 @@
           "expires_at_ms": 1756973100000,
           "validation_target": "terminal",
           "state": "cancelled",
-          "state_reason": "turn_interrupted"
+          "state_reason": "turn_interrupted",
+          "index": 7
         },
         "hermes.approval.expired.timeout": {
           "type": "hermes.approval",
@@ -1359,7 +1658,8 @@
           "expires_at_ms": 1756973100000,
           "validation_target": "terminal",
           "state": "expired",
-          "state_reason": "timeout"
+          "state_reason": "timeout",
+          "index": 7
         },
         "hermes.approval": {
           "type": "hermes.approval",
@@ -1376,7 +1676,8 @@
             "rm -rf"
           ],
           "expires_at_ms": 1756973100000,
-          "validation_target": "terminal"
+          "validation_target": "terminal",
+          "index": 7
         },
         "hermes.attachment": {
           "type": "hermes.attachment",
@@ -1395,7 +1696,8 @@
                 }
               ]
             }
-          }
+          },
+          "index": 5
         },
         "hermes.clarify.cancelled.delivery_failed": {
           "type": "hermes.clarify",
@@ -1411,7 +1713,8 @@
           "expires_at_ms": 1756973100000,
           "turn_id": "turn_demo_0001",
           "state": "cancelled",
-          "state_reason": "delivery_failed"
+          "state_reason": "delivery_failed",
+          "index": 6
         },
         "hermes.clarify.cancelled.session_reset": {
           "type": "hermes.clarify",
@@ -1427,7 +1730,8 @@
           "expires_at_ms": 1756973100000,
           "turn_id": "turn_demo_0001",
           "state": "cancelled",
-          "state_reason": "session_reset"
+          "state_reason": "session_reset",
+          "index": 6
         },
         "hermes.clarify.cancelled.turn_interrupted": {
           "type": "hermes.clarify",
@@ -1443,7 +1747,8 @@
           "expires_at_ms": 1756973100000,
           "turn_id": "turn_demo_0001",
           "state": "cancelled",
-          "state_reason": "turn_interrupted"
+          "state_reason": "turn_interrupted",
+          "index": 6
         },
         "hermes.clarify.expired.timeout": {
           "type": "hermes.clarify",
@@ -1459,7 +1764,8 @@
           "expires_at_ms": 1756973100000,
           "turn_id": "turn_demo_0001",
           "state": "expired",
-          "state_reason": "timeout"
+          "state_reason": "timeout",
+          "index": 6
         },
         "hermes.clarify": {
           "type": "hermes.clarify",
@@ -1473,7 +1779,8 @@
           "turn_id": "turn_demo_0001",
           "connector_setup": {
             "resource_kind": "camera"
-          }
+          },
+          "index": 6
         },
         "hermes.delegation.progress": {
           "type": "hermes.delegation.progress",
@@ -1492,7 +1799,10 @@
           "duration_seconds": 3.5,
           "parent_id": "sub_demo_root",
           "depth": 1,
-          "exit_reason": ""
+          "exit_reason": "",
+          "item_id": "01996f2e-7b6a-7c35-9f8e-4a3d6c1b2e90",
+          "index": 4,
+          "v": 1
         },
         "hermes.plan": {
           "type": "hermes.plan",
@@ -1509,7 +1819,8 @@
               ]
             }
           ],
-          "auto_execute": false
+          "auto_execute": false,
+          "index": 9
         },
         "hermes.todo": {
           "type": "hermes.todo",
@@ -1529,25 +1840,51 @@
             "in_progress": 1,
             "completed": 0,
             "cancelled": 0
-          }
+          },
+          "item_id": "01996f2e-7b6a-7c34-9f8e-4a3d6c1b2e90",
+          "index": 3,
+          "v": 1
+        },
+        "item.completed": {
+          "type": "item.completed",
+          "turn_id": "turn_demo_0001",
+          "kind": "reasoning",
+          "item_id": "01996f2e-7b6a-7c31-9f8e-4a3d6c1b2e90",
+          "index": 0,
+          "text": "思考片段",
+          "finished_at": 1756972801000,
+          "snapshot_omitted": false,
+          "canonical": false
+        },
+        "item.started": {
+          "type": "item.started",
+          "turn_id": "turn_demo_0001",
+          "kind": "reasoning",
+          "item_id": "01996f2e-7b6a-7c31-9f8e-4a3d6c1b2e90",
+          "index": 0,
+          "started_at": 1756972800000
         },
         "reasoning.delta": {
           "type": "reasoning.delta",
           "turn_id": "turn_demo_0001",
-          "text": "用户要剪 vlog，先确认时间范围。"
+          "text": "用户要剪 vlog，先确认时间范围。",
+          "item_id": "01996f2e-7b6a-7c31-9f8e-4a3d6c1b2e90",
+          "index": 0
         },
         "steer_accepted": {
           "type": "steer_accepted",
           "steer_id": "01998f2d-7c00-7000-8000-000000000001",
           "turn_id": "turn_demo_0001",
-          "text": "顺便加上字幕"
+          "text": "顺便加上字幕",
+          "index": 11
         },
         "steer_dropped": {
           "type": "steer_dropped",
           "steer_id": "01998f2d-7c00-7000-8000-000000000001",
           "turn_id": "turn_demo_0001",
           "text": "顺便加上字幕",
-          "reason": "unconsumed"
+          "reason": "unconsumed",
+          "index": 11
         },
         "tool-frame.completed": {
           "tool": "image_generate",
@@ -1569,6 +1906,13 @@
           },
           "browserContentEvidence": {
             "text": "demo"
+          },
+          "item_id": "01996f2e-7b6a-7c33-9f8e-4a3d6c1b2e90",
+          "index": 2,
+          "display": {
+            "summary": "Result: Generated cover image",
+            "content_type": "text",
+            "truncated": false
           }
         },
         "tool-frame.error": {
@@ -1589,6 +1933,14 @@
           },
           "output": {
             "success": false
+          },
+          "item_id": "01996f2e-7b6a-7c33-9f8e-4a3d6c1b2e90",
+          "index": 2,
+          "display": {
+            "summary": "Error: connector returned 401",
+            "content_type": "error",
+            "truncated": false,
+            "bytes": 22
           }
         },
         "tool-frame.running": {
@@ -1596,11 +1948,259 @@
           "emoji": "🔍",
           "label": "搜索素材",
           "toolCallId": "call_demo_0001",
-          "status": "running"
+          "status": "running",
+          "item_id": "01996f2e-7b6a-7c33-9f8e-4a3d6c1b2e90",
+          "index": 2,
+          "source": {
+            "kind": "mcp",
+            "id": "search",
+            "label": "Search"
+          },
+          "display": {
+            "args_summary": "demo",
+            "truncated": false
+          },
+          "pattern": "demo"
         }
       },
       "http": {
         "session-history.delta": {
+          "agent_id": "agent_demo_0001",
+          "session_id": "zettlab:owner:agent_demo_0001:sess_demo_0001",
+          "snapshot_seq": 100,
+          "messages": [
+            {
+              "started_at": 1756972800000,
+              "completed_at": 1756972820000,
+              "id": 1001,
+              "row_key": "m:1001",
+              "turn_id": "turn_demo_0001",
+              "role": "user",
+              "content": "hello",
+              "updated_seq": 2,
+              "visible": true,
+              "status": "done"
+            },
+            {
+              "started_at": 1756972800000,
+              "completed_at": 1756972820000,
+              "id": 1002,
+              "row_key": "m:1002",
+              "turn_id": "turn_demo_0001",
+              "role": "assistant",
+              "content": "host",
+              "updated_seq": 2,
+              "visible": true,
+              "status": "done"
+            }
+          ],
+          "activities": [
+            {
+              "started_at": 1756972801000,
+              "finished_at": 1756972802000,
+              "activity_id": 40,
+              "call_id": "01996f2e-7b6a-7c31-9f8e-4a3d6c1b2e90",
+              "item_id": "01996f2e-7b6a-7c31-9f8e-4a3d6c1b2e90",
+              "item_index": 0,
+              "turn_id": "turn_demo_0001",
+              "kind": "thinking",
+              "content": "用户要剪 vlog，先确认时间范围。",
+              "created_seq": 40,
+              "updated_seq": 50,
+              "last_fanout_seq": 60,
+              "status": "done"
+            },
+            {
+              "started_at": 1756972802000,
+              "finished_at": 1756972803000,
+              "activity_id": 41,
+              "call_id": "01996f2e-7b6a-7000-8000-000000000002",
+              "item_id": "01996f2e-7b6a-7000-8000-000000000002",
+              "item_index": 1,
+              "turn_id": "turn_demo_0001",
+              "kind": "text",
+              "content": "Done",
+              "created_seq": 41,
+              "updated_seq": 51,
+              "last_fanout_seq": 61,
+              "status": "done"
+            },
+            {
+              "started_at": 1756972803000,
+              "finished_at": 1756972804000,
+              "source": {
+                "kind": "builtin",
+                "id": "file_search",
+                "label": "Search demo files"
+              },
+              "display_args": {
+                "args_summary": "query=demo"
+              },
+              "display_result": {
+                "summary": "Found demo files",
+                "content_type": "text",
+                "truncated": false,
+                "bytes": 16
+              },
+              "activity_id": 42,
+              "call_id": "hp_t_demo_0001",
+              "name": "file_search",
+              "label": "Search demo files",
+              "item_id": "01996f2e-7b6a-7000-8000-000000000003",
+              "item_index": 2,
+              "turn_id": "turn_demo_0001",
+              "kind": "tool",
+              "created_seq": 42,
+              "updated_seq": 52,
+              "last_fanout_seq": 62,
+              "status": "done"
+            },
+            {
+              "started_at": 1756972804000,
+              "finished_at": 1756972805000,
+              "todo_list": {
+                "items": [
+                  {
+                    "id": "todo_demo_1",
+                    "content": "Find demo files",
+                    "status": "completed"
+                  }
+                ],
+                "summary": {
+                  "total": 1,
+                  "pending": 0,
+                  "in_progress": 0,
+                  "completed": 1,
+                  "cancelled": 0
+                }
+              },
+              "v": 2,
+              "activity_id": 43,
+              "call_id": "01996f2e-7b6a-7000-8000-000000000004",
+              "item_id": "01996f2e-7b6a-7000-8000-000000000004",
+              "item_index": 3,
+              "turn_id": "turn_demo_0001",
+              "kind": "todo_update",
+              "created_seq": 43,
+              "updated_seq": 53,
+              "last_fanout_seq": 63,
+              "status": "done"
+            },
+            {
+              "started_at": 1756972805000,
+              "finished_at": 1756972806000,
+              "v": 1,
+              "preview": "Found demo files",
+              "activity_id": 44,
+              "call_id": "01996f2e-7b6a-7000-8000-000000000005",
+              "item_id": "01996f2e-7b6a-7000-8000-000000000005",
+              "item_index": 4,
+              "turn_id": "turn_demo_0001",
+              "kind": "subagent",
+              "created_seq": 44,
+              "updated_seq": 54,
+              "last_fanout_seq": 64,
+              "status": "done"
+            },
+            {
+              "started_at": 1756972806000,
+              "finished_at": 1756972807000,
+              "canonical_omitted": true,
+              "activity_id": 45,
+              "call_id": "01996f2e-7b6a-7000-8000-000000000006",
+              "item_id": "01996f2e-7b6a-7000-8000-000000000006",
+              "item_index": 5,
+              "turn_id": "turn_demo_0001",
+              "kind": "text",
+              "content": "Done",
+              "created_seq": 45,
+              "updated_seq": 55,
+              "last_fanout_seq": 65,
+              "status": "done"
+            },
+            {
+              "started_at": 1756972807000,
+              "finished_at": 1756972808000,
+              "activity_id": 46,
+              "call_id": "ia_demo_0002",
+              "item_index": 6,
+              "turn_id": "turn_demo_0001",
+              "kind": "clarify",
+              "created_seq": 46,
+              "updated_seq": 56,
+              "last_fanout_seq": 66,
+              "status": "done"
+            },
+            {
+              "started_at": 1756972808000,
+              "finished_at": 1756972809000,
+              "activity_id": 47,
+              "call_id": "context",
+              "item_index": 7,
+              "turn_id": "turn_demo_0001",
+              "kind": "context_compaction",
+              "created_seq": 47,
+              "updated_seq": 57,
+              "last_fanout_seq": 67,
+              "status": "done"
+            },
+            {
+              "started_at": 1756972809000,
+              "finished_at": 1756972810000,
+              "activity_id": 48,
+              "call_id": "plan_preview",
+              "item_index": 8,
+              "turn_id": "turn_demo_0001",
+              "kind": "plan_preview",
+              "created_seq": 48,
+              "updated_seq": 58,
+              "last_fanout_seq": 68,
+              "status": "done"
+            },
+            {
+              "started_at": 1756972810000,
+              "finished_at": 1756972811000,
+              "source": {
+                "kind": "builtin",
+                "id": "search_files",
+                "label": "Search files"
+              },
+              "display_args": {
+                "args_summary": "上周末 公园 视频"
+              },
+              "display_result": {
+                "summary": "Found weekend park videos",
+                "content_type": "text",
+                "truncated": false,
+                "bytes": 25
+              },
+              "activity_id": 50,
+              "call_id": "hp_t_demo_0002",
+              "name": "search_files",
+              "label": "Search files",
+              "item_id": "01996f2e-7b6a-7000-8000-000000000007",
+              "item_index": 9,
+              "turn_id": "turn_demo_0001",
+              "kind": "tool",
+              "created_seq": 49,
+              "updated_seq": 59,
+              "last_fanout_seq": 69,
+              "status": "done"
+            },
+            {
+              "activity_id": 49,
+              "call_id": "legacy-tool",
+              "name": "legacy_search",
+              "turn_id": "turn_demo_0001",
+              "kind": "tool",
+              "created_seq": 50,
+              "updated_seq": 60,
+              "last_fanout_seq": 70,
+              "status": "done"
+            }
+          ]
+        },
+        "session-history.delta.pagination": {
           "agent_id": "agent_demo_0001",
           "session_id": "sess_demo_0001",
           "snapshot_seq": 44,
@@ -1621,69 +2221,295 @@
               "updated_seq": 44,
               "visible": false,
               "turn_id": "turn_demo_0001"
-            }
-          ],
-          "activities": [
-            {
-              "activity_id": 40,
-              "item_id": "01996f2e-7b6a-7c31-9f8e-4a3d6c1b2e90",
-              "turn_id": "turn_demo_0001",
-              "kind": "thinking",
-              "status": "streaming",
-              "updated_seq": 44,
-              "last_fanout_seq": 9
             },
             {
-              "activity_id": 41,
-              "call_id": "hp_t_demo_0001",
-              "item_id": "01996f2e-7b6a-7c31-9f8e-4a3d6c1b2e91",
+              "id": 7,
+              "row_key": "m:7",
               "turn_id": "turn_demo_0001",
-              "kind": "tool",
-              "name": "file_search",
-              "label": "Search demo files",
-              "status": "running",
-              "created_seq": 41,
+              "role": "assistant",
+              "content": "Done",
+              "status": "done",
+              "visible": true,
               "updated_seq": 44,
-              "last_fanout_seq": 9
+              "started_at": 1756972800000,
+              "completed_at": 1756972810000
             }
           ],
+          "activities": [],
           "truncated": false
         },
         "session-history.tail": {
           "agent_id": "agent_demo_0001",
-          "session_id": "sess_demo_0001",
-          "next_since": {
-            "updated_seq": 41,
-            "row_key": "ma:7"
-          },
-          "active_turn": {
-            "turn_id": "turn_demo_0001",
-            "live_seq": 7,
-            "phase": "tool",
-            "tool_name": "search_files",
-            "unsettled": false,
-            "started_at": 1756972800000
-          },
+          "session_id": "zettlab:owner:agent_demo_0001:sess_demo_0001",
           "messages": [
             {
-              "id": 7,
+              "started_at": 1756972800000,
+              "completed_at": 1756972820000,
+              "id": 1001,
+              "seq": 1,
               "turn_id": "turn_demo_0001",
-              "role": "assistant",
-              "content": "好的，我先找出上周末的视频。",
-              "status": "streaming",
-              "last_fanout_seq": 2
+              "role": "user",
+              "content": "hello",
+              "status": "done"
             },
             {
-              "id": 7,
+              "call_id": "01996f2e-7b6a-7c31-9f8e-4a3d6c1b2e90",
+              "started_at": 1756972801000,
+              "finished_at": 1756972802000,
+              "id": 1002,
+              "seq": 2,
+              "item_id": "01996f2e-7b6a-7c31-9f8e-4a3d6c1b2e90",
+              "item_index": 0,
+              "last_fanout_seq": 60,
               "turn_id": "turn_demo_0001",
               "role": "assistant",
               "content": "",
-              "reasoning": "用户要剪 vlog，先确认时间范围。",
-              "status": "streaming",
-              "item_id": "01996f2e-7b6a-7c31-9f8e-4a3d6c1b2e90",
-              "last_fanout_seq": 3
+              "status": "done",
+              "reasoning": "用户要剪 vlog，先确认时间范围。"
+            },
+            {
+              "call_id": "01996f2e-7b6a-7000-8000-000000000002",
+              "started_at": 1756972802000,
+              "finished_at": 1756972803000,
+              "id": 1002,
+              "seq": 2,
+              "item_id": "01996f2e-7b6a-7000-8000-000000000002",
+              "item_index": 1,
+              "last_fanout_seq": 61,
+              "turn_id": "turn_demo_0001",
+              "role": "assistant",
+              "content": "Done",
+              "status": "done",
+              "kind": "text"
+            },
+            {
+              "id": 1002,
+              "seq": 2,
+              "last_fanout_seq": 62,
+              "turn_id": "turn_demo_0001",
+              "role": "tool",
+              "content": "",
+              "tool_call": {
+                "label": "Search demo files",
+                "name": "file_search",
+                "call_id": "hp_t_demo_0001",
+                "status": "success",
+                "item_id": "01996f2e-7b6a-7000-8000-000000000003",
+                "item_index": 2,
+                "source": {
+                  "kind": "builtin",
+                  "id": "file_search",
+                  "label": "Search demo files"
+                },
+                "display_args": {
+                  "args_summary": "query=demo"
+                },
+                "display_result": {
+                  "summary": "Found demo files",
+                  "content_type": "text",
+                  "truncated": false,
+                  "bytes": 16
+                },
+                "started_at": 1756972803000,
+                "finished_at": 1756972804000
+              }
+            },
+            {
+              "call_id": "01996f2e-7b6a-7000-8000-000000000004",
+              "v": 2,
+              "started_at": 1756972804000,
+              "finished_at": 1756972805000,
+              "id": 1002,
+              "seq": 2,
+              "item_id": "01996f2e-7b6a-7000-8000-000000000004",
+              "item_index": 3,
+              "last_fanout_seq": 63,
+              "turn_id": "turn_demo_0001",
+              "role": "assistant",
+              "content": "",
+              "status": "done",
+              "kind": "todo_update",
+              "todo_list": {
+                "v": 2,
+                "items": [
+                  {
+                    "id": "todo_demo_1",
+                    "content": "Find demo files",
+                    "status": "completed"
+                  }
+                ],
+                "summary": {
+                  "total": 1,
+                  "pending": 0,
+                  "in_progress": 0,
+                  "completed": 1,
+                  "cancelled": 0
+                }
+              }
+            },
+            {
+              "call_id": "01996f2e-7b6a-7000-8000-000000000005",
+              "v": 1,
+              "preview": "Found demo files",
+              "started_at": 1756972805000,
+              "finished_at": 1756972806000,
+              "id": 1002,
+              "seq": 2,
+              "item_id": "01996f2e-7b6a-7000-8000-000000000005",
+              "item_index": 4,
+              "last_fanout_seq": 64,
+              "turn_id": "turn_demo_0001",
+              "role": "assistant",
+              "content": "",
+              "status": "done",
+              "kind": "subagent",
+              "subagent": {
+                "item_id": "01996f2e-7b6a-7000-8000-000000000005",
+                "item_index": 4,
+                "v": 1,
+                "status": "done",
+                "subagent_id": "sub_demo_0001",
+                "preview": "Found demo files"
+              }
+            },
+            {
+              "call_id": "01996f2e-7b6a-7000-8000-000000000006",
+              "started_at": 1756972806000,
+              "finished_at": 1756972807000,
+              "id": 1002,
+              "seq": 2,
+              "item_id": "01996f2e-7b6a-7000-8000-000000000006",
+              "item_index": 5,
+              "canonical_omitted": true,
+              "last_fanout_seq": 65,
+              "turn_id": "turn_demo_0001",
+              "role": "assistant",
+              "content": "Done",
+              "status": "done",
+              "kind": "text"
+            },
+            {
+              "call_id": "ia_demo_0002",
+              "started_at": 1756972807000,
+              "finished_at": 1756972808000,
+              "id": 1002,
+              "seq": 2,
+              "item_index": 6,
+              "last_fanout_seq": 66,
+              "turn_id": "turn_demo_0001",
+              "role": "assistant",
+              "content": "",
+              "status": "done",
+              "kind": "clarify",
+              "clarify_id": "ia_demo_0002",
+              "clarify": {
+                "clarify_id": "ia_demo_0002",
+                "question": "周末指哪两天？",
+                "choices_offered": [
+                  "上周末",
+                  "本周末"
+                ],
+                "expires_at_ms": 1756973100000
+              }
+            },
+            {
+              "call_id": "context",
+              "started_at": 1756972808000,
+              "finished_at": 1756972809000,
+              "id": 1002,
+              "seq": 2,
+              "item_index": 7,
+              "last_fanout_seq": 67,
+              "turn_id": "turn_demo_0001",
+              "role": "assistant",
+              "content": "",
+              "status": "done",
+              "kind": "context_compaction",
+              "context_compaction": {
+                "state": "succeeded",
+                "message": "上下文已压缩",
+                "old_session_id": "sess_demo_0001",
+                "new_session_id": "sess_demo_0002"
+              }
+            },
+            {
+              "call_id": "plan_preview",
+              "started_at": 1756972809000,
+              "finished_at": 1756972810000,
+              "id": 1002,
+              "seq": 2,
+              "item_index": 8,
+              "last_fanout_seq": 68,
+              "turn_id": "turn_demo_0001",
+              "role": "assistant",
+              "content": "",
+              "status": "done",
+              "kind": "plan_preview",
+              "plan_preview": {
+                "title": "剪辑 vlog",
+                "groups": [
+                  {
+                    "icon": "🎬",
+                    "label": "素材",
+                    "count": 1,
+                    "items": [
+                      "挑选 4 段"
+                    ]
+                  }
+                ],
+                "plan_id": "plan_demo_0001",
+                "status": "pending"
+              }
+            },
+            {
+              "id": 1002,
+              "seq": 2,
+              "last_fanout_seq": 69,
+              "turn_id": "turn_demo_0001",
+              "role": "tool",
+              "content": "",
+              "tool_call": {
+                "label": "Search files",
+                "name": "search_files",
+                "call_id": "hp_t_demo_0002",
+                "status": "success",
+                "item_id": "01996f2e-7b6a-7000-8000-000000000007",
+                "item_index": 9,
+                "source": {
+                  "kind": "builtin",
+                  "id": "search_files",
+                  "label": "Search files"
+                },
+                "display_args": {
+                  "args_summary": "上周末 公园 视频"
+                },
+                "display_result": {
+                  "summary": "Found weekend park videos",
+                  "content_type": "text",
+                  "truncated": false,
+                  "bytes": 25
+                },
+                "started_at": 1756972810000,
+                "finished_at": 1756972811000
+              }
+            },
+            {
+              "id": 1002,
+              "seq": 2,
+              "last_fanout_seq": 70,
+              "turn_id": "turn_demo_0001",
+              "role": "tool",
+              "content": "",
+              "tool_call": {
+                "name": "legacy_search",
+                "call_id": "legacy-tool",
+                "status": "success"
+              }
             }
-          ]
+          ],
+          "oldest_id": 1001,
+          "newest_id": 1002,
+          "snapshot_seq": 100
         },
         "session-history.tail.live-seq-zero": {
           "agent_id": "agent_demo_0001",
@@ -1707,6 +2533,23 @@
               "status": "streaming"
             }
           ]
+        },
+        "session-history.tail.pagination": {
+          "agent_id": "agent_demo_0001",
+          "session_id": "sess_demo_0001",
+          "next_since": {
+            "updated_seq": 41,
+            "row_key": "ma:7"
+          },
+          "active_turn": {
+            "turn_id": "turn_demo_0001",
+            "live_seq": 7,
+            "phase": "tool",
+            "tool_name": "search_files",
+            "unsettled": false,
+            "started_at": 1756972800000
+          },
+          "messages": []
         },
         "session-history.tail.registry-evicted": {
           "agent_id": "agent_demo_0001",
@@ -1735,31 +2578,209 @@
         "session-history.turn-activities": {
           "activities": [
             {
+              "started_at": 1756972801000,
+              "finished_at": 1756972802000,
               "activity_id": 40,
-              "call_id": "thinking:0",
+              "call_id": "01996f2e-7b6a-7c31-9f8e-4a3d6c1b2e90",
               "item_id": "01996f2e-7b6a-7c31-9f8e-4a3d6c1b2e90",
+              "item_index": 0,
               "turn_id": "turn_demo_0001",
               "kind": "thinking",
-              "status": "done",
+              "content": "用户要剪 vlog，先确认时间范围。",
               "created_seq": 40,
-              "updated_seq": 45,
-              "last_fanout_seq": 9
+              "updated_seq": 50,
+              "last_fanout_seq": 60,
+              "status": "done"
             },
             {
+              "started_at": 1756972802000,
+              "finished_at": 1756972803000,
               "activity_id": 41,
-              "call_id": "hp_t_demo_0001",
-              "item_id": "01996f2e-7b6a-7c31-9f8e-4a3d6c1b2e91",
+              "call_id": "01996f2e-7b6a-7000-8000-000000000002",
+              "item_id": "01996f2e-7b6a-7000-8000-000000000002",
+              "item_index": 1,
               "turn_id": "turn_demo_0001",
-              "kind": "tool",
+              "kind": "text",
+              "content": "Done",
+              "created_seq": 41,
+              "updated_seq": 51,
+              "last_fanout_seq": 61,
+              "status": "done"
+            },
+            {
+              "started_at": 1756972803000,
+              "finished_at": 1756972804000,
+              "source": {
+                "kind": "builtin",
+                "id": "file_search",
+                "label": "Search demo files"
+              },
+              "display_args": {
+                "args_summary": "query=demo"
+              },
+              "display_result": {
+                "summary": "Found demo files",
+                "content_type": "text",
+                "truncated": false,
+                "bytes": 16
+              },
+              "activity_id": 42,
+              "call_id": "hp_t_demo_0001",
               "name": "file_search",
               "label": "Search demo files",
-              "status": "success",
-              "created_seq": 41,
-              "updated_seq": 45,
-              "last_fanout_seq": 9
+              "item_id": "01996f2e-7b6a-7000-8000-000000000003",
+              "item_index": 2,
+              "turn_id": "turn_demo_0001",
+              "kind": "tool",
+              "created_seq": 42,
+              "updated_seq": 52,
+              "last_fanout_seq": 62,
+              "status": "done"
+            },
+            {
+              "started_at": 1756972804000,
+              "finished_at": 1756972805000,
+              "todo_list": {
+                "items": [
+                  {
+                    "id": "todo_demo_1",
+                    "content": "Find demo files",
+                    "status": "completed"
+                  }
+                ],
+                "summary": {
+                  "total": 1,
+                  "pending": 0,
+                  "in_progress": 0,
+                  "completed": 1,
+                  "cancelled": 0
+                }
+              },
+              "v": 2,
+              "activity_id": 43,
+              "call_id": "01996f2e-7b6a-7000-8000-000000000004",
+              "item_id": "01996f2e-7b6a-7000-8000-000000000004",
+              "item_index": 3,
+              "turn_id": "turn_demo_0001",
+              "kind": "todo_update",
+              "created_seq": 43,
+              "updated_seq": 53,
+              "last_fanout_seq": 63,
+              "status": "done"
+            },
+            {
+              "started_at": 1756972805000,
+              "finished_at": 1756972806000,
+              "v": 1,
+              "preview": "Found demo files",
+              "activity_id": 44,
+              "call_id": "01996f2e-7b6a-7000-8000-000000000005",
+              "item_id": "01996f2e-7b6a-7000-8000-000000000005",
+              "item_index": 4,
+              "turn_id": "turn_demo_0001",
+              "kind": "subagent",
+              "created_seq": 44,
+              "updated_seq": 54,
+              "last_fanout_seq": 64,
+              "status": "done"
+            },
+            {
+              "started_at": 1756972806000,
+              "finished_at": 1756972807000,
+              "canonical_omitted": true,
+              "activity_id": 45,
+              "call_id": "01996f2e-7b6a-7000-8000-000000000006",
+              "item_id": "01996f2e-7b6a-7000-8000-000000000006",
+              "item_index": 5,
+              "turn_id": "turn_demo_0001",
+              "kind": "text",
+              "content": "Done",
+              "created_seq": 45,
+              "updated_seq": 55,
+              "last_fanout_seq": 65,
+              "status": "done"
+            },
+            {
+              "started_at": 1756972807000,
+              "finished_at": 1756972808000,
+              "activity_id": 46,
+              "call_id": "ia_demo_0002",
+              "item_index": 6,
+              "turn_id": "turn_demo_0001",
+              "kind": "clarify",
+              "created_seq": 46,
+              "updated_seq": 56,
+              "last_fanout_seq": 66,
+              "status": "done"
+            },
+            {
+              "started_at": 1756972808000,
+              "finished_at": 1756972809000,
+              "activity_id": 47,
+              "call_id": "context",
+              "item_index": 7,
+              "turn_id": "turn_demo_0001",
+              "kind": "context_compaction",
+              "created_seq": 47,
+              "updated_seq": 57,
+              "last_fanout_seq": 67,
+              "status": "done"
+            },
+            {
+              "started_at": 1756972809000,
+              "finished_at": 1756972810000,
+              "activity_id": 48,
+              "call_id": "plan_preview",
+              "item_index": 8,
+              "turn_id": "turn_demo_0001",
+              "kind": "plan_preview",
+              "created_seq": 48,
+              "updated_seq": 58,
+              "last_fanout_seq": 68,
+              "status": "done"
+            },
+            {
+              "started_at": 1756972810000,
+              "finished_at": 1756972811000,
+              "source": {
+                "kind": "builtin",
+                "id": "search_files",
+                "label": "Search files"
+              },
+              "display_args": {
+                "args_summary": "上周末 公园 视频"
+              },
+              "display_result": {
+                "summary": "Found weekend park videos",
+                "content_type": "text",
+                "truncated": false,
+                "bytes": 25
+              },
+              "activity_id": 50,
+              "call_id": "hp_t_demo_0002",
+              "name": "search_files",
+              "label": "Search files",
+              "item_id": "01996f2e-7b6a-7000-8000-000000000007",
+              "item_index": 9,
+              "turn_id": "turn_demo_0001",
+              "kind": "tool",
+              "created_seq": 49,
+              "updated_seq": 59,
+              "last_fanout_seq": 69,
+              "status": "done"
+            },
+            {
+              "activity_id": 49,
+              "call_id": "legacy-tool",
+              "name": "legacy_search",
+              "turn_id": "turn_demo_0001",
+              "kind": "tool",
+              "created_seq": 50,
+              "updated_seq": 60,
+              "last_fanout_seq": 70,
+              "status": "done"
             }
-          ],
-          "truncated": false
+          ]
         }
       }
     },
@@ -1974,6 +2995,10 @@
               "required": true,
               "type": "number"
             },
+            "index": {
+              "required": false,
+              "type": "number"
+            },
             "pattern_key": {
               "required": true,
               "type": "string"
@@ -2114,6 +3139,10 @@
                   }
                 }
               }
+            },
+            "index": {
+              "required": false,
+              "type": "number"
             }
           }
         },
@@ -2123,6 +3152,10 @@
             "attachments": {
               "required": false,
               "type": "boolean"
+            },
+            "contract_version": {
+              "required": false,
+              "type": "number"
             },
             "delegation": {
               "required": false,
@@ -2328,6 +3361,10 @@
               "required": true,
               "type": "number"
             },
+            "index": {
+              "required": false,
+              "type": "number"
+            },
             "question": {
               "required": true,
               "type": "string"
@@ -2345,6 +3382,10 @@
         "context.compaction": {
           "struct": "ContextCompactionData",
           "fields": {
+            "index": {
+              "required": false,
+              "type": "number"
+            },
             "message": {
               "required": false,
               "type": "string"
@@ -2366,6 +3407,10 @@
         "conversation.title": {
           "struct": "ConversationTitleData",
           "fields": {
+            "index": {
+              "required": false,
+              "type": "number"
+            },
             "session_id": {
               "required": false,
               "type": "string"
@@ -2392,6 +3437,14 @@
               "type": "string"
             },
             "goal": {
+              "required": false,
+              "type": "string"
+            },
+            "index": {
+              "required": false,
+              "type": "number"
+            },
+            "item_id": {
               "required": false,
               "type": "string"
             },
@@ -2434,6 +3487,10 @@
             "turn_id": {
               "required": false,
               "type": "string"
+            },
+            "v": {
+              "required": false,
+              "type": "number"
             }
           }
         },
@@ -2623,6 +3680,60 @@
             }
           }
         },
+        "item.completed": {
+          "struct": "ItemCompletedData",
+          "fields": {
+            "canonical": {
+              "required": false,
+              "type": "boolean"
+            },
+            "finished_at": {
+              "required": true,
+              "type": "number"
+            },
+            "index": {
+              "required": true,
+              "type": "number"
+            },
+            "item_id": {
+              "required": true,
+              "type": "string"
+            },
+            "kind": {
+              "required": true,
+              "type": "string"
+            },
+            "snapshot_omitted": {
+              "required": false,
+              "type": "boolean"
+            },
+            "text": {
+              "required": false,
+              "type": "string"
+            }
+          }
+        },
+        "item.started": {
+          "struct": "ItemStartedData",
+          "fields": {
+            "index": {
+              "required": true,
+              "type": "number"
+            },
+            "item_id": {
+              "required": true,
+              "type": "string"
+            },
+            "kind": {
+              "required": true,
+              "type": "string"
+            },
+            "started_at": {
+              "required": true,
+              "type": "number"
+            }
+          }
+        },
         "media.ref": {
           "struct": "MediaRefData",
           "fields": {
@@ -2802,6 +3913,10 @@
                     "required": true,
                     "type": "number"
                   },
+                  "index": {
+                    "required": false,
+                    "type": "number"
+                  },
                   "question": {
                     "required": true,
                     "type": "string"
@@ -2891,6 +4006,10 @@
                 }
               }
             },
+            "index": {
+              "required": false,
+              "type": "number"
+            },
             "plan_id": {
               "required": false,
               "type": "string"
@@ -2912,6 +4031,10 @@
         "reasoning.delta": {
           "struct": "ReasoningDeltaData",
           "fields": {
+            "index": {
+              "required": false,
+              "type": "number"
+            },
             "item_id": {
               "required": false,
               "type": "string"
@@ -3049,6 +4172,10 @@
         "steer": {
           "struct": "SteerData",
           "fields": {
+            "index": {
+              "required": false,
+              "type": "number"
+            },
             "steer_id": {
               "required": false,
               "type": "string"
@@ -3062,6 +4189,10 @@
         "steer.dropped": {
           "struct": "SteerDroppedData",
           "fields": {
+            "index": {
+              "required": false,
+              "type": "number"
+            },
             "reason": {
               "required": false,
               "type": "string"
@@ -3079,6 +4210,14 @@
         "text.delta": {
           "struct": "TextDeltaData",
           "fields": {
+            "index": {
+              "required": false,
+              "type": "number"
+            },
+            "item_id": {
+              "required": false,
+              "type": "string"
+            },
             "text": {
               "required": true,
               "type": "string"
@@ -3092,6 +4231,14 @@
         "todo.update": {
           "struct": "TodoUpdateData",
           "fields": {
+            "index": {
+              "required": false,
+              "type": "number"
+            },
+            "item_id": {
+              "required": false,
+              "type": "string"
+            },
             "summary": {
               "required": true,
               "type": "object",
@@ -3149,6 +4296,10 @@
                   }
                 }
               }
+            },
+            "v": {
+              "required": false,
+              "type": "number"
             }
           }
         },
@@ -3175,6 +4326,31 @@
               "required": false,
               "type": "any"
             },
+            "display": {
+              "required": false,
+              "type": "object",
+              "items": {
+                "struct": "ToolResultDisplayData",
+                "fields": {
+                  "bytes": {
+                    "required": true,
+                    "type": "number"
+                  },
+                  "content_type": {
+                    "required": true,
+                    "type": "string"
+                  },
+                  "summary": {
+                    "required": true,
+                    "type": "string"
+                  },
+                  "truncated": {
+                    "required": true,
+                    "type": "boolean"
+                  }
+                }
+              }
+            },
             "duration_s": {
               "required": false,
               "type": "number"
@@ -3184,6 +4360,14 @@
               "type": "string"
             },
             "error_code": {
+              "required": false,
+              "type": "string"
+            },
+            "index": {
+              "required": false,
+              "type": "number"
+            },
+            "item_id": {
               "required": false,
               "type": "string"
             },
@@ -3220,6 +4404,31 @@
               "required": true,
               "type": "string"
             },
+            "display": {
+              "required": false,
+              "type": "object",
+              "items": {
+                "struct": "ToolStartDisplayData",
+                "fields": {
+                  "args_summary": {
+                    "required": false,
+                    "type": "string"
+                  },
+                  "truncated": {
+                    "required": false,
+                    "type": "boolean"
+                  }
+                }
+              }
+            },
+            "index": {
+              "required": false,
+              "type": "number"
+            },
+            "item_id": {
+              "required": false,
+              "type": "string"
+            },
             "label": {
               "required": false,
               "type": "string"
@@ -3227,6 +4436,27 @@
             "name": {
               "required": true,
               "type": "string"
+            },
+            "source": {
+              "required": false,
+              "type": "object",
+              "items": {
+                "struct": "ToolSourceData",
+                "fields": {
+                  "id": {
+                    "required": true,
+                    "type": "string"
+                  },
+                  "kind": {
+                    "required": true,
+                    "type": "string"
+                  },
+                  "label": {
+                    "required": true,
+                    "type": "string"
+                  }
+                }
+              }
             }
           }
         },
@@ -3792,6 +5022,10 @@
             "required": false,
             "type": "string"
           },
+          "canonical_omitted": {
+            "required": false,
+            "type": "boolean"
+          },
           "content": {
             "required": false,
             "type": "string"
@@ -3801,9 +5035,27 @@
             "type": "number",
             "integer": true
           },
+          "display_args": {
+            "required": false,
+            "type": "object"
+          },
+          "display_result": {
+            "required": false,
+            "type": "object"
+          },
+          "finished_at": {
+            "required": false,
+            "type": "number",
+            "integer": true
+          },
           "item_id": {
             "required": false,
             "type": "string"
+          },
+          "item_index": {
+            "required": false,
+            "type": "number",
+            "integer": true
           },
           "kind": {
             "required": true,
@@ -3822,6 +5074,19 @@
             "required": false,
             "type": "string"
           },
+          "preview": {
+            "required": false,
+            "type": "string"
+          },
+          "source": {
+            "required": false,
+            "type": "object"
+          },
+          "started_at": {
+            "required": false,
+            "type": "number",
+            "integer": true
+          },
           "status": {
             "required": true,
             "type": "string",
@@ -3836,6 +5101,10 @@
               "accepted"
             ]
           },
+          "todo_list": {
+            "required": false,
+            "type": "object"
+          },
           "turn_id": {
             "required": true,
             "type": "string"
@@ -3844,14 +5113,28 @@
             "required": false,
             "type": "number",
             "integer": true
+          },
+          "v": {
+            "required": false,
+            "type": "number",
+            "integer": true
           }
         }
       },
       "message_row": {
         "fields": {
+          "completed_at": {
+            "required": false,
+            "type": "number",
+            "integer": true
+          },
           "content": {
             "required": false,
             "type": "string"
+          },
+          "error": {
+            "required": false,
+            "type": "object"
           },
           "id": {
             "required": true,
@@ -3870,6 +5153,11 @@
           "row_key": {
             "required": false,
             "type": "string"
+          },
+          "started_at": {
+            "required": false,
+            "type": "number",
+            "integer": true
           },
           "status": {
             "required": false,
@@ -4049,10 +5337,6 @@
       },
       "tail_message_row": {
         "fields": {
-          "activity_text_boundaries": {
-            "required": false,
-            "type": "array"
-          },
           "app_element": {
             "required": false,
             "type": "object"
@@ -4064,6 +5348,14 @@
           "browser_turn_summary": {
             "required": false,
             "type": "object"
+          },
+          "call_id": {
+            "required": false,
+            "type": "string"
+          },
+          "canonical_omitted": {
+            "required": false,
+            "type": "boolean"
           },
           "chat_attachments": {
             "required": false,
@@ -4077,6 +5369,11 @@
             "required": false,
             "type": "string"
           },
+          "completed_at": {
+            "required": false,
+            "type": "number",
+            "integer": true
+          },
           "content": {
             "required": true,
             "type": "string"
@@ -4089,9 +5386,22 @@
             "required": false,
             "type": "object"
           },
+          "display_args": {
+            "required": false,
+            "type": "object"
+          },
+          "display_result": {
+            "required": false,
+            "type": "object"
+          },
           "error": {
             "required": false,
             "type": "object"
+          },
+          "finished_at": {
+            "required": false,
+            "type": "number",
+            "integer": true
           },
           "goal_id": {
             "required": false,
@@ -4111,7 +5421,16 @@
             "required": false,
             "type": "string"
           },
+          "item_index": {
+            "required": false,
+            "type": "number",
+            "integer": true
+          },
           "kind": {
+            "required": false,
+            "type": "string"
+          },
+          "label": {
             "required": false,
             "type": "string"
           },
@@ -4124,9 +5443,17 @@
             "required": false,
             "type": "array"
           },
+          "name": {
+            "required": false,
+            "type": "string"
+          },
           "plan_preview": {
             "required": false,
             "type": "object"
+          },
+          "preview": {
+            "required": false,
+            "type": "string"
           },
           "produced_files": {
             "required": false,
@@ -4165,6 +5492,15 @@
             "required": false,
             "type": "string"
           },
+          "source": {
+            "required": false,
+            "type": "object"
+          },
+          "started_at": {
+            "required": false,
+            "type": "number",
+            "integer": true
+          },
           "status": {
             "required": false,
             "type": "string",
@@ -4176,6 +5512,10 @@
             ]
           },
           "steer": {
+            "required": false,
+            "type": "object"
+          },
+          "subagent": {
             "required": false,
             "type": "object"
           },
@@ -4194,6 +5534,11 @@
           "ui_hint": {
             "required": false,
             "type": "any"
+          },
+          "v": {
+            "required": false,
+            "type": "number",
+            "integer": true
           }
         }
       }
@@ -4207,8 +5552,74 @@
           "text"
         ],
         "reason": "Non-frame dict literals in zet_agent.py that also carry a \"type\" key: reasoning-config `disabled`, the OpenAI-style error body `invalid_request_error`, and `text` content blocks. Any other undotted type literal is a new frame until registered here.",
-        "frame_shape_exempt": {
-          "context.compaction": "The frame is the upstream compaction status payload forwarded as-is (dict(payload) + type); its fields are frozen by golden/hermes/context.compaction.json and asserted by tests/gateway/test_zet_agent_producer_conformance.py against the three real producer shapes."
+        "frame_shape_exempt": {},
+        "identity_fields": {
+          "hermes.attachment": "attachment.id",
+          "hermes.clarify": "clarify_id",
+          "hermes.approval": "approval_id",
+          "steer_accepted": "steer_id",
+          "steer_dropped": "steer_id",
+          "context.compaction": "fixed",
+          "hermes.plan": "fixed",
+          "conversation.title": "fixed"
+        },
+        "item_kinds": [
+          "reasoning",
+          "text",
+          "tool",
+          "todo",
+          "subagent"
+        ],
+        "identity_fields_reason": "BT-T1 frozen identity paths are producer-owned and must be mirrored before T2 wiring.",
+        "item_trajectory": [
+          [
+            "reasoning.delta"
+          ],
+          [
+            "content-chunk"
+          ],
+          [
+            "tool-frame.running"
+          ],
+          [
+            "hermes.todo"
+          ],
+          [
+            "hermes.delegation.progress"
+          ],
+          [
+            "hermes.attachment"
+          ],
+          [
+            "hermes.clarify"
+          ],
+          [
+            "hermes.approval"
+          ],
+          [
+            "context.compaction"
+          ],
+          [
+            "hermes.plan"
+          ],
+          [
+            "conversation.title"
+          ],
+          [
+            "steer_accepted",
+            "steer_dropped"
+          ]
+        ],
+        "translated_event_types": {
+          "delegation.status": "hermes.delegation.progress",
+          "attachment.upsert": "hermes.attachment",
+          "clarify": "hermes.clarify",
+          "approval": "hermes.approval",
+          "context.compaction": "context.compaction",
+          "plan.preview": "hermes.plan",
+          "conversation.title": "conversation.title",
+          "steer": "steer_accepted",
+          "steer.dropped": "steer_dropped"
         }
       },
       "registry": {
@@ -4418,6 +5829,190 @@
               "pointer": "/activities/0"
             }
           ]
+        }
+      ]
+    },
+    "activity_rows_fixture": {
+      "version": 1,
+      "turn": {
+        "turn_id": "turn_demo_0001",
+        "session_id": "zettlab:owner:agent_demo_0001:sess_demo_0001",
+        "agent_id": "agent_demo_0001",
+        "started_at": 1756972800000,
+        "completed_at": 1756972820000,
+        "status": "completed"
+      },
+      "activities": [
+        {
+          "id": 40,
+          "kind": "thinking",
+          "call_id": "01996f2e-7b6a-7c31-9f8e-4a3d6c1b2e90",
+          "name": "",
+          "status": "done",
+          "text": "用户要剪 vlog，先确认时间范围。",
+          "started_at": 1756972801000,
+          "completed_at": 1756972802000,
+          "created_seq": 40,
+          "updated_seq": 50,
+          "last_fanout_seq": 60,
+          "item_index": 0,
+          "item_id": "01996f2e-7b6a-7c31-9f8e-4a3d6c1b2e90",
+          "metadata_json": "{}"
+        },
+        {
+          "id": 41,
+          "kind": "text",
+          "call_id": "01996f2e-7b6a-7000-8000-000000000002",
+          "name": "",
+          "status": "done",
+          "text": "Done",
+          "started_at": 1756972802000,
+          "completed_at": 1756972803000,
+          "created_seq": 41,
+          "updated_seq": 51,
+          "last_fanout_seq": 61,
+          "item_index": 1,
+          "item_id": "01996f2e-7b6a-7000-8000-000000000002",
+          "metadata_json": "{\"canonical_omitted\":false}"
+        },
+        {
+          "id": 42,
+          "kind": "tool",
+          "call_id": "hp_t_demo_0001",
+          "name": "file_search",
+          "status": "done",
+          "text": "",
+          "started_at": 1756972803000,
+          "completed_at": 1756972804000,
+          "created_seq": 42,
+          "updated_seq": 52,
+          "last_fanout_seq": 62,
+          "item_index": 2,
+          "item_id": "01996f2e-7b6a-7000-8000-000000000003",
+          "metadata_json": "{\"source\":{\"kind\":\"builtin\",\"id\":\"file_search\",\"label\":\"Search demo files\"},\"display_args\":{\"args_summary\":\"query=demo\",\"truncated\":false},\"display_result\":{\"summary\":\"Found demo files\",\"content_type\":\"text\",\"truncated\":false,\"bytes\":16},\"label\":\"Search demo files\"}"
+        },
+        {
+          "id": 43,
+          "kind": "todo_update",
+          "call_id": "01996f2e-7b6a-7000-8000-000000000004",
+          "name": "",
+          "status": "done",
+          "text": "",
+          "started_at": 1756972804000,
+          "completed_at": 1756972805000,
+          "created_seq": 43,
+          "updated_seq": 53,
+          "last_fanout_seq": 63,
+          "item_index": 3,
+          "item_id": "01996f2e-7b6a-7000-8000-000000000004",
+          "metadata_json": "{\"todos\":[{\"id\":\"todo_demo_1\",\"content\":\"Find demo files\",\"status\":\"completed\"}],\"summary\":{\"total\":1,\"pending\":0,\"in_progress\":0,\"completed\":1,\"cancelled\":0},\"v\":2}"
+        },
+        {
+          "id": 44,
+          "kind": "subagent",
+          "call_id": "01996f2e-7b6a-7000-8000-000000000005",
+          "name": "",
+          "status": "done",
+          "text": "",
+          "started_at": 1756972805000,
+          "completed_at": 1756972806000,
+          "created_seq": 44,
+          "updated_seq": 54,
+          "last_fanout_seq": 64,
+          "item_index": 4,
+          "item_id": "01996f2e-7b6a-7000-8000-000000000005",
+          "metadata_json": "{\"v\":1,\"preview\":\"Found demo files\",\"subagent_id\":\"sub_demo_0001\",\"status\":\"done\"}"
+        },
+        {
+          "id": 45,
+          "kind": "text",
+          "call_id": "01996f2e-7b6a-7000-8000-000000000006",
+          "name": "",
+          "status": "done",
+          "text": "Done",
+          "started_at": 1756972806000,
+          "completed_at": 1756972807000,
+          "created_seq": 45,
+          "updated_seq": 55,
+          "last_fanout_seq": 65,
+          "item_index": 5,
+          "item_id": "01996f2e-7b6a-7000-8000-000000000006",
+          "metadata_json": "{\"canonical_omitted\":true}"
+        },
+        {
+          "id": 46,
+          "kind": "clarify",
+          "call_id": "ia_demo_0002",
+          "name": "",
+          "status": "done",
+          "text": "",
+          "started_at": 1756972807000,
+          "completed_at": 1756972808000,
+          "created_seq": 46,
+          "updated_seq": 56,
+          "last_fanout_seq": 66,
+          "item_index": 6,
+          "metadata_json": "{\"clarify_id\":\"ia_demo_0002\",\"question\":\"周末指哪两天？\",\"choices_offered\":[\"上周末\",\"本周末\"],\"expires_at_ms\":1756973100000}"
+        },
+        {
+          "id": 47,
+          "kind": "context_compaction",
+          "call_id": "context",
+          "name": "",
+          "status": "done",
+          "text": "",
+          "started_at": 1756972808000,
+          "completed_at": 1756972809000,
+          "created_seq": 47,
+          "updated_seq": 57,
+          "last_fanout_seq": 67,
+          "item_index": 7,
+          "metadata_json": "{\"state\":\"succeeded\",\"message\":\"上下文已压缩\",\"old_session_id\":\"sess_demo_0001\",\"new_session_id\":\"sess_demo_0002\"}"
+        },
+        {
+          "id": 48,
+          "kind": "plan_preview",
+          "call_id": "plan_preview",
+          "name": "",
+          "status": "done",
+          "text": "",
+          "started_at": 1756972809000,
+          "completed_at": 1756972810000,
+          "created_seq": 48,
+          "updated_seq": 58,
+          "last_fanout_seq": 68,
+          "item_index": 8,
+          "metadata_json": "{\"title\":\"剪辑 vlog\",\"groups\":[{\"icon\":\"🎬\",\"label\":\"素材\",\"count\":1,\"items\":[\"挑选 4 段\"]}],\"plan_id\":\"plan_demo_0001\",\"status\":\"pending\",\"revision_requested\":false}"
+        },
+        {
+          "id": 50,
+          "kind": "tool",
+          "call_id": "hp_t_demo_0002",
+          "name": "search_files",
+          "status": "done",
+          "text": "",
+          "started_at": 1756972810000,
+          "completed_at": 1756972811000,
+          "created_seq": 49,
+          "updated_seq": 59,
+          "last_fanout_seq": 69,
+          "item_index": 9,
+          "item_id": "01996f2e-7b6a-7000-8000-000000000007",
+          "metadata_json": "{\"pattern\":\"上周末 公园 视频\",\"source\":{\"kind\":\"builtin\",\"id\":\"search_files\",\"label\":\"Search files\"},\"display_args\":{\"args_summary\":\"上周末 公园 视频\",\"truncated\":false},\"display_result\":{\"summary\":\"Found weekend park videos\",\"content_type\":\"text\",\"truncated\":false,\"bytes\":25},\"label\":\"Search files\"}"
+        },
+        {
+          "id": 49,
+          "kind": "tool",
+          "call_id": "legacy-tool",
+          "name": "legacy_search",
+          "status": "done",
+          "text": "",
+          "metadata_json": "{}",
+          "started_at": 0,
+          "completed_at": 0,
+          "created_seq": 50,
+          "updated_seq": 60,
+          "last_fanout_seq": 70
         }
       ]
     }

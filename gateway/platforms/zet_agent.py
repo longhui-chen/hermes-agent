@@ -87,6 +87,8 @@ After the first successful exchange, reuse Hermes' native
 """
 
 import asyncio
+import base64
+import binascii
 import hashlib
 import inspect
 import hashlib
@@ -125,6 +127,28 @@ from gateway.sensitive_process_boundary import (
     initialize_gateway_sensitive_process_boundary,
 )
 from gateway.config import Platform, PlatformConfig
+# Re-export existing helper names for adapter consumers. No registration/import side effects.
+from gateway.platforms.bt_request_helpers import (
+    MAX_CANONICAL_FINAL_TURN_ID_LEN,
+    MAX_TURN_ID_LEN,
+    _CURRENT_TURN_IMAGE_MAX_BYTES,
+    _CURRENT_TURN_IMAGE_MIMES,
+    _HARDWARE_EXECUTION_TOKEN_HEADER,
+    _VIDEO_EDIT_SKILL_SLUGS,
+    _extract_connector_policy_disabled_skills,
+    _extract_connector_route_capability,
+    _extract_creation_action_receipt_transport,
+    _extract_current_turn_reference_image,
+    _extract_hardware_execution_token,
+    _extract_requested_execution_policy,
+    _extract_skill_slug,
+    _extract_turn_id,
+    _is_video_edit_skill_slug,
+    _strip_skill_display_token,
+    _trusted_skill_task_message,
+)
+
+
 from gateway.platforms.api_server import (
     AIOHTTP_AVAILABLE,
     APIServerAdapter,
@@ -142,7 +166,6 @@ from gateway.platforms.api_server import (
     _request_reasoning_config,
     _request_service_tier,
     _resolve_request_runtime_agent_kwargs,
-    _strip_skill_display_token,
 )
 from gateway.platforms.base import SendResult
 from gateway.zet_agent_runtime_cache import (
@@ -153,10 +176,13 @@ from gateway.zet_agent_runtime_cache import (
 from gateway.deep_memory_identity import bounded_identity_header as _bounded_identity_header
 from gateway.platforms.zet_agent_metrics import (
     clarify_rejected as _metric_clarify_rejected,
+    item_frame_dropped_backlog as _metric_item_frame_dropped_backlog,
     interaction_answered as _metric_interaction_answered,
     interaction_opened as _metric_interaction_opened,
     interaction_terminal as _metric_interaction_terminal,
 )
+# zettlab-overlay(BT): bind bounded item/display callbacks at the adapter seam; upstream: none
+from gateway.platforms.zet_agent_bt import WriterProjection, projection_context, tool_callbacks
 # ZettClaw cron event hook — monkey-patches cron.scheduler at import time
 # so cron triggers POST a webhook to local-server. zero hermes main-line
 # changes; see zet_agent_cron.py docstring for the full rationale.
@@ -167,6 +193,8 @@ _zet_agent_cron.install()
 logger = logging.getLogger(__name__)
 
 _STEER_SOURCE_TOKEN = object()
+# BT-T1 contract-only declarations. T2 wires these into the SSE writer.
+_BT_T1_ITEM_FRAME_TYPES = ("item.started", "item.completed")
 _RESERVED_STEER_PROGRESS_TYPES = frozenset({"steer_accepted", "steer_dropped"})
 _STEER_REJECTION_COUNTS: Counter[str] = Counter()
 _STEER_REJECTION_LOCK = threading.Lock()
@@ -660,18 +688,6 @@ _SILENT_AUTOMATION_ALLOWED_TOOLS = frozenset({
     "skill_view",
     "terminal",
 })
-
-_VIDEO_EDIT_SKILL_SLUGS = frozenset({
-    "video-edit-workflow-mini",
-    "video-edit-workflow",
-    "video-edit",
-    "video_edit",
-})
-
-
-def _is_video_edit_skill_slug(slug: str) -> bool:
-    normalized = str(slug or "").strip().lower().strip("/")
-    return normalized in _VIDEO_EDIT_SKILL_SLUGS
 
 
 def _video_edit_tool_names() -> frozenset[str]:
@@ -4149,6 +4165,7 @@ class ZetAgentAdapter(APIServerAdapter):
                     )
                     return False
                 if stream_q.qsize() > self._ATTACHMENT_STREAM_BACKLOG_MAX:
+                    _metric_item_frame_dropped_backlog("attachment")
                     logger.warning(
                         "[zet_agent] attachment stream backlog saturated"
                     )
@@ -4316,6 +4333,7 @@ class ZetAgentAdapter(APIServerAdapter):
                 # progress is best-effort UI signal, the live manifest is
                 # the authoritative record the App polls for terminal state.
                 if stream_q.qsize() > cls._DELEGATION_PROGRESS_BACKLOG_MAX:
+                    _metric_item_frame_dropped_backlog("subagent")
                     return
                 _put_progress(stream_q, payload)
             except Exception:
@@ -5455,6 +5473,8 @@ class ZetAgentAdapter(APIServerAdapter):
                 exc_info=True,
             )
 
+        agent.tool_start_callback, agent.tool_complete_callback = tool_callbacks(stream_q, prestream_timing)
+
         # 2. Structured lifecycle status: late-bind so only the sniffed
         # chat-completions stream receives the App-specific extension event.
         try:
@@ -6229,6 +6249,12 @@ class ZetAgentAdapter(APIServerAdapter):
     # SSE writer override — track chat-completions turn by session_id
     # ------------------------------------------------------------------
 
+    def _project_stream_item(self, item):
+        return projection_context.get().project(item)
+
+    def _pre_finish_frames(self, result):
+        return projection_context.get().finish(result)
+
     async def _write_sse_chat_completion(
         self, request, completion_id: str, model: str, created: int,
         stream_q, agent_task, agent_ref=None, session_id: str = None,
@@ -6250,6 +6276,9 @@ class ZetAgentAdapter(APIServerAdapter):
             self._active_turn_key(session_id) if session_id else ""
         )
         self._register_active_session_turn(session_id, active_ref, agent_task)
+        from gateway.session_context import get_session_env
+        projection = WriterProjection(turn_id=get_session_env("HERMES_TURN_ID", "").strip() or None)
+        projection_token = projection_context.set(projection)
         try:
             return await super()._write_sse_chat_completion(
                 request,
@@ -6264,6 +6293,8 @@ class ZetAgentAdapter(APIServerAdapter):
                 prestream_timing=prestream_timing,
             )
         finally:
+            projection.count_stranded(stream_q.qsize())
+            projection_context.reset(projection_token)
             self._clear_active_session_turn(session_id, active_ref, agent_task)
             if scoped_session_key:
                 self._clear_approval_projections(scoped_session_key)
