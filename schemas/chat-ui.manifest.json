@@ -180,6 +180,7 @@
           "after_tokens",
           "before_messages",
           "before_tokens",
+          "context_measurement",
           "error",
           "index",
           "message",
