@@ -121,6 +121,7 @@ Fields from `contracts/chat-ui/v1/golden/hermes/context.compaction.json` (do not
 | `after_tokens` | number | `6000` |
 | `error` | string | `""` |
 | `index` | number | `8` |
+| `context_measurement` | string | `"unknown"` |
 <!-- generated:end context.compaction -->
 
 | Field | Type | Req | Meaning |
