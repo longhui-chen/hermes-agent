@@ -1,7 +1,7 @@
 {
   "snapshot_version": 2,
-  "root_commit": "6417e3aada9893ccd0570fa55b8606c637166e35",
-  "sha256": "9098a64acdbfd57c3eea6f10bee00e4b9bd1b9137e65e45cdd440c342fd76fa3",
+  "root_commit": "268926e9bdfb42151138721ba44da411d8586eef",
+  "sha256": "873b2e506eacc3d23587d2ad7d1ccac5374ab5414431de5bf019f7eca18cf680",
   "payload": {
     "golden": {
       "events": {
@@ -1106,6 +1106,33 @@
               "args_summary": "上周末 公园 视频",
               "truncated": false
             }
+          }
+        },
+        "tool.start.label-absent": {
+          "type": "tool.start",
+          "turn_id": "turn_demo_0001",
+          "seq": 205,
+          "fanout_seq": 7,
+          "ts": 1756972800000,
+          "backend": "hermes",
+          "data": {
+            "call_id": "call_demo_0001",
+            "name": "search_files",
+            "arguments": {
+              "pattern": "上周末 公园 视频"
+            },
+            "item_id": "01996f2e-7b6a-7c33-9f8e-4a3d6c1b2e90",
+            "index": 2,
+            "source": {
+              "kind": "builtin",
+              "id": "search_files",
+              "label": "Search files"
+            },
+            "display": {
+              "args_summary": "上周末 公园 视频",
+              "truncated": false
+            },
+            "label": ""
           }
         },
         "turn.end": {
