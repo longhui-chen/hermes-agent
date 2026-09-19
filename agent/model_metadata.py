@@ -3163,6 +3163,25 @@ def _count_image_tokens(msg: Dict[str, Any], cost_per_image: int) -> int:
     return count * cost_per_image
 
 
+# zettlab-overlay(context-budget): align compaction with actual request and preserve task state; upstream: none
+def project_messages_for_token_estimate(messages, copy_reasoning=None):
+    """Project replay reasoning using the same policy as the request builder.
+
+    Shallow copies share large content/tool payloads. Never mutate the stored
+    transcript or decide a provider's echo policy here. Without a policy,
+    callers retain conservative accounting of the stored reasoning.
+    """
+    if not callable(copy_reasoning):
+        return messages
+    projected = []
+    for msg in messages:
+        api_msg = msg.copy()
+        copy_reasoning(msg, api_msg)
+        api_msg.pop("reasoning", None)  # trajectory-only alias, as on the wire
+        projected.append(api_msg)
+    return projected
+
+
 def _wire_message_shadow(msg: Dict[str, Any]) -> Dict[str, Any]:
     """Shadow of a message holding only what the provider actually receives.
 
@@ -3193,6 +3212,12 @@ def _wire_message_shadow(msg: Dict[str, Any]) -> Dict[str, Any]:
     shadow: Dict[str, Any] = {}
     for k, v in msg.items():
         if k in ("_anthropic_content_blocks", "reasoning_details"):
+            continue
+        # zettlab-overlay(context-budget): align compaction with actual request and preserve task state; upstream: none
+        if k == "reasoning" and isinstance(v, str) and v == msg.get("reasoning_content"):
+            # Persisted aliases of the same trace must not double the budget.
+            continue
+        if k in ("display_kind", "display_metadata", "finish_reason", "_row_id"):
             continue
         if k == "api_content":
             # Always popped before the request is built; only counted when it

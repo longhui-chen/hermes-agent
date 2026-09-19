@@ -10,10 +10,12 @@ from tools.registry import registry
 
 
 _CREATE_TOOL = "connector.create_readonly_template"
-_READ_ONLY_TEMPLATES = {
-    "jira-data-center-pat-api", "gitlab-com-pat-api", "gitlab-self-managed-pat-api",
-}
+_TEMPLATE_ID_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*\Z")
 _KEY_RE = re.compile(r"[A-Za-z0-9._:-]{16,128}\Z")
+# tools/list enumerates every published provider tool. On AC that is 338 tools
+# and ~383KB, so the historic 64KB read cut the JSON mid-string and every probe
+# failed with a swallowed JSONDecodeError even though the cloud was healthy.
+_MAX_RPC_RESPONSE_BYTES = 1 << 20
 
 
 def _runtime_env() -> dict[str, str]:
@@ -54,7 +56,11 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 def _rpc(request: urllib.request.Request, timeout: float) -> dict:
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
     with opener.open(request, timeout=timeout) as response:
-        raw = response.read(64 << 10)
+        # Read one byte past the cap so an over-budget body fails as a parse
+        # error instead of silently truncating into invalid JSON.
+        raw = response.read(_MAX_RPC_RESPONSE_BYTES + 1)
+    if len(raw) > _MAX_RPC_RESPONSE_BYTES:
+        raise ValueError("connector rpc response exceeds read budget")
     parsed = json.loads(raw)
     return parsed if isinstance(parsed, dict) else {}
 
@@ -92,7 +98,9 @@ def connector_chat_create_tool(args, **kw) -> str:
         return json.dumps({"ok": False, "available": False, "code": "connector_chat_create_unavailable"})
     if action == "probe":
         try:
-            response = _call(env, "tools/list", {}, 5.0)
+            # One local->cloud roundtrip; the cross-region invoke leg measures
+            # 3-16s on AC, so sub-10s budgets cancelled in-flight probes.
+            response = _call(env, "tools/list", {}, 20.0)
             tools = (response.get("result") or {}).get("tools")
             available = isinstance(tools, list) and any(
                 isinstance(tool, dict) and tool.get("name") == _CREATE_TOOL for tool in tools
@@ -105,7 +113,9 @@ def connector_chat_create_tool(args, **kw) -> str:
     variables = args.get("variables")
     secret = args.get("secret")
     key = args.get("idempotency_key")
-    if (template not in _READ_ONLY_TEMPLATES or args.get("template_version") != 1
+    if (not isinstance(template, str) or len(template) > 128
+            or _TEMPLATE_ID_RE.fullmatch(template) is None
+            or args.get("template_version") != 1
             or not isinstance(variables, dict) or len(variables) > 16
             or any(not isinstance(k, str) or not isinstance(v, str) or len(v) > 512
                    for k, v in variables.items())
@@ -131,6 +141,7 @@ def connector_chat_create_tool(args, **kw) -> str:
         "ok": True, "connection_id": result["connection_id"],
         "connection_status": str(result.get("connection_status") or ""),
         "template_id": str(result.get("template_id") or ""),
+        "session_ready": result.get("session_ready") is True,
         "verified": result.get("verified") is True,
     })
 
@@ -139,12 +150,13 @@ registry.register(
     name="connector_chat_create", toolset="zettlab_connectors",
     schema={
         "name": "connector_chat_create",
-        "description": "Probe current-Chat Connector creation availability, then create one published read-only Jira/GitLab API connection from the user's latest ordinary Chat reply. No shell and no automatic tool authorization.",
+        "description": "Probe current-Chat Connector creation availability, then create and enable one published Connector template with its declared tools available next turn. Write and destructive tools retain policy and confirmation gates. No shell.",
         "parameters": {
             "type": "object", "additionalProperties": False,
             "properties": {
                 "action": {"type": "string", "enum": ["probe", "create"]},
-                "template_id": {"type": "string", "enum": sorted(_READ_ONLY_TEMPLATES)},
+                "template_id": {"type": "string", "minLength": 1, "maxLength": 128,
+                                "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$"},
                 "template_version": {"type": "integer"},
                 "variables": {"type": "object", "additionalProperties": {"type": "string"}},
                 "secret": {"type": "string"},

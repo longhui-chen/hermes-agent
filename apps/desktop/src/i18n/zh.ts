@@ -2695,6 +2695,7 @@ export const zh: Translations = {
           system_prompt: '系统提示词',
           tool_definitions: '工具定义'
         },
+        unmeasured: '尚未测量',
         empty: '暂无上下文数据',
         loading: '正在加载明细…',
         percentFull: percent => `已用 ${percent}%`,

@@ -39,23 +39,28 @@ def enabled() -> bool:
     return _secret("ZETTLAB_CRON_CONNECTOR_DIRECT_ENABLED") == "1"
 
 
-def connector_provider_for_skills(skills: Any) -> Optional[str]:
-    """Return the sole Connector provider declared by trusted preset manifests.
+def connector_provider_for_skills(skills: Any) -> str:
+    """Return the Connector provider a Cron job binds its direct route to.
 
-    A Cron job may include ordinary skills alongside one Connector provider.
-    More than one Connector provider is rejected because one direct route is
-    deliberately bound to one Server-side connection and policy snapshot.
+    A Cron job may include ordinary skills alongside Connector skills. When
+    the trusted preset manifests name exactly one Connector provider, the
+    direct route stays bound to that provider (legacy behaviour). When they
+    name none or several, ``""`` is returned and the caller prepares an
+    Agent-level route instead: the local-server broker then resolves the
+    provider per request (MCP tool-name prefix or the
+    ``X-Zettlab-Connector-Provider`` header) and Server policy still decides
+    every call. Nothing is rejected here any more.
     """
     if isinstance(skills, str):
         skills = [skills]
     skill_ids = {str(skill).strip().lower() for skill in (skills or []) if str(skill).strip()}
     if not skill_ids:
-        return None
+        return ""
     providers = {_preset_connector_providers().get(skill_id, "") for skill_id in skill_ids}
     providers.discard("")
-    if len(providers) > 1:
-        raise ConnectorExecutionLeaseError("task_connector_mixed_skills_unsupported")
-    return next(iter(providers), None)
+    if len(providers) == 1:
+        return next(iter(providers))
+    return ""
 
 
 def _preset_connector_providers() -> Dict[str, str]:
@@ -103,8 +108,15 @@ def requires_live_chat_grant(_skills: Any) -> bool:
 
 
 def prepare_route_capability(job_id: str, execution_id: str, provider_id: str) -> str:
-    provider_id = provider_id.strip().lower()
-    if not enabled() or not _PROVIDER_ID_RE.fullmatch(provider_id):
+    """Ask the local-server broker for one AC-local route handle.
+
+    ``provider_id`` may be empty: that requests an Agent-level route covering
+    every Connector the Agent is authorized for, with the provider resolved
+    per request by the broker. A non-empty value keeps the provider-bound
+    route and must be a canonical provider id.
+    """
+    provider_id = str(provider_id or "").strip().lower()
+    if not enabled() or (provider_id and not _PROVIDER_ID_RE.fullmatch(provider_id)):
         raise ConnectorExecutionLeaseError("task_connector_not_authorized")
     result = _bridge_call(
         _PREPARE_METHOD,

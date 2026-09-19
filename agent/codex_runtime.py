@@ -230,7 +230,7 @@ def _record_codex_app_server_compaction(
         compressor.compression_count = getattr(
             compressor, "compression_count", 0
         ) + 1
-        compressor.last_compression_rough_tokens = approx_tokens or 0
+        # zettlab-overlay(context-budget): native compaction does not maintain a character calibration; upstream: none
         # The app server has already completed a real compaction boundary. Its
         # usage update (when supplied) is therefore the same real-vs-real
         # effectiveness verdict used by the normal compression path.

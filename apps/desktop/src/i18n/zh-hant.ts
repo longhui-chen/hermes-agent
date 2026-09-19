@@ -2267,6 +2267,7 @@ export const zhHant = defineLocale({
           system_prompt: '系統提示詞',
           tool_definitions: '工具定義'
         },
+        unmeasured: '尚未測量',
         empty: '尚無上下文資料',
         loading: '正在載入明細…',
         percentFull: percent => `已用 ${percent}%`,

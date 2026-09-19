@@ -1,5 +1,7 @@
 # Connector Chat direct input 协议切片
 
+> 历史记录：以下 2026-09-09 受保护输入设计已于 2026-09-15 废弃，不再用于普通软件 Connector 创建。现行路径是 Agent 在普通 Chat 消息中只问缺失字段并结束本轮，用户下一轮在同一 Chat session 回复，随后调用 `connector_chat_create`。地址、Token、密码属于普通 Chat 消息，会进入历史与模型处理链路；不能把它说成受保护输入。`clarify.connector_setup` 只保留摄像头观察/直播/录制确认和旧事件兼容，旧非摄像头请求被取消。以下验证数字只代表当时的切片，不代表现行路径的验收。
+
 状态：结构化请求、解析和恢复基础已实现；实际连接控制器与 skill 接线尚未完成，客户端不发送能力开关，因此默认关闭。
 
 复用 clarify 的 pending / response / timeout 生命周期。新增可选 connector_setup，只携带受校验的资源类型、模板或提供方 ID，以及不含凭据的 HTTPS MCP 地址。客户端完成时仅返回状态和目标 ID；Hermes 必须重新确认连接和当前会话授权，客户端回执不构成授权。旧客户端请求被明确拒绝，不回退到普通聊天收集密钥。

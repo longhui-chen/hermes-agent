@@ -227,7 +227,7 @@ export function useStatusbarItems({
   const contextBar = useMemo(() => contextBarLabel(currentUsage), [currentUsage])
 
   const publishContextUsage = useCallback(
-    (snapshot: Pick<UsageStats, 'context_max' | 'context_percent' | 'context_used'>) => {
+    (snapshot: Pick<UsageStats, 'context_max' | 'context_percent' | 'context_used' | 'context_measurement'>) => {
       setCurrentUsage(current => ({ ...current, ...snapshot }))
     },
     []

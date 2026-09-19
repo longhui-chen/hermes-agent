@@ -2,6 +2,7 @@ import { act, cleanup, render, waitFor } from '@testing-library/react'
 import { useState } from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
+import { contextBarLabel, usageContextLabel } from '@/lib/statusbar'
 import type { ContextBreakdown, UsageStats } from '@/types/hermes'
 
 import { ContextUsagePanel } from './context-usage-panel'
@@ -90,4 +91,37 @@ describe('ContextUsagePanel', () => {
 
     await waitFor(() => expect(secondGateway).toHaveBeenCalledTimes(1))
   })
+})
+
+it('shows unknown capacity separately from literal payload bytes', async () => {
+  const unknown: ContextBreakdown = {
+    ...breakdown,
+    context_measurement: 'unknown',
+    context_used: 0,
+    context_percent: 0,
+    size_unit: 'bytes',
+    total_bytes: 750000,
+    estimated_total: 0,
+    categories: [{ color: 'teal', id: 'conversation', label: 'Conversation', tokens: 0, bytes: 750000 }]
+  }
+
+  const publish = vi.fn()
+
+  const view = render(
+    <ContextUsagePanel
+      currentUsage={initialUsage}
+      onUsageSnapshot={publish}
+      requestGateway={vi.fn().mockResolvedValue(unknown)}
+      sessionId="runtime-1"
+    />
+  )
+
+  await waitFor(() => expect(publish).toHaveBeenCalledWith(expect.objectContaining({ context_measurement: 'unknown' })))
+  expect(view.container.textContent).toContain('750k B')
+  expect(view.container.textContent).not.toContain('0%')
+  const usage: UsageStats = { ...initialUsage, context_used: 0, context_measurement: 'unknown' }
+  expect(contextBarLabel(usage)).toBe('?%')
+  expect(usageContextLabel(usage)).toBe('? tok')
+  // Old servers omit the optional flag on the next actual usage event.
+  expect(contextBarLabel({ ...usage, context_used: 50000, context_percent: 20 })).toContain('20%')
 })

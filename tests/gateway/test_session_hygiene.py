@@ -498,6 +498,7 @@ async def test_session_hygiene_timeout_continues_to_agent_and_sets_cooldown(monk
         platform=Platform.TELEGRAM,
         chat_type="dm",
     )
+    runner.session_store.get_or_create_session.return_value.last_prompt_tokens = 100
     runner.session_store.load_transcript.return_value = _make_history(6, content_size=400)
     runner.session_store.has_any_sessions.return_value = True
     runner.session_store.rewrite_transcript = MagicMock()
@@ -570,8 +571,9 @@ async def test_session_hygiene_timeout_continues_to_agent_and_sets_cooldown(monk
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("reported_tokens", [0, 100])
 async def test_session_hygiene_forces_in_place_compaction_with_bound_session_db(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path, reported_tokens
 ):
     """Regression for #60947: gateway hygiene should not rely on
     helper-agent session rotation to shrink a live gateway transcript.
@@ -656,6 +658,7 @@ async def test_session_hygiene_forces_in_place_compaction_with_bound_session_db(
         platform=Platform.TELEGRAM,
         chat_type="private",
     )
+    runner.session_store.get_or_create_session.return_value.last_prompt_tokens = reported_tokens
     runner.session_store.load_transcript.return_value = _make_history(12, content_size=400)
     runner.session_store.has_any_sessions.return_value = True
     runner.session_store.rewrite_transcript = MagicMock()
@@ -699,6 +702,11 @@ async def test_session_hygiene_forces_in_place_compaction_with_bound_session_db(
     result = await runner._handle_message(event)
 
     assert result == "ok"
+    if reported_tokens == 0:
+        assert FakeInPlaceCompressAgent.last_instance is None
+        runner._run_agent.assert_awaited_once()
+        runner.session_store.rewrite_transcript.assert_not_called()
+        return
     agent = FakeInPlaceCompressAgent.last_instance
     assert agent is not None
     async_session_db.get_session.assert_awaited_once_with("sess-1")
@@ -953,6 +961,7 @@ def _make_cooldown_runner(monkeypatch, tmp_path, agent_cls, session_db, session_
         platform=Platform.TELEGRAM,
         chat_type="dm",
     )
+    runner.session_store.get_or_create_session.return_value.last_prompt_tokens = 100
     runner.session_store.load_transcript.return_value = _make_history(6, content_size=400)
     runner.session_store.has_any_sessions.return_value = True
     runner.session_store.rewrite_transcript = MagicMock()
