@@ -1,7 +1,7 @@
 {
   "snapshot_version": 2,
-  "root_commit": "268926e9bdfb42151138721ba44da411d8586eef",
-  "sha256": "873b2e506eacc3d23587d2ad7d1ccac5374ab5414431de5bf019f7eca18cf680",
+  "root_commit": "2e705f270e3364f3976a326619cd67321b949515",
+  "sha256": "7781ecd6da1d9ebdd9ac5019c1b36d98eda74bd8f1d81ea5c468278c8863bac1",
   "payload": {
     "golden": {
       "events": {
@@ -1528,7 +1528,8 @@
           "after_messages": 12,
           "after_tokens": 6000,
           "error": "",
-          "index": 8
+          "index": 8,
+          "context_measurement": "unknown"
         },
         "conversation.title": {
           "type": "conversation.title",

@@ -32,7 +32,7 @@ except ImportError:
     except ImportError:
         msvcrt = None
 from pathlib import Path
-from typing import Any, List, Optional
+from typing import Any, List, Optional, Tuple
 
 # Add parent directory to path for imports BEFORE repo-level imports.
 # Without this, standalone invocations (e.g. after `hermes update` reloads
@@ -400,6 +400,71 @@ def _record_silent_run(job: dict, silent: bool) -> None:
     the same job id can exist in more than one of them.
     """
     return None
+
+
+# An app maintenance round closes with one machine-readable verdict line. The
+# prompt local-server generates for these jobs (zls
+# internal/agent/service/app_dedicated_tasks.go) requires it and tells the
+# agent the platform reads only that line to decide success or failure --
+# until 2026-09-17 nothing in the platform actually read it.
+_APP_TASK_VERDICT_RE = re.compile(
+    r"^\*\*Status:\*\*\s*(?P<state>[A-Za-z]+)\s*(?P<reason>.*)$"
+)
+# Punctuation that may separate "failed" from its reason: em/en dash, hyphen,
+# ASCII and full-width colon/comma/enumeration comma. Trimmed so the recorded
+# error reads as the reason on its own.
+_APP_TASK_VERDICT_REASON_LEAD = "\u2014\u2013-:\uff1a,\uff0c\u3001 \t"
+_MAX_APP_TASK_VERDICT_REASON = 300
+
+
+def _app_task_agent_verdict(final_response: str) -> Optional[Tuple[bool, str]]:
+    """Read an app maintenance round's own closing verdict; None when absent.
+
+    Returns ``(ok, reason)``. Scope and trust are deliberately narrow:
+
+      - Only the LAST non-empty line of the agent's own ``final_response`` is
+        read. The prompt requires the verdict there with nothing after it, so
+        a quoted example mid-reply can never be mistaken for it. This reads
+        ``final_response``, never the saved markdown: that file also carries
+        the prompt, which itself spells out ``"**Status:** ok"`` -- exactly
+        why ``_cron_output_occurrence_status`` refuses to parse Response and
+        Prompt bodies at all.
+
+      - The caller applies it in ONE direction: it may downgrade a round the
+        platform judged successful, never clear one the platform judged
+        failed. A round can confess; it cannot absolve itself.
+
+    Why the round's own word is needed at all: the platform can see that a
+    write call was accepted, not whether this round *should* have written
+    anything. The no-op heartbeat ({"__zettlab_noop": true}, which App Host
+    answers itself with ok:true so a genuinely empty round is not judged a
+    failure) is indistinguishable from a real write in the import ledger.
+    "Nothing new today" and "I could not verify the data, so I sent the
+    heartbeat and gave up" therefore both arrive as an accepted write. Only
+    the round itself knows which one it was.
+    """
+    if not isinstance(final_response, str):
+        return None
+    last = ""
+    for line in final_response.splitlines():
+        stripped = line.strip()
+        if stripped:
+            last = stripped
+    if not last:
+        return None
+    match = _APP_TASK_VERDICT_RE.match(last)
+    if match is None:
+        return None
+    state = match.group("state").lower()
+    if state in ("ok", "success", "succeeded"):
+        return True, ""
+    if not state.startswith("fail"):
+        # "silent", "blocked", and anything else the platform itself writes
+        # into saved docs are not round verdicts. Never guess.
+        return None
+    reason = match.group("reason").strip()
+    reason = reason.lstrip(_APP_TASK_VERDICT_REASON_LEAD).strip()
+    return False, reason[:_MAX_APP_TASK_VERDICT_REASON]
 
 
 # ---------------------------------------------------------------------------
@@ -2942,12 +3007,6 @@ def _guard_job_credential_exfil(job: dict) -> None:
 
 def _connector_execution_blocked_document(error_code: str) -> str:
     """Return an honest terminal report before any Connector tool can run."""
-    if str(error_code).strip() == "task_connector_mixed_skills_unsupported":
-        return (
-            "**定时任务连接配置不支持**\n\n"
-            "该任务同时使用多个连接器，无法安全使用单一执行路由；"
-            "未读取数据、未生成报告。请在当前会话将其拆分为每个连接器独立的定时任务。"
-        )
     if str(error_code).strip() == "task_connector_temporarily_unavailable":
         return (
             "**定时任务连接暂时不可用**\n\n"
@@ -2962,7 +3021,18 @@ def _connector_execution_blocked_document(error_code: str) -> str:
 
 
 def _prepare_connector_execution(job: dict) -> tuple[str, Optional[str]]:
-    """Prepare the AC-local route for one non-Chat Connector Cron provider."""
+    """Prepare the AC-local route for one non-Chat Connector Cron run.
+
+    Skills naming exactly one Connector provider keep the provider-bound
+    route: any failure blocks the run before a Connector tool can execute
+    (unchanged). Skills naming none or several providers request an
+    Agent-level route (empty ``provider_id``; the broker resolves the
+    provider per request). That request is best-effort: when it fails, for
+    example an older broker rejecting the empty provider or a transport
+    error, the run proceeds without a route exactly as before, so ordinary
+    non-Connector jobs are never blocked by this step.
+    """
+    provider_id = ""
     try:
         from cron.connector_execution import (
             enabled,
@@ -2970,10 +3040,10 @@ def _prepare_connector_execution(job: dict) -> tuple[str, Optional[str]]:
             connector_provider_for_skills,
         )
 
-        provider_id = connector_provider_for_skills(job.get("skills") or job.get("skill"))
-        if not provider_id:
-            return "", None
+        provider_id = connector_provider_for_skills(job.get("skills") or job.get("skill")) or ""
         if not enabled():
+            if not provider_id:
+                return "", None
             return "", "task_connector_temporarily_unavailable"
         capability = prepare_route_capability(
             str(job.get("id") or ""),
@@ -2982,7 +3052,14 @@ def _prepare_connector_execution(job: dict) -> tuple[str, Optional[str]]:
         )
         return capability, None
     except Exception as exc:
-        return "", str(getattr(exc, "code", "task_connector_not_authorized"))
+        code = str(getattr(exc, "code", "task_connector_not_authorized"))
+        if not provider_id:
+            logger.warning(
+                "Job '%s': agent-level connector route unavailable (%s); running without a route",
+                job.get("id"), code,
+            )
+            return "", None
+        return "", code
 
 
 def _attach_private_connector_execution(job: dict) -> dict:
@@ -4505,6 +4582,25 @@ def run_one_job(
             ]
             if any(attempt.get("ok") for attempt in _import_attempts):
                 success, error = True, None
+                # An accepted write is not the same as a round that did
+                # its job. The no-op heartbeat is accepted too, so this
+                # ledger cannot tell "nothing new" from "I gave up and
+                # sent the heartbeat" (see _app_task_agent_verdict).
+                # 2026-09-17, storage-market-pulse: a round that could not
+                # cross-check its quotes sent the heartbeat and closed
+                # with "**Status:** failed - <reason>"; it was recorded
+                # completed with no error while the app's tables stayed
+                # empty. Honour the verdict the prompt promises to read.
+                # One-way by construction: this branch only runs when the
+                # platform already saw an accepted write, so the verdict
+                # can only downgrade, never absolve.
+                _agent_verdict = _app_task_agent_verdict(final_response)
+                if _agent_verdict is not None and not _agent_verdict[0]:
+                    success = False
+                    error = (
+                        _agent_verdict[1]
+                        or "the maintenance round reported itself failed"
+                    )
             elif _import_attempts:
                 _last_import_failure = _import_attempts[-1]
                 success = False

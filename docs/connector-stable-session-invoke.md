@@ -4,7 +4,7 @@ The dedicated preset runner receives `ZETTLAB_CONNECTOR_SESSION_ID` from the tas
 
 The preset sends `X-Zettlab-Connector-Session-Id` and `X-Zettlab-Agent-Action-Token` to the loopback broker. The broker no longer needs an active turn capability for this route. Cloud Session Gate still enforces the session switch, Agent policy and exact connection/account selection. The existing turn ID is forwarded for Action V2 correlation only; it is not looked up as an active grant.
 
-Cron remains on its dedicated direct route. During the upgrade window the legacy capability is still exported for old presets. Deploy the matching local-server broker before the updated Hermes/presets packages; no device deployment is part of this source change.
+Cron remains on its dedicated direct route. That route also supports an Agent-level binding: when a job's skills do not name exactly one Connector provider, Hermes prepares the route with an empty `provider_id` and the broker resolves the provider per request from the MCP tool-name prefix or the `X-Zettlab-Connector-Provider` header; Server still applies the same Agent policy to every call. During the upgrade window the legacy capability is still exported for old presets. Deploy the matching local-server broker before the updated Hermes/presets packages; no device deployment is part of this source change.
 
 ## Overlay registry
 

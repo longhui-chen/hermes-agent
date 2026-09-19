@@ -632,6 +632,7 @@ export interface SessionRuntimeInfo {
 }
 
 export interface UsageStats {
+  context_measurement?: 'provider' | 'unknown'
   calls: number
   context_max?: number
   context_percent?: number
@@ -684,6 +685,7 @@ export interface StarmapGraph {
 }
 
 export interface ContextUsageCategory {
+  bytes?: number
   color: string
   id: string
   label: string
@@ -691,6 +693,9 @@ export interface ContextUsageCategory {
 }
 
 export interface ContextBreakdown {
+  context_measurement?: 'provider' | 'unknown'
+  size_unit?: 'bytes'
+  total_bytes?: number
   categories: ContextUsageCategory[]
   context_max: number
   context_percent: number

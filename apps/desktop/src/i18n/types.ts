@@ -2114,6 +2114,7 @@ export interface Translations {
           system_prompt: string
           tool_definitions: string
         }
+        unmeasured: string
         empty: string
         loading: string
         percentFull: (percent: number) => string
