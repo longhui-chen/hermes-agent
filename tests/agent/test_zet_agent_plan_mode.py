@@ -8,6 +8,7 @@ from agent.conversation_loop import (
     _should_end_after_present_plan,
     _should_force_present_plan_tool_choice,
 )
+from agent.system_prompt import _build_onboarding_prompt_parts
 from agent.tool_executor import _zet_agent_plan_mode_block_message
 from gateway.platforms.zet_agent import _zettlab_workflow_addendum
 
@@ -393,6 +394,24 @@ def test_workflow_addendum_plan_first_section_is_capability_aware():
     for text in (auto, manual):
         assert "系统已按计划骨架自动创建任务清单" in text
         assert "不要整表重建" in text
+
+
+def test_workflow_addendum_emits_one_tool_batch_preamble():
+    preamble = (
+        "工具调用播报：每次开始一批工具调用前，先用一句话（不超过 20 字）"
+        "说明接下来要做什么；只在开始新一批工具或改变策略时说，工具之间不重复；"
+        "不复述工具结果，不用表情，不加标题。"
+    )
+
+    for auto_execute in (False, True):
+        assert _zettlab_workflow_addendum(auto_execute).count(preamble) == 1
+
+    assert preamble not in _zettlab_workflow_addendum(True, "silent_automation")
+    onboarding = _build_onboarding_prompt_parts(
+        "[zettlab-onboarding-guide-v15]\n只进行简短初次见面引导。",
+        "step=userName",
+    )
+    assert preamble not in "\n".join(onboarding.values())
 
 
 def test_workflow_addendum_workdir_alias_line_follows_capability(monkeypatch):

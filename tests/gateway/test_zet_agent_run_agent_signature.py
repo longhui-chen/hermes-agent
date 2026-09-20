@@ -554,6 +554,12 @@ def test_zet_agent_create_agent_applies_request_runtime_options(monkeypatch):
     assert captured["session_owner_id"] == "iam:alice"  # SessionDB owner
     assert captured["deep_memory_principal"] == "iam:alice"
     assert captured["deep_memory_subject"] == "user-1"
+    preamble = (
+        "工具调用播报：每次开始一批工具调用前，先用一句话（不超过 20 字）"
+        "说明接下来要做什么；只在开始新一批工具或改变策略时说，工具之间不重复；"
+        "不复述工具结果，不用表情，不加标题。"
+    )
+    assert captured["ephemeral_system_prompt"].count(preamble) == 1
 
 
 def test_zet_agent_create_agent_strips_private_principal_from_request_overrides(monkeypatch):
@@ -661,7 +667,7 @@ def test_onboarding_agent_is_lightweight_before_construction(monkeypatch):
     monkeypatch.setattr("gateway.run._current_max_iterations", lambda: 90)
     monkeypatch.setattr(
         "gateway.run.GatewayRunner._load_reasoning_config",
-        lambda: {"enabled": True},
+        lambda *_: {"enabled": True},
     )
     monkeypatch.setattr(
         "gateway.run.GatewayRunner._load_fallback_model", lambda: None
@@ -698,6 +704,7 @@ def test_onboarding_agent_is_lightweight_before_construction(monkeypatch):
     assert captured["skip_context_files"] is True
     assert captured["skip_memory"] is True
     assert captured["ephemeral_system_prompt"] == "v14 onboarding policy"
+    assert "工具调用播报" not in captured["ephemeral_system_prompt"]
     assert captured["reasoning_config"] == {"enabled": False}
     assert agent._tools_disabled_for_request is True
     assert agent.compression_enabled is False
