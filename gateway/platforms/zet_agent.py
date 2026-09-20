@@ -1124,6 +1124,12 @@ _ZET_SILENT_AUTOMATION_ADDENDUM = """\
 
 普通对话不得套用本段规则。"""
 
+# zettlab-overlay(preamble): emit one short pre-tool-batch status sentence; upstream: none
+_ZET_TOOL_BATCH_PREAMBLE = """\
+## 工具调用播报
+
+工具调用播报：每次开始一批工具调用前，先用一句话（不超过 20 字）说明接下来要做什么；只在开始新一批工具或改变策略时说，工具之间不重复；不复述工具结果，不用表情，不加标题。"""
+
 
 def _zettlab_workflow_addendum(
     auto_execute: bool,
@@ -1143,7 +1149,13 @@ def _zettlab_workflow_addendum(
         return _ZET_SILENT_AUTOMATION_ADDENDUM + "\n"
     plan_first = _ZET_PLAN_FIRST_AUTO if auto_execute else _ZET_PLAN_FIRST_MANUAL
     return "\n\n".join(
-        (_ZET_ADDENDUM_HEAD, plan_first, _zet_workdir_section(), _ZET_ADDENDUM_TAIL)
+        (
+            _ZET_ADDENDUM_HEAD,
+            plan_first,
+            _zet_workdir_section(),
+            _ZET_TOOL_BATCH_PREAMBLE,
+            _ZET_ADDENDUM_TAIL,
+        )
     ) + "\n"
 
 
