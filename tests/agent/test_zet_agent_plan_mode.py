@@ -395,6 +395,19 @@ def test_workflow_addendum_plan_first_section_is_capability_aware():
         assert "不要整表重建" in text
 
 
+def test_workflow_addendum_emits_one_tool_batch_preamble():
+    preamble = (
+        "工具调用播报：每次开始一批工具调用前，先用一句话（不超过 20 字）"
+        "说明接下来要做什么；只在开始新一批工具或改变策略时说，工具之间不重复；"
+        "不复述工具结果，不用表情，不加标题。"
+    )
+
+    for auto_execute in (False, True):
+        assert _zettlab_workflow_addendum(auto_execute).count(preamble) == 1
+
+    assert preamble not in _zettlab_workflow_addendum(True, "silent_automation")
+
+
 def test_workflow_addendum_workdir_alias_line_follows_capability(monkeypatch):
     """`agent_output` 只在终端工具真能解析它时才教——别名没落地的运行时会把它
     当普通路径原样 cd，教了反而让命令失败。"""
